@@ -61,6 +61,7 @@ install(TARGETS nn_cpu LIBRARY DESTINATION lib)
 #  构建期 glslc 管线生成 *_spv.hpp（NN_SPV_GETTER_LIST 用 __has_include 探测）。
 # ═══════════════════════════════════════════════════════════════════════════
 option(NN_ENABLE_GPU "构建 GPU 引擎 libnn-gpu.so" ON)
+option(NN_BUILD_TESTS "构建自带消费方测试（consumer_test / gpu_consumer_test / kernelgen_smoke）" OFF)
 if(NN_ENABLE_GPU)
     find_package(Vulkan QUIET)
     find_program(GLSLC glslc HINTS /home/ethan/vulkan/1.4.357.1/x86_64/bin ${Vulkan_GLSLC_EXECUTABLE})
@@ -184,12 +185,15 @@ else()
 endif()
 
 # ── 消费方验证：只 include 抽象层（MIT）+ 链接 .so ────────────────────────
+# 默认 OFF：嵌入消费方（主仓库 add_subdirectory）不拉入本仓测试；本仓独立
+# 构建验证时用 -DNN_BUILD_TESTS=ON。
+if(NN_BUILD_TESTS)
+enable_testing()
 add_executable(consumer_test tests/consumer_test.cpp)
 target_include_directories(consumer_test PRIVATE ${ABST_INCLUDE})
 target_link_libraries(consumer_test PRIVATE nn_cpu)
 set_target_properties(consumer_test PROPERTIES
     BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR})
-enable_testing()
 add_test(NAME consumer_test COMMAND consumer_test)
 
 if(TARGET nn_gpu)
@@ -211,4 +215,5 @@ if(TARGET nn_kernelgen)
     set_target_properties(kernelgen_smoke PROPERTIES
         BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR})
     add_test(NAME kernelgen_smoke COMMAND kernelgen_smoke)
+endif()
 endif()
