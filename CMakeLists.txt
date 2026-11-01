@@ -48,7 +48,7 @@ set(GENERATED_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 # ── libnn-cpu.so（LGPL）：CPU 引擎 + 原语，C++ 直出 ───────────────────────
 add_library(nn_cpu SHARED engine/src/cpu_engine_so.cpp)
-target_include_directories(nn_cpu PRIVATE ${ABST_INCLUDE} ${ENGINE_INCLUDE})
+target_include_directories(nn_cpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp)
 target_link_libraries(nn_cpu PRIVATE Threads::Threads)
 set_target_properties(nn_cpu PROPERTIES
     OUTPUT_NAME nn-cpu
@@ -133,7 +133,7 @@ if(NN_ENABLE_GPU)
         # 2. AOT 融合 shader：scan_exprs（单步 = 收集 + 生成）→ fused_registry.hpp
         set(NN_FUSED_REGISTRY_HPP ${GENERATED_INCLUDE}/fused_registry.hpp)
         add_executable(scan_exprs engine/tools/scan_exprs.cpp)
-        target_include_directories(scan_exprs PRIVATE ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp)
+        target_include_directories(scan_exprs PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp)
         target_link_libraries(scan_exprs PRIVATE Threads::Threads Vulkan::Vulkan ${NN_STACKTRACE_LIB})
         add_custom_command(
             OUTPUT ${NN_FUSED_REGISTRY_HPP}
@@ -146,7 +146,7 @@ if(NN_ENABLE_GPU)
 
         # 3. libnn-gpu.so：依赖全部生成头
         add_library(nn_gpu SHARED engine/src/gpu_engine_so.cpp)
-        target_include_directories(nn_gpu PRIVATE ${ABST_INCLUDE} ${ENGINE_INCLUDE} ${GENERATED_INCLUDE})
+        target_include_directories(nn_gpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${GENERATED_INCLUDE})
         target_link_libraries(nn_gpu PRIVATE Threads::Threads Vulkan::Vulkan)
         target_compile_definitions(nn_gpu PRIVATE NN_HAS_VULKAN=1)
         add_custom_target(gpu_generated DEPENDS ${GPU_GENERATED_HPP})
@@ -171,7 +171,7 @@ find_library(SHADERC_LIBRARY NAMES shaderc_shared
     HINTS ${Vulkan_LIBRARY_DIR} /home/ethan/vulkan/1.4.357.1/x86_64/lib)
 if(SHADERC_INCLUDE_DIR AND SHADERC_LIBRARY)
     add_library(nn_kernelgen SHARED engine/src/kernelgen.cpp)
-    target_include_directories(nn_kernelgen PRIVATE ${ENGINE_INCLUDE} ${SHADERC_INCLUDE_DIR})
+    target_include_directories(nn_kernelgen PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${SHADERC_INCLUDE_DIR})
     target_link_libraries(nn_kernelgen PRIVATE Threads::Threads ${SHADERC_LIBRARY})
     set_target_properties(nn_kernelgen PROPERTIES
         OUTPUT_NAME nn-kernelgen
@@ -194,7 +194,10 @@ add_test(NAME consumer_test COMMAND consumer_test)
 
 if(TARGET nn_gpu)
     add_executable(gpu_consumer_test tests/gpu_consumer_test.cpp)
-    target_include_directories(gpu_consumer_test PRIVATE ${ABST_INCLUDE})
+    target_include_directories(gpu_consumer_test PRIVATE ${ABST_INCLUDE} ${Vulkan_INCLUDE_DIRS})
+    # 跨界 ABI 契约：Tensor 布局随 NN_HAS_VULKAN 条件编译 → 消费方必须与 .so
+    # 同宏编译（GpuBuffer 析构经 .so 符号，消费方无需完整后端类型）。
+    target_compile_definitions(gpu_consumer_test PRIVATE NN_HAS_VULKAN=1)
     target_link_libraries(gpu_consumer_test PRIVATE nn_gpu)
     set_target_properties(gpu_consumer_test PROPERTIES
         BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR})
@@ -203,7 +206,7 @@ endif()
 
 if(TARGET nn_kernelgen)
     add_executable(kernelgen_smoke tests/kernelgen_smoke.cpp)
-    target_include_directories(kernelgen_smoke PRIVATE ${ENGINE_INCLUDE})
+    target_include_directories(kernelgen_smoke PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE})
     target_link_libraries(kernelgen_smoke PRIVATE nn_kernelgen)
     set_target_properties(kernelgen_smoke PROPERTIES
         BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR})

@@ -25,9 +25,9 @@
 #include <vector>
 
 #include <neuralnet.cpp/core_errors.hpp>
-#include "../core_observer_ptr.hpp"
+#include <neuralnet.cpp/core_observer_ptr.hpp>
 #include <neuralnet.cpp/core_config.hpp>
-#include "compute_memory_pool.hpp"
+#include <neuralnet.cpp/backend/compute_memory_pool.hpp>
 
 namespace nn
 {

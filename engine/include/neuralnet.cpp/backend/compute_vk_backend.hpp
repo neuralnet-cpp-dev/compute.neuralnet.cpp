@@ -44,21 +44,21 @@
 #include <vector>
 
 #include <neuralnet.cpp/core_errors.hpp>
-#include "../core_observer_ptr.hpp"
+#include <neuralnet.cpp/core_observer_ptr.hpp>
 #include <neuralnet.cpp/core_config.hpp>
-#include "../core_profile.hpp"   // 设备侧计时回填（NN_PROFILE=1 门控）
+#include <neuralnet.cpp/core_profile.hpp>   // 设备侧计时回填（NN_PROFILE=1 门控）
 // 本文件直接使用 expr_spec 的符号（run_fused_gpu 签名的 ExprPrecSig、
 // EXPR_PREC_DISPATCH_SUFFIX/EXPR_MAX_INPUTS/EXPR_MAX_CONSTS/
 // EXPR_MATMUL_BLOCK/EXPR_FOLD_ROWS_PER_WG）——**必须显式 include**：
 // include 链 algebra_matrix.hpp → 本文件发生在 expr_spec.hpp 之前，此前
 // 只靠 fused_registry.hpp 传递带入 → 注册表缺失（干净构建 / NN_EXPR_SCAN
 // 收集器 TU）时编译断裂（clang 与 MSVC 同批报错，实测）。
-#include "../expr_spec.hpp"
-#include "compute_memory_pool.hpp"
-#include "compute_gpu_storage.hpp"
-#include "../core_domain.hpp"
-#include "compute_vk_pipeline_catalog.hpp"
-#include "compute_staging_ring.hpp"
+#include <neuralnet.cpp/expr_spec.hpp>
+#include <neuralnet.cpp/backend/compute_memory_pool.hpp>
+#include <neuralnet.cpp/backend/compute_gpu_storage.hpp>
+#include <neuralnet.cpp/core_domain.hpp>
+#include <neuralnet.cpp/backend/compute_vk_pipeline_catalog.hpp>
+#include <neuralnet.cpp/backend/compute_staging_ring.hpp>
 
 // SPIR-V 嵌入头文件（由 CMake 生成）
 
@@ -426,7 +426,7 @@
 #endif
 
 // Vulkan 设备/Pipeline 辅助类（detail::vk_check/convert + VulkanDevice + VulkanPipeline）
-#include "compute_vk_device.hpp"
+#include <neuralnet.cpp/backend/compute_vk_device.hpp>
 
 namespace nn
 {
@@ -835,12 +835,12 @@ inline GpuBuffer::~GpuBuffer()
 } // namespace nn
 
 // 原语 pipeline 布局表（GpuBackend::pipeline_specs 的定义）
-#include "compute_vk_pipeline_specs.hpp"
+#include <neuralnet.cpp/backend/compute_vk_pipeline_specs.hpp>
 
 // GpuTensorT<P> 的 backend 依赖实现（from_matrix / to_matrix / create_*）：
 // 放在 GpuBackend 与 GpuBuffer 析构之后——存储层（compute_gpu_storage.hpp）
 // 本身不认识后端，只有这些"经后端上传/下载"的动作需要完整定义。
 // algebra_matrix.hpp 不再包含它，从而只依赖存储层。
-#include "compute_gpu_tensor_impl.hpp"
+#include <neuralnet.cpp/backend/compute_gpu_tensor_impl.hpp>
 
 #endif // NN_HAS_VULKAN

@@ -5,8 +5,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
-using namespace neuralnet;
+using namespace nn;
 
 int main()
 {
@@ -18,29 +19,31 @@ int main()
                     last_error() ? last_error() : "(无错误信息)");
         return 0;
     }
-    std::printf("gpu engine: %s\n", e->describe());
+    std::printf("gpu engine: %s\n", e->describe().text().c_str());
 
-    // matmul：A(2x3) × B(3x2) = C(2x2)
+    Matrix mA(2, 3), mB(3, 2);
     const float Ad[6] = {1, 2, 3, 4, 5, 6};
     const float Bd[6] = {7, 8, 9, 10, 11, 12};
-    auto A = e->from_matrix(Ad, 2, 3, Precision::F32);
-    auto B = e->from_matrix(Bd, 3, 2, Precision::F32);
-    if (!A.valid() || !B.valid()) { std::printf("FAIL from_matrix: %s\n", e->last_error()); return 1; }
+    std::memcpy(mA.span().data(), Ad, 6 * sizeof(float));
+    std::memcpy(mB.span().data(), Bd, 6 * sizeof(float));
+    auto rA = e->from_matrix(mA, Precision::F32);
+    auto rB = e->from_matrix(mB, Precision::F32);
+    if (!rA.has_value() || !rB.has_value()) { std::printf("FAIL from_matrix: %s\n", last_error()); return 1; }
+    Tensor A = *rA, B = *rB;
+    std::printf("A: valid=%d gpu=%d prec=%d shape=%zux%zu\n", A.valid(), A.is_gpu(),
+                (int)A.precision(), A.rows(), A.cols());
     e->begin_batch();
-    auto C = e->matmul(A, B, false, false);
+    auto rC = e->matmul(A, B, false, false, Precision::F32);
     e->end_batch();
-    if (!C.valid()) { std::printf("FAIL matmul: %s\n", e->last_error()); return 1; }
-    float c[4];
-    std::size_t n = 0;
-    if (!e->to_matrix(C, c, 4, &n)) { std::printf("FAIL to_matrix: %s\n", e->last_error()); return 1; }
+    if (!rC.has_value()) { std::printf("FAIL matmul: %s\n", rC.error().message.c_str()); return 1; }
+    auto rCm = e->to_matrix(*rC);
+    if (!rCm.has_value()) { std::printf("FAIL to_matrix: %s\n", last_error()); return 1; }
     const float expC[4] = {58, 64, 139, 154};
     bool ok = true;
     for (int i = 0; i < 4; ++i)
-        if (std::fabs(c[i] - expC[i]) > 1e-3f) { ok = false; std::printf("  C[%d]=%f exp %f\n", i, c[i], expC[i]); }
+        if (std::fabs(rCm->span().data()[i] - expC[i]) > 1e-3f)
+        { ok = false; std::printf("  C[%d]=%f exp %f\n", i, rCm->span().data()[i], expC[i]); }
     if (!ok) { std::printf("FAIL matmul values\n"); return 1; }
     std::printf("GPU matmul PASS (C=[58,64,139,154])\n");
-    e->destroy_tensor(A);
-    e->destroy_tensor(B);
-    e->destroy_tensor(C);
     return 0;
 }

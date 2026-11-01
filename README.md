@@ -20,50 +20,58 @@
 ```
 消费方（cli/model/layer）          只 include 抽象层头 + 链接引擎 .so
         │
-抽象层（MIT，header-only C++）      neuralnet::ComputeEngine 抽象接口 + Tensor 值类型
+抽象层（MIT，abstraction/include）  nn::ComputeEngine 完整接口（52 虚方法）
+                                    + Tensor/Matrix/ExprSpec/Precision 值类型
         ├──────────────┐
 libnn-cpu.so (LGPL)   libnn-gpu.so (LGPL)
 CpuEngine + CPU 原语    GpuEngine + Vulkan backend + shader + kernelgen
         └── 引擎实现全编进对应 .so，C++ 直出 ──┘
 ```
 
-- **引擎直出 C++**（区别于源仓库的 C ABI `nn_api.h`）：消费方 `create_cpu_engine()` /
-  `create_gpu_engine(device)` 得到 `std::unique_ptr<neuralnet::ComputeEngine>`，直接调
-  用虚方法，不经过 C 句柄/序列化层。
-- **跨 `.so` 边界协议**：`Tensor` 是轻量值类型（不透明句柄 + 缓存维度），真实存储由
-  引擎托管（引擎析构连带回收）；`Tensor` 拷贝 = 别名；错误经 `last_error()`。
-  STL 仅 `std::unique_ptr` / `std::string` 跨界 → 要求消费方与 `.so` 同编译器 /
-  同标准库 / 同 `-fno-exceptions`。
-- **边界验证**：`nm` 消费方二进制零引擎实现符号（引擎全在 `.so`），只引用工厂符号。
+- **引擎直出 C++（完整接口）**：`nn::create_cpu_engine()` / `create_gpu_engine(device)`
+  返回 `shared_ptr<ComputeEngine>`；Tensor 是**真实值类型**（布局在 MIT 抽象层头），
+  `from_matrix` / `matmul` 等返回 `Result<Tensor>`（`std::expected`）直接跨界，
+  无句柄映射、无适配器层。
+- **许可边界**：抽象层 = 引擎接口声明 + 跨界值类型（MIT，无引擎实现）；引擎具体
+  实现（CpuEngine/GpuEngine 类体、原语、Vulkan、shader）编进 .so（LGPL，可替换）。
+  Layer/Model/DSL 模板面在主仓库（MIT）。
+- **跨界 ABI 契约（C++ 直出的前提）**：
+  1. 消费方与 .so **同编译器 / 同标准库 / 同 `-fno-exceptions`** 编译；
+  2. **Tensor 布局随 `NN_HAS_VULKAN` 条件编译** → 链接 `libnn-gpu.so` 的消费方必须
+     以 `-DNN_HAS_VULKAN=1` 编译（GPU 相关存储类型布局与 .so 一致）；CPU-only
+     消费方无需宏；
+  3. GPU 值类型（GpuBuffer）析构经 .so 符号（PIMPL 式），消费方不需要完整后端类型；
+  4. `std::shared_ptr` / `std::expected` / `std::string` 跨界由同标准库保证。
 
 ## 构建与测试
 
 ```bash
-cmake -B build -G Ninja -DNN_ENABLE_GPU=OFF   # CPU-only（本轮已交付）
+cmake -B build -G Ninja -DNN_ENABLE_GPU=OFF   # CPU-only
 cmake --build build
-./build/consumer_test                          # 消费方验证（只 include 抽象层 + 链 libnn-cpu.so）
-```
+./build/consumer_test                          # CPU 消费方（只 include 抽象层 + 链 libnn-cpu.so）
 
-`NN_ENABLE_GPU=ON`（默认）时尝试构建 `libnn-gpu.so`，需 Vulkan + glslc（见下）。
+# GPU（默认 ON，需 Vulkan + glslc）：
+cmake -B build -G Ninja
+cmake --build build
+./build/gpu_consumer_test                      # GPU 消费方（-DNN_HAS_VULKAN=1 编译）
+LD_LIBRARY_PATH=<Vulkan SDK>/lib ./build/kernelgen_smoke   # JIT 生成器 C ABI
+```
 
 ## 当前状态
 
-- **libnn-cpu.so ✅ 已交付并验证**：真实 `CpuEngine` 编进 `.so`，经 MIT 抽象层
-  C++ 直出；`consumer_test` 跑通 matmul / 行列归约 / transpose / clone /
-  add_inplace / scale_inplace；`nm` 验证 LGPL 边界干净。
-- **libnn-gpu.so ✅ 已交付并验证**：真实 `GpuEngine` + Vulkan backend + 原语 shader
-  管线 + AOT 融合（`scan_exprs` → `fused_registry.hpp`）编进 `.so`；构建期 glslc
-  管线生成 44 份 `*_spv.hpp`；`gpu_consumer_test` 在真实 GPU（GTX 850M）跑通
-  matmul；`nm` 验证 LGPL 边界干净。
+- **libnn-cpu.so ✅**：真实 `CpuEngine` 编进 `.so`，完整接口 C++ 直出；`consumer_test`
+  跑通 matmul / 归约 / 原地操作 / transpose；LGPL 边界 nm 干净。
+- **libnn-gpu.so ✅**：真实 `GpuEngine` + Vulkan backend + glslc 管线（44 份 `*_spv.hpp`）
+  + `scan_exprs` AOT 融合（158 条表达式 → `fused_registry.hpp`）；真实 850M matmul PASS。
+- **libnn-kernelgen.so ✅**：运行期 JIT 算子生成器（shaderc），`nnk_generate_spirv`
+  现编 SPIR-V 冒烟 PASS；GPU 引擎运行期 dlopen（懒加载，`NN_KERNELGEN_PATH` 可覆盖）。
 
 ## 待办（后续）
 
-1. **kernelgen（`.nnk` JIT）**：GPU 引擎在表达式 JIT miss 时运行期 dlopen
-   `libnn-kernelgen.so`（懒加载，非链接依赖）。当前 GPU `.so` 未迁 kernelgen，
-   eval_expr 的 JIT 回退路径会因加载失败而报错；原语（matmul/reduce）不受影响。
-   后续迁 `src/kernelgen/kernelgen.cpp`（依赖 shaderc）+ 生成器 `.so`。
+1. **主仓库 cli 改链 .so**：主仓库已 submodule 挂载本仓库（`engine/`），下一步把
+   cli 从 header-only 引擎改为 include 抽象层头 + 链 .so（mnist_train 先，再全量）。
 2. **双引擎各自 `.so` 替换验证**：对 `libnn-cpu.so` / `libnn-gpu.so` 分别做
    `bench/lgpl_verify.sh` 式替换验证（改一个原语实现，同一消费方二进制行为随新
    `.so` 变化）。
-3. **双轨测试**：ctest 覆盖 CPU/GPU 双引擎路径的更多原语（当前仅 matmul +
-   归约 + 数据操作冒烟）。
+3. **eval_expr 消费方测试**：ExprSpec 载荷生产方是引擎 DSL，消费方手编 spec 的
+   跨界用例待引擎侧工具支持后补充。

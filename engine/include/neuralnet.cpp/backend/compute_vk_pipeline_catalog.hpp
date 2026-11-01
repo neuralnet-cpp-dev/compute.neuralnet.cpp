@@ -24,7 +24,7 @@
 #include <vector>
 
 #include <neuralnet.cpp/core_errors.hpp>
-#include "compute_vk_device.hpp"
+#include <neuralnet.cpp/backend/compute_vk_device.hpp>
 
 namespace nn
 {

@@ -21,7 +21,7 @@
 
 #include <neuralnet.cpp/core_errors.hpp>
 #include <neuralnet.cpp/core_config.hpp>
-#include "../core_env.hpp"   // RV-09：环境变量读取唯一入口
+#include <neuralnet.cpp/core_env.hpp>   // RV-09：环境变量读取唯一入口
 
 namespace nn
 {
