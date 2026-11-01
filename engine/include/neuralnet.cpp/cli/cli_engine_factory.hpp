@@ -1,0 +1,72 @@
+// ── cli_engine_factory.hpp — 计算引擎选择工厂 ──────────────────────────────────
+//
+// 收拢 mnist_train/mnist_infer/text_train/text_infer/mnist_bench 等入口共用的
+// 引擎选择逻辑，免去各自重复写 `#ifdef NN_HAS_VULKAN` 两段式样板。
+//
+// 选择优先级：--gpu > CPU
+//   - Vulkan 路径：要求编译期 NN_HAS_VULKAN，运行时 backend.initialize() 成功
+//     EngineConfig::gpu_device 可手动指定计算设备（索引 "2" 或名称子串
+//     "40HX"/"NVIDIA"；空 = 自动选最优）。多卡机器上"第一张独显"可能不是
+//     想用的卡（本机 AMD R5 240 排在 NVIDIA CMP 40HX 之前）。
+//   - **显式请求后端（use_gpu）失败时直接返回错误**，绝不静默回退
+//     CPU（保持"硬报错、不降级"；调用方决定是否终止）。
+//   - 未显式请求时默认 CpuEngine。
+//
+// 调用方约束：
+//   返回的 engine 必须早于任何持有其非拥有指针的对象（如 nn::Model）析构。
+// ─────────────────────────────────────────────────────────────────────────
+
+#pragma once
+
+#include <iosfwd>  // std::ostream 前向声明
+#include <memory>
+#include <string>
+
+#include "neuralnet.cpp/compute_engine.hpp"
+#include "neuralnet.cpp/core_errors.hpp"
+#include "neuralnet.cpp/compute_cpu_engine.hpp"
+#ifdef NN_HAS_VULKAN
+#include "neuralnet.cpp/compute_gpu_engine.hpp"
+#endif
+
+namespace nn::cli
+{
+// ── 引擎选择配置 ───────────────────────────────────────────────────────
+struct EngineConfig
+{
+    bool use_gpu = false;   // 启用 Vulkan GpuEngine
+        // 手动指定 Vulkan 计算设备（索引 "2" 或名称子串 "40HX"/"NVIDIA"）；
+        // 空 = 自动选择（设备类型 + apiVersion 打分）。
+        // 注意保留默认成员初始化器：聚合初始化 `EngineConfig{a, b}` 在
+        // -Wextra -Werror 下会对无初始化器的成员报 -Wmissing-field-initializers。
+    std::string gpu_device = {};
+};
+
+// ── 创建计算引擎 ───────────────────────────────────────────────────────
+// 根据 use_gpu 选择 GpuEngine/CpuEngine。
+// 返回 Result：显式请求的后端不可用（初始化失败/未编译）时返回错误，
+// **不回退 CPU**；成功返回引擎并打印选择信息到 log。
+[[nodiscard]] inline nn::Result<std::shared_ptr<nn::ComputeEngine>>
+create_engine(const EngineConfig& cfg, [[maybe_unused]] std::ostream& log = std::cerr)
+{
+    if (cfg.use_gpu)
+    {
+#ifdef NN_HAS_VULKAN
+        auto backend = nn::GpuBackend::shared();
+        auto init_r = backend->initialize(cfg.gpu_device);
+        if (init_r)
+        {
+            log << "GPU 加速已启用 (Vulkan GpuEngine, GPU: " << backend->device().device_name()
+                << ")\n\n";
+            return nn::GpuEngine::create(std::move(backend));
+        }
+        NN_FAIL("请求 --gpu 但 GPU 初始化失败: " + init_r.error().message +
+                "（不回退 CPU；请移除 --gpu 或改用 CPU 模式）");
+#else
+        NN_FAIL("请求 --gpu 但未编译 Vulkan 支持（NN_HAS_VULKAN）；不回退 CPU");
+#endif
+    }
+
+    return nn::CpuEngine::create();
+}
+} // namespace nn::cli
