@@ -30,6 +30,7 @@
 #include "train_state.hpp"  // 训练状态段（P1-2）
 #include "compute_layer.hpp"
 #include "model_container.hpp"
+#include "ternary_pack.hpp"  // 三值打包编解码（引擎 .so 化后不再传递包含）
 
 namespace nn
 {

@@ -12,6 +12,12 @@
 cmake_minimum_required(VERSION 3.30)
 project(compute_neuralnet_cpp VERSION 0.1.0 LANGUAGES CXX)
 
+# 默认 Release（同主仓库口径：-O3 优化；scan_bitwise_test 等逐位测试
+# 依赖 Release 的 CPU FMA 路径，Debug 下按设计 SKIP）
+if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -19,6 +25,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 与源引擎一致的严格旗标（-fno-exceptions 是 ABI 前提：消费方与 .so 必须同款）
 add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic)
 find_package(Threads REQUIRED)
+
+# ── Release 优化（同主仓库口径）───────────────────────────────────────────
+# -O3 -fno-math-errno -fno-trapping-math -funroll-loops [-march=native]。
+# ⚠ -march=native 是**逐位锚前提**：CPU 参考必须走 FMA 收缩（Haswell+），
+#   否则与 GPU kernel（glslc 默认 FMA 收缩）累加路径不同 → scan_bitwise_test
+#   等逐位测试 1-2 ULP 漂移（实测：裸 -O3 下 57/61 用例位型不同）。
+option(NN_ENABLE_NATIVE "Enable -march=native (max perf, non-portable binary)" ON)
+set(NN_RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops)
+if(NN_ENABLE_NATIVE)
+    list(APPEND NN_RELEASE_FLAGS -march=native)
+endif()
+add_compile_options("$<$<CONFIG:Release>:${NN_RELEASE_FLAGS}>")
 
 # std::stacktrace 运行时库探测（仅 tools/scan_exprs 用；GCC/Clang+libstdc++ 需
 # stdc++exp 或 stdc++_libbacktrace，见源仓库 CMakeLists.txt §247）
@@ -134,7 +152,7 @@ if(NN_ENABLE_GPU)
         # 2. AOT 融合 shader：scan_exprs（单步 = 收集 + 生成）→ fused_registry.hpp
         set(NN_FUSED_REGISTRY_HPP ${GENERATED_INCLUDE}/fused_registry.hpp)
         add_executable(scan_exprs engine/tools/scan_exprs.cpp)
-        target_include_directories(scan_exprs PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp)
+        target_include_directories(scan_exprs PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(scan_exprs PRIVATE Threads::Threads Vulkan::Vulkan ${NN_STACKTRACE_LIB})
         add_custom_command(
             OUTPUT ${NN_FUSED_REGISTRY_HPP}
@@ -215,5 +233,46 @@ if(TARGET nn_kernelgen)
     set_target_properties(kernelgen_smoke PROPERTIES
         BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR})
     add_test(NAME kernelgen_smoke COMMAND kernelgen_smoke)
+endif()
+
+# ── 引擎级回归（从主仓库迁移；消费方形态）──────────────────────────────
+# 只 include MIT 抽象层接口头 + 引擎侧 LGPL 头（模型/DSL/emitter：header-only
+# 编译进测试，引擎原语虚调用走 .so）。GPU 用例链接 libnn-gpu.so，GPU 不可用时
+# 程序自判 77 = SKIP。
+set(NN_TESTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+function(nn_add_engine_test name)
+    add_executable(${name} ${ARGN})
+    # 引号 include（"core_domain.hpp" 等）需要 abstraction 的 neuralnet.cpp
+    # 子目录在 -I 路径（同主仓库 nn_core 教训）
+    target_include_directories(${name} PRIVATE
+        ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${NN_TESTS_DIR})
+    set_target_properties(${name} PROPERTIES
+        BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR})
+    # 77 = ctest SKIP 约定（GPU 不可用 / Release 口径不满足等）
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+endfunction()
+
+nn_add_engine_test(expr_graph_test tests/expr_graph_test.cpp)
+target_link_libraries(expr_graph_test PRIVATE nn_cpu)
+
+if(TARGET nn_gpu)
+    nn_add_engine_test(scan_bitwise_test tests/scan_bitwise_test.cpp)
+    target_link_libraries(scan_bitwise_test PRIVATE nn_cpu nn_gpu)
+
+    nn_add_engine_test(gpu_test tests/gpu_test.cpp)
+    target_link_libraries(gpu_test PRIVATE nn_cpu nn_gpu)
+
+    nn_add_engine_test(gpu_f16_test tests/gpu_f16_test.cpp)
+    target_link_libraries(gpu_f16_test PRIVATE nn_cpu nn_gpu)
+
+    nn_add_engine_test(gpt_offload_test tests/gpt_offload_test.cpp)
+    target_link_libraries(gpt_offload_test PRIVATE nn_gpu nn_cpu)
+
+    nn_add_engine_test(rapt_offload_test tests/rapt_offload_test.cpp)
+    target_link_libraries(rapt_offload_test PRIVATE nn_gpu nn_cpu)
+
+    nn_add_engine_test(expr_fuse_test tests/expr_fuse_test.cpp)
+    target_link_libraries(expr_fuse_test PRIVATE nn_cpu nn_gpu)
 endif()
 endif()

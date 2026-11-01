@@ -48,6 +48,7 @@
 #include "neuralnet.cpp/expr_fold.hpp"
 #include "neuralnet.cpp/rl_experience.hpp"
 #include "neuralnet.cpp/rl_policy.hpp"
+#include "expr_fuse_shapes.hpp"  // 测试覆盖登记（tests/；CMake 加 -I）
 
 #include <csignal>
 #if __has_include(<stacktrace>)
@@ -986,6 +987,71 @@ int main(int argc, char* argv[])
         return 1;
     }
 #endif
+    // ── 测试覆盖登记：expr_fuse_test 的录制段链（闭合世界两端一致）────────
+    // expr_fuse_test（tests/expr_fuse_test.cpp）的链定义在 tests/expr_fuse_shapes.hpp
+    // （单一事实源，与运行期用例共用同一组函数）；库内 dry-run / 模型 pass 不覆盖
+    // 这些形状（x*row_broadcast(g) 视图、Adam 金刚石多输出等），若不登记，GPU 端
+    // end_expr 会按闭合世界硬报错（key 离根因很远）。NN_EXPR_SCAN 下 begin_expr/
+    // end_expr 走同一融合分析并登记复合 spec（两端同源、确定性保证同 key）。
+    const auto test_cover_pass = [&](nn::ComputeEngine& engine)
+    {
+        constexpr std::size_t R = 5, C = 7, M = 3, K = 4, N = 2;
+        auto x = engine.create_tensor(R, C);
+        auto g = engine.create_tensor(R, 1);
+        auto w = engine.create_tensor(R, C);
+        auto a0 = engine.create_tensor(M, K);
+        auto b0 = engine.create_tensor(K, N);
+        auto bias = engine.create_tensor(M, N);
+
+        // 录制段 1：3 节点链（用例 1）
+        (void)engine.begin_expr();
+        {
+            auto t1 = nn::test_fuse::chain3_a(engine, x, R, C);
+            auto t2 = nn::test_fuse::chain3_b(engine, *t1, R, C);
+            auto t3 = nn::test_fuse::chain3_c(engine, *t2, g, R, C);
+            (void)t3;
+        }
+        (void)engine.end_expr();
+
+        // 录制段 2：独立双分支（用例 2：融合边界 → 2 kernel）
+        (void)engine.begin_expr();
+        {
+            auto t1 = nn::test_fuse::chain3_a(engine, x, R, C);
+            auto t2 = nn::test_fuse::indep_b(engine, w, R, C);
+            (void)t1;
+            (void)t2;
+        }
+        (void)engine.end_expr();
+
+        // 录制段 3：S5 matmul 链（用例 3）
+        (void)engine.begin_expr();
+        {
+            auto t1 = nn::test_fuse::mm_a(engine, a0, b0, bias, M, N);
+            auto t2 = nn::test_fuse::mm_b(engine, *t1, M, N);
+            (void)t2;
+        }
+        (void)engine.end_expr();
+
+        // 录制段 4：Adam 金刚石（用例 7，P2 多输出：m/v 写穿 + d 中间量 + p 目标传递）
+        {
+            auto m0 = engine.create_tensor(R, C);
+            auto v0 = engine.create_tensor(R, C);
+            auto gg = engine.create_tensor(R, C);
+            auto pp = engine.create_tensor(R, C);
+            (void)engine.begin_expr();
+            auto t1 = nn::test_fuse::adam_a(engine, m0, gg, R, C);
+            auto t2 = nn::test_fuse::adam_b(engine, v0, gg, R, C);
+            auto t3 = nn::test_fuse::adam_c(engine, *t1, *t2, R, C);
+            (void)nn::test_fuse::adam_d_into(engine, pp, *t3);
+            (void)t3;
+            (void)engine.end_expr();
+        }
+
+        // 非录制单表达式（用例 4/5）
+        (void)nn::test_fuse::one_shot_rb2(engine, x, g, R, C);
+    };
+    test_cover_pass(*raw_engine);
+
     const std::size_t n_after_model = nn::fused::global_registry().specs.size();
     // ── 注：fold 结构（通用 v1 样例 + 注意力 5 组合 × {MHA,GQA}）不在本文件
     //    登记 ── 它们由**定义方**在静态初始化期经 `FoldAnchor` 自登记

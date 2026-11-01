@@ -37,6 +37,7 @@
 #include "compute_layer_base.hpp"
 #include "compute_tensor.hpp"
 #include "expr_dsl.hpp"
+#include <neuralnet.cpp/ternary_pack.hpp>   // 三值打包布局（trit_pack，主仓库同款修复）
 #include <neuralnet.cpp/precision.hpp>
 
 namespace nn
