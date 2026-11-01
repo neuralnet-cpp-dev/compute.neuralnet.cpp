@@ -1,0 +1,69 @@
+// ── matmul_q_i8.comp — 三值权重 × int8 激活的量化 GEMM（P3，W1.58A8）──────
+// C = (τ∘A)·(s∘Q)：A 以 2 bit/权重打包（见 trit_pack.comp），Q 以 8 bit/元素
+// 打包（见 quantize_i8.comp / int8_pack.hpp）：
+//   C[m,n] = τ_m · s_n · Σ_k trit(m,k)·q(k,n)
+// 权重读 0.25 B、激活读 1 B/元素（f16 的 1/2）；int32 累加 + 双向量缩放。
+//
+// **当前形态 = 逐输出元素的参考内核**（正确性优先）：每个线程算一个 (m,n)，
+// 内层循环逐 k 解码两边的打包字。宽 batch 下的性能（分块 + 共享内存解码）按
+// P3 的"先量后承诺"流程用 layer_bench 配对 A/B 后另行落地 —— 与 matmul_q
+// 从"逐元素直算"到"分块解码"的演进同一条路（docs/internal/21 §4.14）。
+//
+// 精度变体（glslc -DNN_SHADER_F16=1）：输出 float16_t（f32 累加 + RNE 写出，
+// 与 matmul_q_f16 同款）；打包字缓冲恒 uint、τ/s 恒 float。
+// ─────────────────────────────────────────────────────────────────────────
+#version 450
+
+#if defined(NN_SHADER_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#define NN_ETYPE float16_t
+#include "nn_f16_rne.glsl"
+#define NN_WR(x) float16_t(nn_f16_rne(x))
+#else
+#define NN_ETYPE float
+#define NN_WR(x) x
+#endif
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufW { uint W[]; };   // 打包三值 (M*wpr_w)
+layout(std430, binding = 1) readonly  buffer BufT { float T[]; };  // τ (M)
+layout(std430, binding = 2) readonly  buffer BufQ { uint Q[]; };   // 打包 int8 (K*wpr_q)
+layout(std430, binding = 3) readonly  buffer BufS { float S[]; };  // per-token 尺度 (N)
+layout(std430, binding = 4) writeonly buffer BufY { NN_ETYPE Y[]; };  // (M*N)
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint N;
+    uint K;
+    uint wpr_w;   // ceil(K/16)
+    uint wpr_q;   // ceil(N/4)
+};
+
+int trit_of(uint word, uint k)
+{
+    return int((word >> (2u * (k % 16u))) & 3u) - 2;
+}
+
+void main()
+{
+    const uint total = M * N;
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint idx = gl_GlobalInvocationID.x; idx < total; idx += stride)
+    {
+        const uint m = idx / N;
+        const uint n = idx % N;
+        const uint qbyte_shift = 8u * (n % 4u);
+        const uint qword_base = n / 4u;
+        int acc = 0;
+        for (uint k = 0u; k < K; ++k)
+        {
+            const uint ww = W[m * wpr_w + k / 16u];
+            const uint qw = Q[k * wpr_q + qword_base];
+            const uint qb = (qw >> qbyte_shift) & 0xFFu;
+            const int q = int(qb) - (qb >= 128u ? 256 : 0);
+            acc += trit_of(ww, k) * q;
+        }
+        Y[idx] = NN_WR(T[m] * S[n] * float(acc));
+    }
+}

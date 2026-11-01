@@ -1,0 +1,107 @@
+// ── quantized_adamw_step.comp — 量化状态 AdamW 一步（AdamWInt8，docs 21 §4.19）──
+// 领域原语：状态是 int8 打包容器（1 B/元素，int8_pack.hpp 布局）→ 解码/编码必须
+// 与更新融合在一趟内核里（否则 f32 全尺寸临时量比省掉的还多）。
+//
+// 数值口径（与 compute_engine.hpp 公共入口 + CPU 实现逐位一致）：
+//   m_old = ms0[r]·(qm/127)      （qm = 旧打包 int8 解码）
+//   m_new = β1·m_old + (1-β1)·g
+//   qm_new = round(clamp(m_new/(ms1[r]/127), -127, 127))（round-half-away、NaN→0）
+//   m̂ = ms1[r]·(qm_new/127)
+//   v 同（v_new = β2·v_old + (1-β2)·g²）
+//   param -= lr·(inv_bc1·m̂ / (√(inv_bc2·v̂) + ε) + wd·param)
+//
+// 并行：每线程负责一个打包字（4 字节）→ 字内 4 元素串行写回，无字节级竞态。
+// ─────────────────────────────────────────────────────────────────────────
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer BufP { float P[]; };      // 参数 (rows*cols) 读改写
+layout(std430, binding = 1) readonly  buffer BufG { float G[]; };   // 梯度
+layout(std430, binding = 2) buffer BufM { uint M[]; };       // 一阶矩容器 (rows*wpr) 读改写
+layout(std430, binding = 3) buffer BufV { uint V[]; };       // 二阶矩容器 (rows*wpr) 读改写
+layout(std430, binding = 4) readonly  buffer BufMS0 { float MS0[]; };  // 旧一阶尺度 (rows)
+layout(std430, binding = 5) readonly  buffer BufMS1 { float MS1[]; };  // 新一阶尺度 (rows)
+layout(std430, binding = 6) readonly  buffer BufVS0 { float VS0[]; };  // 旧二阶尺度 (rows)
+layout(std430, binding = 7) readonly  buffer BufVS1 { float VS1[]; };  // 新二阶尺度 (rows)
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint wpr;
+    float lr;
+    float beta1;
+    float one_m_b1;
+    float beta2;
+    float one_m_b2;
+    float eps;
+    float wd;
+    float inv_bc1;
+    float inv_bc2;
+};
+
+// 与 int8_pack.hpp / i8_pack::quantize 同口径（round-half-away、clamp、NaN→0）
+int quantize8(float v, float s)
+{
+    const float scaled = v / s;
+    float c;
+    if (scaled >= 127.0f) c = 127.0f;
+    else if (scaled <= -127.0f) c = -127.0f;
+    else if (scaled != scaled) c = 0.0f;   // NaN
+    else c = scaled;
+    const float r = c + (c < 0.0f ? -0.5f : 0.5f);
+    return int(r);
+}
+
+void main()
+{
+    const uint total_words = rows * wpr;
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint idx = gl_GlobalInvocationID.x; idx < total_words; idx += stride)
+    {
+        const uint r = idx / wpr;
+        const uint wi = idx % wpr;
+        const uint base = r * cols;
+        const uint wbase = r * wpr;
+        const float smo = MS0[r];
+        const float smn = MS1[r];
+        const float svo = VS0[r];
+        const float svn = VS1[r];
+        const float scl_m = smn / 127.0f;
+        const float scl_v = svn / 127.0f;
+        const uint wm_old = M[wbase + wi];
+        const uint wv_old = V[wbase + wi];
+        uint wm_new = 0u;
+        uint wv_new = 0u;
+        for (uint j = 0u; j < 4u; ++j)
+        {
+            const uint c = wi * 4u + j;
+            if (c < cols)
+            {
+                const uint byte_m = (wm_old >> (8u * j)) & 0xFFu;
+                const uint byte_v = (wv_old >> (8u * j)) & 0xFFu;
+                const int qm = int(byte_m) - (byte_m >= 128u ? 256 : 0);
+                const int qv = int(byte_v) - (byte_v >= 128u ? 256 : 0);
+                const float g = G[base + c];
+                const float m_old = smo * (float(qm) / 127.0f);
+                const float m_new = beta1 * m_old + one_m_b1 * g;
+                const int qm_new = quantize8(m_new, scl_m);
+                const float v_old = svo * (float(qv) / 127.0f);
+                const float v_new = beta2 * v_old + one_m_b2 * g * g;
+                const int qv_new = quantize8(v_new, scl_v);
+                const float m_hat = smn * (float(qm_new) / 127.0f);
+                // v̂ 下限 = 量化步长 svn/127（与 CPU 实现同口径）：qv=0 时若重建为 0，
+                // 分母退化成 eps → 更新爆炸（int8 无次正规兜底）；下限让最坏比值有界。
+                const float v_hat = max(svn * (float(qv_new) / 127.0f), scl_v);
+                const float p_old = P[base + c];
+                const float upd = inv_bc1 * m_hat / (sqrt(inv_bc2 * v_hat) + eps) + wd * p_old;
+                P[base + c] = p_old - lr * upd;
+                wm_new |= (uint(qm_new) & 0xFFu) << (8u * j);
+                wv_new |= (uint(qv_new) & 0xFFu) << (8u * j);
+            }
+            // c >= cols：尾部填 0（wm_new/wv_new 初值即 0）
+        }
+        M[wbase + wi] = wm_new;
+        V[wbase + wi] = wv_new;
+    }
+}

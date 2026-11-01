@@ -1148,6 +1148,105 @@ public:
                                             Precision P = Precision::F32)
     { return matmul_q_dispatch_(packed, scale, B, /*transA=*/true, out_rows, P); }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // int8 激活量化（W1.58A8，P3 显存侧，docs 21 §4.16）：
+    //
+    //   quantize_i8(x (M,N), scale, col_scale) → 容器 (M, ceil(N/4)) f32
+    //     q = round(clamp(x/s, -127, 127))（round-half-away）；scale 按行
+    //     （col_scale=false，(M,1) —— 优化器状态/权重侧）或按列（col_scale=true，
+    //     (1,N) —— per-token 激活）广播。容器 1 B/元素（4×int8/f32 字，
+    //     布局见 int8_pack.hpp —— 与 trit_pack 同先例：f32 张量承载原始字）。
+    //   unpack_i8(容器 (M, ceil(N/4))) → f32 (M,N)，值 ∈ [-127,127] 整数
+    //     （STE 反传的 dW 需要 Xq 的 f32 形式；**不乘尺度** —— 尺度由调用方
+    //     经 col_broadcast/row_broadcast 在表达式里折进，见 BitLinear）。
+    //   matmul_q_i8(wq 容器 (M, ceil(K/16)), τ (M,1), xq 容器 (K, ceil(N/4)),
+    //               s (1,N)) → Y = (τ∘W)·(s∘Q)：
+    //     Y[m,n] = τ_m · s_n · Σ_k trit(m,k)·q(k,n)（int32 累加 + 双向量缩放）。
+    //     权重读 0.25 B、激活读 1 B/元素（f16 的 1/2）⇒ 训练期线性投影的
+    //     权重带宽 1/8、激活带宽/显存 1/2，且量化 GEMM 不需要 f32 操作数。
+    //
+    // 精度策略同 matmul_q：非 f32 下传引擎自行决定（GPU 有 f16 直写变体，
+    // CPU 抬 f32 计算 + 按 P 落回）。能力：未接 int8 原语的引擎由 *_impl
+    // 默认实现 fail-fast（与三值打包同款，能力不下沉到上层）。
+    // ══════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] Result<Tensor> quantize_i8(const Tensor& x, const Tensor& scale,
+                                              bool col_scale, Precision P = Precision::F32)
+    {
+        NN_PROF_OP("quantize_i8");
+        NN_TRY(ec, bind_check_({&x, &scale}));
+        return quantize_i8_impl(x, scale, col_scale, P);
+    }
+
+    [[nodiscard]] Result<Tensor> unpack_i8(const Tensor& packed, std::size_t cols)
+    {
+        NN_PROF_OP("unpack_i8");
+        NN_TRY(ec, bind_check_({&packed}));
+        return unpack_i8_impl(packed, cols);
+    }
+
+    [[nodiscard]] Result<Tensor> matmul_q_i8(const Tensor& packed_w, const Tensor& tau,
+                                             const Tensor& packed_x, const Tensor& sx,
+                                             Precision P = Precision::F32)
+    {
+        NN_PROF_OP("matmul_q_i8");
+        NN_TRY(ec, bind_check_({&packed_w, &tau, &packed_x, &sx}));
+        return matmul_q_i8_impl(packed_w, tau, packed_x, sx, P);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 量化状态 AdamW 一步（领域原语：AdamWInt8 优化器，docs 21 §4.13 的 int8 增量）
+    //
+    // 为什么是引擎原语而不是 DSL：状态是 **int8 打包容器**（1 B/元素，布局
+    // int8_pack.hpp），DSL 不能直接读位打包状态 —— 解码/编码必须与更新融合在
+    // 一趟内核里，否则要物化 f32 全尺寸临时量（4 B/状态 × 2 = 比省掉的还多）。
+    // 与 matmul_q_i8 同性质：领域数学参数化在引擎内、数值口径在此钉死
+    // （铁律 3 的"shader 不含算法"豁免：打包状态无法经 DSL 表达，见 docs 21 §4.19）。
+    //
+    //   param      (rows, cols) f32 读改写：p -= lr·(inv_bc1·m̂/(√(inv_bc2·v̂)+ε) + wd·p)
+    //   grad       (rows, cols) f32
+    //   m_packed/v_packed: (rows, ceil(cols/4)) f32 容器（int8 打包一阶/二阶矩，
+    //              1 B/元素；行内小端、尾部填 0，与 quantize_i8 同布局）
+    //   m_scale_old / m_scale_new、v_scale_old / v_scale_new: (rows,1) f32 旧/新上界尺度
+    //   lr, beta1, beta2, eps, wd, inv_bc1, inv_bc2: 标量超参
+    //
+    // 数值口径（每元素，行 r；与 AdamWQuant 的 DSL 表达式同构，payload 分辨率
+    // f16 → int8）：
+    //   m_old = m_scale_old[r]·(qm/127)（qm = 旧打包 int8 解码，∈ [-127,127]）
+    //   m_new = β1·m_old + (1-β1)·g
+    //   qm_new = round(clamp(m_new/(m_scale_new[r]/127), -127, 127))
+    //            （round-half-away；NaN → 0；|m_new| ≤ m_scale_new ⇒ clamp 不触发）
+    //   m̂ = m_scale_new[r]·(qm_new/127)（参数更新用**重建值**，与 AdamWQuant
+    //       "写回后用新尺度读"同一口径）
+    //   v 同（v_new = β2·v_old + (1-β2)·g²）
+    //   **v̂ 下限 = v_scale_new[r]/127（int8 分辨率下限）**：qv=0（v_real 小于半步长）
+    //   时若重建为 0，分母退化成 eps → 更新爆炸（int8 没有 f32/f16 的次正规兜底）；
+    //   下限让最坏比值有界（|m̂| ≤ sm ⇒ m̂/√v̂ ≤ sm/√(sv/127) ≈ O(1)）。
+    //   param -= lr·(inv_bc1·m̂ / (√(inv_bc2·v̂) + ε) + wd·param)
+    // 尺度前进（sm_new = max(β1·sm + (1-β1)·row_max(|g|)·1.02, 1e-24)）由调用方
+    // （AdamWInt8）用 DSL 完成 —— 原语只做"给定新尺度"的融合状态写回 + 参数更新。
+    // 能力：未接的引擎由 *_impl 默认实现 fail-fast（与三值打包同款）。
+    // ══════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] Result<void> quantized_adamw_step(
+        Tensor& param, const Tensor& grad, Tensor& m_packed, Tensor& v_packed,
+        const Tensor& m_scale_old, const Tensor& m_scale_new, const Tensor& v_scale_old,
+        const Tensor& v_scale_new, Scalar lr, Scalar beta1, Scalar beta2, Scalar eps, Scalar wd,
+        Scalar inv_bc1, Scalar inv_bc2)
+    {
+        NN_PROF_OP("quantized_adamw_step");
+        NN_TRY(ec,
+               bind_check_({&param, &grad, &m_packed, &v_packed, &m_scale_old, &m_scale_new,
+                            &v_scale_old, &v_scale_new}));
+        // 写入口：param / m_packed / v_packed 都是读改写（推进写版本，契约）
+        WriteEpochGuard wg1{param};
+        WriteEpochGuard wg2{m_packed};
+        WriteEpochGuard wg3{v_packed};
+        return quantized_adamw_step_impl(param, grad, m_packed, v_packed, m_scale_old,
+                                         m_scale_new, v_scale_old, v_scale_new, lr, beta1, beta2,
+                                         eps, wd, inv_bc1, inv_bc2);
+    }
+
 private:
     [[nodiscard]] Result<Tensor> matmul_q_dispatch_(const Tensor& packed, const Tensor& scale,
                                                     const Tensor& B, bool transA,
@@ -1526,6 +1625,61 @@ protected:
         (void)out_rows;
         (void)P;
         NN_FAIL("matmul_q: 该引擎未实现三值 GEMM");
+    }
+
+    // int8 量化（P3，W1.58A8）：语义见公共入口 quantize_i8 / unpack_i8 /
+    // matmul_q_i8 的说明。默认 = 引擎未接 int8 原语（fail-fast）。
+    [[nodiscard]] virtual Result<Tensor> quantize_i8_impl(const Tensor& x, const Tensor& scale,
+                                                          bool col_scale, Precision P)
+    {
+        (void)x;
+        (void)scale;
+        (void)col_scale;
+        (void)P;
+        NN_FAIL("quantize_i8: 该引擎未实现 int8 量化");
+    }
+    [[nodiscard]] virtual Result<Tensor> unpack_i8_impl(const Tensor& packed, std::size_t cols)
+    {
+        (void)packed;
+        (void)cols;
+        NN_FAIL("unpack_i8: 该引擎未实现 int8 解包");
+    }
+    [[nodiscard]] virtual Result<Tensor> matmul_q_i8_impl(const Tensor& packed_w,
+                                                          const Tensor& tau, const Tensor& packed_x,
+                                                          const Tensor& sx, Precision P)
+    {
+        (void)packed_w;
+        (void)tau;
+        (void)packed_x;
+        (void)sx;
+        (void)P;
+        NN_FAIL("matmul_q_i8: 该引擎未实现 int8 量化 GEMM");
+    }
+
+    // 量化状态 AdamW 一步（领域原语，语义见公共入口 quantized_adamw_step 的说明）。
+    // 默认 = 引擎未接该原语（fail-fast）。
+    [[nodiscard]] virtual Result<void> quantized_adamw_step_impl(
+        Tensor& param, const Tensor& grad, Tensor& m_packed, Tensor& v_packed,
+        const Tensor& m_scale_old, const Tensor& m_scale_new, const Tensor& v_scale_old,
+        const Tensor& v_scale_new, Scalar lr, Scalar beta1, Scalar beta2, Scalar eps, Scalar wd,
+        Scalar inv_bc1, Scalar inv_bc2)
+    {
+        (void)param;
+        (void)grad;
+        (void)m_packed;
+        (void)v_packed;
+        (void)m_scale_old;
+        (void)m_scale_new;
+        (void)v_scale_old;
+        (void)v_scale_new;
+        (void)lr;
+        (void)beta1;
+        (void)beta2;
+        (void)eps;
+        (void)wd;
+        (void)inv_bc1;
+        (void)inv_bc2;
+        NN_FAIL("quantized_adamw_step: 该引擎未实现量化状态 AdamW 更新");
     }
     [[nodiscard]] virtual Result<Tensor> batched_matmul_impl(const Tensor& A, const Tensor& B,
                                                              std::size_t batch, bool transA,

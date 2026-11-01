@@ -87,6 +87,15 @@ enum class PipelineId : std::uint8_t
     matmul_q_gemv,
     matmul_q_gemv_f16,
 
+    // int8 激活量化（P3，W1.58A8）：quantize / unpack / matmul_q_i8
+    quantize_i8,
+    unpack_i8,
+    matmul_q_i8,
+    matmul_q_i8_f16,
+
+    // 量化状态 AdamW 一步（AdamWInt8，领域原语，docs 21 §4.19）
+    quantized_adamw_step,
+
     count
 };
 

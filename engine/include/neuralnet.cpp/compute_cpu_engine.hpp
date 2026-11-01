@@ -21,6 +21,7 @@
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
 #include "expr_dsl.hpp" // matmul_with_bias 经 DSL 融合（单一事实源）
 #include "ternary_pack.hpp" // 三值打包布局（trit_pack / matmul_q，P2）
+#include "int8_pack.hpp"    // int8 激活打包布局（quantize_i8 / matmul_q_i8，P3）
 
 namespace nn
 {
@@ -855,6 +856,267 @@ public:
             }
         }
         return out;
+    }
+
+    // ── int8 激活量化（P3，W1.58A8）：quantize / unpack / matmul_q_i8（CPU 参考）
+    // 语义与布局：compute_engine.hpp 的公共入口说明 + int8_pack.hpp。
+    // 精度：x 非 f32 先抬 f32（§7.2 f32 参考）；输出容器恒 f32（原始字，不做
+    // 浮点运算）；matmul_q_i8 的输出按 P 落回（CPU 无 in-kernel f16 变体）。
+    [[nodiscard]] Result<Tensor> quantize_i8_impl(const Tensor& x, const Tensor& scale,
+                                                  bool col_scale, Precision P) override
+    {
+        if (!x.is_cpu() || !scale.is_cpu()) NN_FAIL("quantize_i8: tensors are not CPU");
+        if (P != Precision::F32 || x.precision() != Precision::F32)
+        {
+            auto x32 =
+                (x.precision() == Precision::F32) ? Result<Tensor>{x} : cast(x, Precision::F32);
+            NN_TRY_CHECK(x32);
+            auto s32 = (scale.precision() == Precision::F32)
+                           ? Result<Tensor>{scale}
+                           : cast(scale, Precision::F32);
+            NN_TRY_CHECK(s32);
+            return quantize_i8_impl(*x32, *s32, col_scale, Precision::F32);
+        }
+        if (scale.precision() != Precision::F32) NN_FAIL("quantize_i8: 尺度必须 f32");
+        const std::size_t rows = x.rows(), cols = x.cols();
+        if (col_scale && (scale.rows() != 1 || scale.cols() != cols))
+            NN_FAIL("quantize_i8: 列尺度形状必须是 (1,N)（per-token）");
+        if (!col_scale && (scale.rows() != rows || scale.cols() != 1))
+            NN_FAIL("quantize_i8: 行尺度形状必须是 (M,1)");
+        const std::size_t words = nn::i8_pack::words_per_row(cols);
+        Tensor out = Tensor::cpu(rows, words);
+        const Matrix& xm = x.cpu_matrix();
+        const Matrix& sm = scale.cpu_matrix();
+        Matrix& om = out.cpu_matrix();
+        const auto x_span = xm.span();
+        const auto s_span = sm.span();
+        auto o_span = om.span();
+        std::vector<std::int8_t> qbuf(cols);
+        std::vector<std::uint32_t> wbuf(words);
+        for (std::size_t r = 0; r < rows; ++r)
+        {
+            for (std::size_t c = 0; c < cols; ++c)
+                qbuf[c] = nn::i8_pack::quantize(x_span[r * cols + c],
+                                                col_scale ? s_span[c] : s_span[r]);
+            nn::i8_pack::pack_row(qbuf.data(), cols, wbuf.data());
+            for (std::size_t wi = 0; wi < words; ++wi)
+                o_span[r * words + wi] = std::bit_cast<float>(wbuf[wi]);
+        }
+        return out;
+    }
+
+    [[nodiscard]] Result<Tensor> unpack_i8_impl(const Tensor& packed, std::size_t cols) override
+    {
+        if (!packed.is_cpu()) NN_FAIL("unpack_i8: tensor is not CPU");
+        if (packed.precision() != Precision::F32) NN_FAIL("unpack_i8: 容器必须 f32");
+        const std::size_t rows = packed.rows();
+        const std::size_t words = nn::i8_pack::words_per_row(cols);
+        if (packed.cols() != words)
+            NN_FAIL("unpack_i8: 容器列数 != words_per_row(cols)（形状不匹配）");
+        Tensor out = Tensor::cpu_uninitialized(rows, cols);
+        const Matrix& pm = packed.cpu_matrix();
+        Matrix& om = out.cpu_matrix();
+        const auto p_span = pm.span();
+        auto o_span = om.span();
+        std::vector<std::uint32_t> wbuf(words);
+        for (std::size_t r = 0; r < rows; ++r)
+        {
+            for (std::size_t wi = 0; wi < words; ++wi)
+                wbuf[wi] = std::bit_cast<std::uint32_t>(p_span[r * words + wi]);
+            for (std::size_t c = 0; c < cols; ++c)
+                o_span[r * cols + c] = static_cast<float>(nn::i8_pack::at(wbuf.data(), c));
+        }
+        return out;
+    }
+
+    [[nodiscard]] Result<Tensor> matmul_q_i8_impl(const Tensor& packed_w, const Tensor& tau,
+                                                  const Tensor& packed_x, const Tensor& sx,
+                                                  Precision P) override
+    {
+        if (P != Precision::F32)
+        {
+            // 容器恒 f32（原始字）；输出按 P 落回（CPU 无 in-kernel f16 变体）
+            auto r = matmul_q_i8_impl(packed_w, tau, packed_x, sx, Precision::F32);
+            NN_TRY_CHECK(r);
+            return cast(*r, P);
+        }
+        if (!packed_w.is_cpu() || !tau.is_cpu() || !packed_x.is_cpu() || !sx.is_cpu())
+            NN_FAIL("matmul_q_i8: tensors are not CPU");
+        if (packed_w.precision() != Precision::F32 || packed_x.precision() != Precision::F32 ||
+            tau.precision() != Precision::F32 || sx.precision() != Precision::F32)
+            NN_FAIL("matmul_q_i8: 需要 f32 容器/尺度");
+        const std::size_t M = packed_w.rows();
+        const std::size_t K = packed_x.rows();
+        const std::size_t N = sx.cols();
+        if (sx.rows() != 1) NN_FAIL("matmul_q_i8: 激活尺度必须是 (1,N)");
+        if (tau.rows() != M || tau.cols() != 1) NN_FAIL("matmul_q_i8: τ 必须是 (M,1)");
+        if (nn::trit_pack::words_per_row(K) != packed_w.cols())
+            NN_FAIL("matmul_q_i8: 权重容器列数与 K 不匹配");
+        if (nn::i8_pack::words_per_row(N) != packed_x.cols())
+            NN_FAIL("matmul_q_i8: 激活容器列数与 N 不匹配");
+
+        Tensor out = Tensor::cpu_uninitialized(M, N);
+        const Matrix& pm = packed_w.cpu_matrix();
+        const Matrix& tm = tau.cpu_matrix();
+        const Matrix& xm = packed_x.cpu_matrix();
+        const Matrix& sm = sx.cpu_matrix();
+        Matrix& om = out.cpu_matrix();
+        const auto p_span = pm.span();
+        const auto t_span = tm.span();
+        const auto x_span = xm.span();
+        const auto s_span = sm.span();
+        auto o_span = om.span();
+        const std::size_t wpr = nn::trit_pack::words_per_row(K);
+        const std::size_t xpr = nn::i8_pack::words_per_row(N);
+
+        // 行块解码（trit → int8 scratch）+ int32 累加 + 双向量缩放。
+        // 参考实现：正确性优先（与 GPU 同口径的整数累加序，后续 A/B 再优化）。
+        constexpr std::size_t RB = 64;
+        std::vector<std::int8_t> trits;
+        trits.resize(RB * K);
+        for (std::size_t m0 = 0; m0 < M; m0 += RB)
+        {
+            const std::size_t nr = std::min(RB, M - m0);
+            // 解码三值行块 → int8 scratch（一行 16 个 trit 共一个字）
+            for (std::size_t i = 0; i < nr; ++i)
+            {
+                const float* pw = p_span.data() + (m0 + i) * wpr;
+                for (std::size_t k = 0; k < K; ++k)
+                {
+                    const std::uint32_t word =
+                        std::bit_cast<std::uint32_t>(pw[k / nn::trit_pack::kPerWord]);
+                    const std::uint32_t code =
+                        (word >> (nn::trit_pack::kBits * (k % nn::trit_pack::kPerWord))) &
+                        nn::trit_pack::kMask;
+                    trits[i * K + k] = static_cast<std::int8_t>(
+                        static_cast<int>(nn::trit_pack::value_of(code)));
+                }
+            }
+            // 每列（token）一次：int32 累加 + τ·s 双向量缩放
+            for (std::size_t n = 0; n < N; ++n)
+            {
+                const float s = s_span[n];
+                for (std::size_t i = 0; i < nr; ++i)
+                {
+                    std::int32_t acc = 0;
+                    for (std::size_t k = 0; k < K; ++k)
+                    {
+                        const std::uint32_t word = std::bit_cast<std::uint32_t>(
+                            x_span[k * xpr + n / nn::i8_pack::kPerWord]);
+                        const std::uint32_t byte =
+                            (word >> (nn::i8_pack::kBits * (n % nn::i8_pack::kPerWord))) &
+                            nn::i8_pack::kMask;
+                        const std::int8_t q = static_cast<std::int8_t>(static_cast<std::uint8_t>(byte));
+                        acc += static_cast<std::int32_t>(trits[i * K + k]) * static_cast<std::int32_t>(q);
+                    }
+                    o_span[(m0 + i) * N + n] = t_span[m0 + i] * s * static_cast<float>(acc);
+                }
+            }
+        }
+        return out;
+    }
+
+    // ── 量化状态 AdamW 一步（AdamWInt8，docs 21 §4.13 的 int8 增量）────────
+    // 语义与数值口径：compute_engine.hpp 公共入口说明（领域原语）+ int8_pack.hpp。
+    // CPU 参考实现：逐行解码 → 更新 → 编码 → 参数更新的标量路径（正确性优先；
+    // 与 GPU shader 同运算序，逐位对拍由 adam_int8_test 锁定）。
+    [[nodiscard]] Result<void> quantized_adamw_step_impl(
+        Tensor& param, const Tensor& grad, Tensor& m_packed, Tensor& v_packed,
+        const Tensor& m_scale_old, const Tensor& m_scale_new, const Tensor& v_scale_old,
+        const Tensor& v_scale_new, Scalar lr, Scalar beta1, Scalar beta2, Scalar eps, Scalar wd,
+        Scalar inv_bc1, Scalar inv_bc2) override
+    {
+        if (!param.is_cpu() || !grad.is_cpu() || !m_packed.is_cpu() || !v_packed.is_cpu() ||
+            !m_scale_old.is_cpu() || !m_scale_new.is_cpu() || !v_scale_old.is_cpu() ||
+            !v_scale_new.is_cpu())
+            NN_FAIL("quantized_adamw_step: tensors are not CPU");
+        if (param.precision() != Precision::F32 || grad.precision() != Precision::F32 ||
+            m_packed.precision() != Precision::F32 || v_packed.precision() != Precision::F32 ||
+            m_scale_old.precision() != Precision::F32 || m_scale_new.precision() != Precision::F32 ||
+            v_scale_old.precision() != Precision::F32 || v_scale_new.precision() != Precision::F32)
+            NN_FAIL("quantized_adamw_step: 参数/梯度/尺度/容器必须 f32");
+        const std::size_t rows = param.rows(), cols = param.cols();
+        if (grad.rows() != rows || grad.cols() != cols)
+            NN_FAIL("quantized_adamw_step: 梯度形状不匹配");
+        const std::size_t wpr = nn::i8_pack::words_per_row(cols);
+        if (m_packed.rows() != rows || m_packed.cols() != wpr || v_packed.rows() != rows ||
+            v_packed.cols() != wpr)
+            NN_FAIL("quantized_adamw_step: 状态容器形状必须 (rows, ceil(cols/4))");
+        if (m_scale_old.rows() != rows || m_scale_old.cols() != 1 || m_scale_new.rows() != rows ||
+            m_scale_new.cols() != 1 || v_scale_old.rows() != rows || v_scale_old.cols() != 1 ||
+            v_scale_new.rows() != rows || v_scale_new.cols() != 1)
+            NN_FAIL("quantized_adamw_step: 尺度必须 (rows,1)");
+
+        Matrix& p_mat = param.cpu_matrix();
+        const Matrix& g_mat = grad.cpu_matrix();
+        Matrix& mp_mat = m_packed.cpu_matrix();
+        Matrix& vp_mat = v_packed.cpu_matrix();
+        const Matrix& ms0 = m_scale_old.cpu_matrix();
+        const Matrix& ms1 = m_scale_new.cpu_matrix();
+        const Matrix& vs0 = v_scale_old.cpu_matrix();
+        const Matrix& vs1 = v_scale_new.cpu_matrix();
+        auto p_span = p_mat.span();
+        const auto g_span = g_mat.span();
+        auto mp_span = mp_mat.span();
+        auto vp_span = vp_mat.span();
+        const auto ms0_s = ms0.span();
+        const auto ms1_s = ms1.span();
+        const auto vs0_s = vs0.span();
+        const auto vs1_s = vs1.span();
+
+        const Scalar one_m_b1 = Scalar{1} - beta1;
+        const Scalar one_m_b2 = Scalar{1} - beta2;
+        std::vector<std::int8_t> qm(cols), qv(cols);
+        std::vector<std::uint32_t> wm(wpr), wv(wpr);
+        for (std::size_t r = 0; r < rows; ++r)
+        {
+            const Scalar smo = ms0_s[r];
+            const Scalar smn = ms1_s[r];
+            const Scalar svo = vs0_s[r];
+            const Scalar svn = vs1_s[r];
+            const Scalar scl_m = smn / Scalar{127};
+            const Scalar scl_v = svn / Scalar{127};
+            // 解码旧状态（一行）
+            for (std::size_t wi = 0; wi < wpr; ++wi)
+            {
+                wm[wi] = std::bit_cast<std::uint32_t>(mp_span[r * wpr + wi]);
+                wv[wi] = std::bit_cast<std::uint32_t>(vp_span[r * wpr + wi]);
+            }
+            for (std::size_t c = 0; c < cols; ++c)
+            {
+                qm[c] = nn::i8_pack::at(wm.data(), c);
+                qv[c] = nn::i8_pack::at(wv.data(), c);
+            }
+            // 更新 + 编码 + 参数更新（运算序与 GPU shader 逐位一致）
+            for (std::size_t c = 0; c < cols; ++c)
+            {
+                const Scalar g = g_span[r * cols + c];
+                const Scalar m_old = smo * (static_cast<Scalar>(qm[c]) / Scalar{127});
+                const Scalar m_new = beta1 * m_old + one_m_b1 * g;
+                qm[c] = nn::i8_pack::quantize(m_new, scl_m);
+                const Scalar v_old = svo * (static_cast<Scalar>(qv[c]) / Scalar{127});
+                const Scalar v_new = beta2 * v_old + one_m_b2 * g * g;
+                qv[c] = nn::i8_pack::quantize(v_new, scl_v);
+                const Scalar m_hat = smn * (static_cast<Scalar>(qm[c]) / Scalar{127});
+                // v̂ 下限 = 量化步长 svn/127（int8 分辨率下限）：qv=0（v_real < 半步长）
+                // 时若重建为 0，分母退化成 eps → 更新爆炸（int8 无 f32/f16 的次正规
+                // 兜底）；下限让最坏比值有界（|m̂| ≤ smn ⇒ m̂/√v̂ ≤ smn/√(svn/127) ≈ 常数）。
+                const Scalar v_hat = std::max(svn * (static_cast<Scalar>(qv[c]) / Scalar{127}),
+                                              scl_v);
+                const Scalar p_old = p_span[r * cols + c];
+                const Scalar upd = inv_bc1 * m_hat / (std::sqrt(inv_bc2 * v_hat) + eps) + wd * p_old;
+                p_span[r * cols + c] = p_old - lr * upd;
+            }
+            // 编码写回（一行）
+            nn::i8_pack::pack_row(qm.data(), cols, wm.data());
+            nn::i8_pack::pack_row(qv.data(), cols, wv.data());
+            for (std::size_t wi = 0; wi < wpr; ++wi)
+            {
+                mp_span[r * wpr + wi] = std::bit_cast<Scalar>(wm[wi]);
+                vp_span[r * wpr + wi] = std::bit_cast<Scalar>(wv[wi]);
+            }
+        }
+        return {};
     }
 
     [[nodiscard]] Result<Tensor> matmul_impl(const Tensor& A, const Tensor& B, bool transA,

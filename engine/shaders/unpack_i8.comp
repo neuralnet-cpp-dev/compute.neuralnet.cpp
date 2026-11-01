@@ -1,0 +1,30 @@
+// ── unpack_i8.comp — int8 打包容器解包原语（P3，W1.58A8）──────────────────
+// 语义：打包字 (rows, wpr)（f32 张量承载原始字，布局见 int8_pack.hpp）→
+// f32 (rows, cols)，值 ∈ [-127,127] 整数（signed int8 升 f32，不乘尺度 ——
+// 尺度由调用方在表达式里折进，见 BitLinear 的 dW 路径）。
+// ─────────────────────────────────────────────────────────────────────────
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufP { uint P[]; };   // (rows*wpr)
+layout(std430, binding = 1) writeonly buffer BufX { float X[]; };  // (rows*cols)
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint wpr;   // ceil(cols/4)
+};
+
+void main()
+{
+    const uint total = rows * cols;
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint idx = gl_GlobalInvocationID.x; idx < total; idx += stride)
+    {
+        const uint row = idx / cols;
+        const uint c   = idx % cols;
+        const uint word = P[row * wpr + c / 4u];
+        const uint qb = (word >> (8u * (c % 4u))) & 0xFFu;
+        X[idx] = float(int(qb) - (qb >= 128u ? 256 : 0));
+    }
+}

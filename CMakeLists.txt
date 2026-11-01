@@ -115,7 +115,8 @@ if(NN_ENABLE_GPU)
             matmul matmul_tiled batched_matmul rearrange_3d elementwise_v2 transpose
             gather scatter_add im2col col2im group_reduce scan_prefix_outer
             scan_suffix_outer scan_prefix_outer_gen scan_suffix_outer_gen
-            outer_col trit_pack matmul_q cast)
+            outer_col trit_pack matmul_q cast quantize_i8 unpack_i8 matmul_q_i8
+            quantized_adamw_step)
         foreach(SHADER_NAME ${GPU_SHADERS})
             nn_embed_shader(${SHADER_NAME} ${SHADER_DIR}/${SHADER_NAME}.comp)
         endforeach()
@@ -130,6 +131,7 @@ if(NN_ENABLE_GPU)
         nn_embed_shader(matmul_tiled_f16 ${SHADER_DIR}/matmul_tiled.comp -DNN_SHADER_F16=1)
         nn_embed_shader(matmul_tiled_fine ${SHADER_DIR}/matmul_tiled.comp -DNN_MM_FINE=1)
         nn_embed_shader(matmul_gemv_f16 ${SHADER_DIR}/matmul_gemv.comp --target-env=vulkan1.2 -DNN_SHADER_F16=1)
+        nn_embed_shader(matmul_q_i8_f16 ${SHADER_DIR}/matmul_q_i8.comp -DNN_SHADER_F16=1)
         nn_embed_shader(scan_prefix_outer_f16 ${SHADER_DIR}/scan_prefix_outer.comp -DNN_SHADER_F16=1)
         nn_embed_shader(scan_suffix_outer_f16 ${SHADER_DIR}/scan_suffix_outer.comp -DNN_SHADER_F16=1)
         nn_embed_shader(scan_prefix_outer_d32 ${SHADER_DIR}/scan_prefix_outer.comp -DNN_SCAN_DK_MAX=32)

@@ -57,6 +57,7 @@
 #include "expr_dsl.hpp"    // matmul_with_bias 经 DSL 融合（单一事实源）
 #include "expr_glsl_gen.hpp"  // fused_kernel_meta_of（JIT 懒建 pipeline 的元数据）
 #include "ternary_pack.hpp"  // 三值打包布局（trit_pack / matmul_q，P2/F3）
+#include "int8_pack.hpp"     // int8 激活打包布局（quantize_i8 / matmul_q_i8，P3）
 #include "kernel_cache.hpp"  // KernelCache / kernel_cache_key / encode_expr_spec（Phase 2 JIT）
 #include "kernelgen_api.h"   // libnn-kernelgen.so C ABI（Phase 2 JIT 现编）
 
@@ -832,6 +833,150 @@ public:
         // 静态工厂直构的 GPU 张量：设备域从存储派生（v3），直接进公共 cast
         // （同 CPU matmul_q_impl；17 §5 M6 的基类内部中转）。
         return cast(std::move(res), P);
+    }
+
+    // ── int8 激活量化（P3，W1.58A8）：quantize / unpack / matmul_q_i8 ──────
+    // 语义见 compute_engine.hpp 公共入口；容器 = f32 张量承载原始字（与
+    // trit_pack / matmul_q 同先例，不做浮点运算）。
+    [[nodiscard]] Result<Tensor> quantize_i8_impl(const Tensor& x, const Tensor& scale,
+                                                  bool col_scale, Precision P) override
+    {
+        if (!(backend_->has(PipelineId::quantize_i8)))
+            NN_FAIL("quantize_i8: 该设备未创建 int8 量化 pipeline（docs 21 §5 P3）");
+        if (!x.is_gpu() || !scale.is_gpu()) NN_FAIL("quantize_i8: GPU 张量必需");
+        if (P != Precision::F32 || x.precision() != Precision::F32)
+        {
+            auto x32 =
+                (x.precision() == Precision::F32) ? Result<Tensor>{x} : cast(x, Precision::F32);
+            NN_TRY_CHECK(x32);
+            auto s32 = (scale.precision() == Precision::F32)
+                           ? Result<Tensor>{scale}
+                           : cast(scale, Precision::F32);
+            NN_TRY_CHECK(s32);
+            return quantize_i8_impl(*x32, *s32, col_scale, Precision::F32);
+        }
+        if (scale.precision() != Precision::F32) NN_FAIL("quantize_i8: 尺度必须 f32");
+        const std::size_t rows = x.rows(), cols = x.cols();
+        if (col_scale && (scale.rows() != 1 || scale.cols() != cols))
+            NN_FAIL("quantize_i8: 列尺度形状必须是 (1,N)（per-token）");
+        if (!col_scale && (scale.rows() != rows || scale.cols() != 1))
+            NN_FAIL("quantize_i8: 行尺度形状必须是 (M,1)");
+        const std::size_t wpr = nn::i8_pack::words_per_row(cols);
+        auto out = GpuTensor::create_empty(rows, wpr, *backend_);
+        NN_TRY_CHECK(out);
+        NN_TRY(r, backend_->quantize_i8_gpu(x.gpu_tensor().buffer(), scale.gpu_tensor().buffer(),
+                                            out->buffer(), static_cast<std::uint32_t>(rows),
+                                            static_cast<std::uint32_t>(cols),
+                                            static_cast<std::uint32_t>(wpr), col_scale ? 1u : 0u));
+        return Tensor::from_gpu(std::move(*out));
+    }
+
+    [[nodiscard]] Result<Tensor> unpack_i8_impl(const Tensor& packed, std::size_t cols) override
+    {
+        if (!(backend_->has(PipelineId::unpack_i8)))
+            NN_FAIL("unpack_i8: 该设备未创建 int8 解包 pipeline（docs 21 §5 P3）");
+        if (!packed.is_gpu()) NN_FAIL("unpack_i8: GPU 张量必需");
+        if (packed.precision() != Precision::F32) NN_FAIL("unpack_i8: 容器必须 f32");
+        const std::size_t rows = packed.rows();
+        const std::size_t wpr = nn::i8_pack::words_per_row(cols);
+        if (packed.cols() != wpr) NN_FAIL("unpack_i8: 容器列数 != words_per_row(cols)");
+        auto out = GpuTensor::create_empty(rows, cols, *backend_);
+        NN_TRY_CHECK(out);
+        NN_TRY(r, backend_->unpack_i8_gpu(packed.gpu_tensor().buffer(), out->buffer(),
+                                          static_cast<std::uint32_t>(rows),
+                                          static_cast<std::uint32_t>(cols),
+                                          static_cast<std::uint32_t>(wpr)));
+        return Tensor::from_gpu(std::move(*out));
+    }
+
+    [[nodiscard]] Result<Tensor> matmul_q_i8_impl(const Tensor& packed_w, const Tensor& tau,
+                                                  const Tensor& packed_x, const Tensor& sx,
+                                                  Precision P) override
+    {
+        if (!(backend_->has(PipelineId::matmul_q_i8)))
+            NN_FAIL("matmul_q_i8: 该设备未创建 int8 量化 GEMM pipeline（docs 21 §5 P3）");
+        if (!packed_w.is_gpu() || !tau.is_gpu() || !packed_x.is_gpu() || !sx.is_gpu())
+            NN_FAIL("matmul_q_i8: GPU 张量必需");
+        if (packed_w.precision() != Precision::F32 || packed_x.precision() != Precision::F32 ||
+            tau.precision() != Precision::F32 || sx.precision() != Precision::F32)
+            NN_FAIL("matmul_q_i8: 需要 f32 容器/尺度");
+        const std::size_t M = packed_w.rows();
+        const std::size_t K = packed_x.rows();
+        const std::size_t N = sx.cols();
+        if (sx.rows() != 1) NN_FAIL("matmul_q_i8: 激活尺度必须是 (1,N)");
+        if (tau.rows() != M || tau.cols() != 1) NN_FAIL("matmul_q_i8: τ 必须是 (M,1)");
+        const std::size_t wpr_w = nn::trit_pack::words_per_row(K);
+        const std::size_t wpr_q = nn::i8_pack::words_per_row(N);
+        if (wpr_w != packed_w.cols()) NN_FAIL("matmul_q_i8: 权重容器列数与 K 不匹配");
+        if (wpr_q != packed_x.cols()) NN_FAIL("matmul_q_i8: 激活容器列数与 N 不匹配");
+
+        // in-kernel f16 输出变体（f16 profile 下免边界 cast）
+        if (P == Precision::F16 && backend_->has(PipelineId::matmul_q_i8_f16))
+        {
+            auto out16 = GpuTensorF16::create_empty(M, N, *backend_);
+            NN_TRY_CHECK(out16);
+            NN_TRY(r, backend_->matmul_q_i8_gpu(
+                          packed_w.gpu_tensor().buffer(), tau.gpu_tensor().buffer(),
+                          packed_x.gpu_tensor().buffer(), sx.gpu_tensor().buffer(),
+                          out16->buffer(), static_cast<std::uint32_t>(M),
+                          static_cast<std::uint32_t>(N), static_cast<std::uint32_t>(K),
+                          static_cast<std::uint32_t>(wpr_w), static_cast<std::uint32_t>(wpr_q),
+                          /*f16=*/true));
+            return Tensor::from_gpu(std::move(*out16));
+        }
+
+        auto out = GpuTensor::create_empty(M, N, *backend_);
+        NN_TRY_CHECK(out);
+        NN_TRY(r, backend_->matmul_q_i8_gpu(
+                      packed_w.gpu_tensor().buffer(), tau.gpu_tensor().buffer(),
+                      packed_x.gpu_tensor().buffer(), sx.gpu_tensor().buffer(), out->buffer(),
+                      static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(N),
+                      static_cast<std::uint32_t>(K), static_cast<std::uint32_t>(wpr_w),
+                      static_cast<std::uint32_t>(wpr_q), /*f16=*/false));
+        Tensor res = Tensor::from_gpu(std::move(*out));
+        if (P == Precision::F32) return res;
+        return cast(std::move(res), P);
+    }
+
+    // ── 量化状态 AdamW 一步（AdamWInt8，领域原语，docs 21 §4.19）──────────
+    // 语义与数值口径见抽象层公共入口；状态容器在设备侧就地读改写。
+    [[nodiscard]] Result<void> quantized_adamw_step_impl(
+        Tensor& param, const Tensor& grad, Tensor& m_packed, Tensor& v_packed,
+        const Tensor& m_scale_old, const Tensor& m_scale_new, const Tensor& v_scale_old,
+        const Tensor& v_scale_new, Scalar lr, Scalar beta1, Scalar beta2, Scalar eps, Scalar wd,
+        Scalar inv_bc1, Scalar inv_bc2) override
+    {
+        if (!(backend_->has(PipelineId::quantized_adamw_step)))
+            NN_FAIL("quantized_adamw_step: 该设备未创建量化状态 AdamW pipeline（docs 21 §4.19）");
+        if (!param.is_gpu() || !grad.is_gpu() || !m_packed.is_gpu() || !v_packed.is_gpu() ||
+            !m_scale_old.is_gpu() || !m_scale_new.is_gpu() || !v_scale_old.is_gpu() ||
+            !v_scale_new.is_gpu())
+            NN_FAIL("quantized_adamw_step: GPU 张量必需");
+        if (param.precision() != Precision::F32 || grad.precision() != Precision::F32 ||
+            m_packed.precision() != Precision::F32 || v_packed.precision() != Precision::F32 ||
+            m_scale_old.precision() != Precision::F32 || m_scale_new.precision() != Precision::F32 ||
+            v_scale_old.precision() != Precision::F32 || v_scale_new.precision() != Precision::F32)
+            NN_FAIL("quantized_adamw_step: 参数/梯度/尺度/容器必须 f32");
+        const std::size_t rows = param.rows(), cols = param.cols();
+        if (grad.rows() != rows || grad.cols() != cols)
+            NN_FAIL("quantized_adamw_step: 梯度形状不匹配");
+        const std::size_t wpr = nn::i8_pack::words_per_row(cols);
+        if (m_packed.rows() != rows || m_packed.cols() != wpr || v_packed.rows() != rows ||
+            v_packed.cols() != wpr)
+            NN_FAIL("quantized_adamw_step: 状态容器形状必须 (rows, ceil(cols/4))");
+        if (m_scale_old.rows() != rows || m_scale_old.cols() != 1 || m_scale_new.rows() != rows ||
+            m_scale_new.cols() != 1 || v_scale_old.rows() != rows || v_scale_old.cols() != 1 ||
+            v_scale_new.rows() != rows || v_scale_new.cols() != 1)
+            NN_FAIL("quantized_adamw_step: 尺度必须 (rows,1)");
+
+        return backend_->quantized_adamw_step_gpu(
+            param.gpu_tensor().buffer(), grad.gpu_tensor().buffer(),
+            m_packed.gpu_tensor().buffer(), v_packed.gpu_tensor().buffer(),
+            m_scale_old.gpu_tensor().buffer(), m_scale_new.gpu_tensor().buffer(),
+            v_scale_old.gpu_tensor().buffer(), v_scale_new.gpu_tensor().buffer(),
+            static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(cols),
+            static_cast<std::uint32_t>(wpr), lr, beta1, Scalar{1} - beta1, beta2, Scalar{1} - beta2,
+            eps, wd, inv_bc1, inv_bc2);
     }
 
     [[nodiscard]] Result<Tensor> matmul_impl(const Tensor& A, const Tensor& B, bool transA,

@@ -81,7 +81,9 @@
                                     X(scan_prefix_outer_gen_f16) X(scan_suffix_outer_gen)          \
                                         X(scan_suffix_outer_gen_f16) X(outer_col) X(outer_col_f16) \
                                             X(cast) X(trit_pack) X(matmul_q) X(matmul_q_f16)       \
-                                                X(matmul_q_gemv) X(matmul_q_gemv_f16)
+                                                X(matmul_q_gemv) X(matmul_q_gemv_f16)                \
+                                                    X(quantize_i8) X(unpack_i8) X(matmul_q_i8)        \
+                                                        X(matmul_q_i8_f16) X(quantized_adamw_step)
 #if __has_include("matmul_spv.hpp")
 #include "matmul_spv.hpp"
 #define NN_SPV_FN_matmul nn_matmul_spirv_bytecode
@@ -404,6 +406,43 @@
 #define NN_SPV_FN_matmul_q_gemv_f16 nn_matmul_q_gemv_f16_spirv_bytecode
 #else
 #define NN_SPV_FN_matmul_q_gemv_f16 NN_SPV_FN_MISSING
+#endif
+
+// ── int8 激活量化（P3，W1.58A8）：quantize / unpack / matmul_q_i8 ──────────
+#if __has_include("quantize_i8_spv.hpp")
+#include "quantize_i8_spv.hpp"
+#define NN_SPV_FN_quantize_i8 nn_quantize_i8_spirv_bytecode
+#else
+#define NN_SPV_FN_quantize_i8 NN_SPV_FN_MISSING
+#endif
+
+#if __has_include("unpack_i8_spv.hpp")
+#include "unpack_i8_spv.hpp"
+#define NN_SPV_FN_unpack_i8 nn_unpack_i8_spirv_bytecode
+#else
+#define NN_SPV_FN_unpack_i8 NN_SPV_FN_MISSING
+#endif
+
+#if __has_include("matmul_q_i8_spv.hpp")
+#include "matmul_q_i8_spv.hpp"
+#define NN_SPV_FN_matmul_q_i8 nn_matmul_q_i8_spirv_bytecode
+#else
+#define NN_SPV_FN_matmul_q_i8 NN_SPV_FN_MISSING
+#endif
+
+#if __has_include("matmul_q_i8_f16_spv.hpp")
+#include "matmul_q_i8_f16_spv.hpp"
+#define NN_SPV_FN_matmul_q_i8_f16 nn_matmul_q_i8_f16_spirv_bytecode
+#else
+#define NN_SPV_FN_matmul_q_i8_f16 NN_SPV_FN_MISSING
+#endif
+
+// ── 量化状态 AdamW 一步（AdamWInt8，领域原语，docs 21 §4.19）────────────
+#if __has_include("quantized_adamw_step_spv.hpp")
+#include "quantized_adamw_step_spv.hpp"
+#define NN_SPV_FN_quantized_adamw_step nn_quantized_adamw_step_spirv_bytecode
+#else
+#define NN_SPV_FN_quantized_adamw_step NN_SPV_FN_MISSING
 #endif
 
 // AOT 融合 shader 注册表（构建期 scan_exprs 收集 + gen_fused 合成；表达式

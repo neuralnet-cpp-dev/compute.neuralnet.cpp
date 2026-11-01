@@ -1644,7 +1644,229 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
     return {};
 }
 
-// ── 创建逻辑形状 (rows,cols) 但存储为偶数槽位的 f16 张量 ───────────
+// ── int8 激活量化（P3，W1.58A8）：quantize / unpack / matmul_q_i8 ──────────
+// 语义与形状契约见 compute_engine.hpp 公共入口 + int8_pack.hpp。
+// 当前三个内核都是"逐元素扁平网格"参考实现（stride 循环 + 256 线程/组）：
+// 正确性优先；宽 batch 性能（分块/共享）按 P3 先量后承诺另行落地。
+
+[[nodiscard]] Result<void> quantize_i8_gpu(const GpuBuffer& x, const GpuBuffer& s,
+                                           const GpuBuffer& p, std::uint32_t rows,
+                                           std::uint32_t cols, std::uint32_t wpr,
+                                           std::uint32_t col_scale)
+{
+    if (!initialized_) NN_FAIL("GPU backend not initialized");
+    if (!has(PipelineId::quantize_i8)) NN_FAIL("quantize_i8_gpu: quantize_i8 pipeline not available");
+    const VulkanPipeline& pipe = pipelines_.get(PipelineId::quantize_i8);
+    const VkBuffer bindings[3]{gpu_vk_impl(x), gpu_vk_impl(s), gpu_vk_impl(p)};
+    auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
+    NN_TRY_CHECK(ds_r);
+    VkDescriptorSet desc_set = *ds_r;
+
+    auto cmd_r = acquire_cmd();
+    if (!cmd_r)
+    {
+        release_desc_set_now(desc_set);
+        NN_TRY_CHECK(cmd_r);
+    }
+    auto [cmd, owns_cmd] = *cmd_r;
+
+    std::vector<VkBuffer> in_bufs{gpu_vk_impl(x), gpu_vk_impl(s)};
+    record_input_barriers(cmd, in_bufs);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.handle());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline_layout(), 0, 1,
+                            &desc_set, 0, nullptr);
+
+    struct Push
+    { std::uint32_t rows, cols, wpr, col_scale; };
+    Push push{rows, cols, wpr, col_scale};
+    std::vector<std::uint8_t> pc(sizeof(push));
+    std::memcpy(pc.data(), &push, sizeof(push));
+    vkCmdPushConstants(cmd, pipe.pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       static_cast<uint32_t>(pc.size()), pc.data());
+
+    const std::uint64_t total = static_cast<std::uint64_t>(rows) * wpr;
+    const std::uint32_t gw = static_cast<std::uint32_t>((total + 255u) / 256u);
+    vkCmdDispatch(cmd, gw < 1u ? 1u : gw, 1u, 1u);
+    record_output_barrier(cmd, gpu_vk_impl(p));
+
+    if (owns_cmd)
+    {
+        auto r = submit_and_wait(cmd, desc_set);
+        NN_TRY_CHECK(r);
+    }
+    return {};
+}
+
+[[nodiscard]] Result<void> unpack_i8_gpu(const GpuBuffer& p, const GpuBuffer& x, std::uint32_t rows,
+                                         std::uint32_t cols, std::uint32_t wpr)
+{
+    if (!initialized_) NN_FAIL("GPU backend not initialized");
+    if (!has(PipelineId::unpack_i8)) NN_FAIL("unpack_i8_gpu: unpack_i8 pipeline not available");
+    const VulkanPipeline& pipe = pipelines_.get(PipelineId::unpack_i8);
+    const VkBuffer bindings[2]{gpu_vk_impl(p), gpu_vk_impl(x)};
+    auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
+    NN_TRY_CHECK(ds_r);
+    VkDescriptorSet desc_set = *ds_r;
+
+    auto cmd_r = acquire_cmd();
+    if (!cmd_r)
+    {
+        release_desc_set_now(desc_set);
+        NN_TRY_CHECK(cmd_r);
+    }
+    auto [cmd, owns_cmd] = *cmd_r;
+
+    record_input_barriers(cmd, {gpu_vk_impl(p)});
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.handle());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline_layout(), 0, 1,
+                            &desc_set, 0, nullptr);
+
+    struct Push
+    { std::uint32_t rows, cols, wpr; };
+    Push push{rows, cols, wpr};
+    std::vector<std::uint8_t> pc(sizeof(push));
+    std::memcpy(pc.data(), &push, sizeof(push));
+    vkCmdPushConstants(cmd, pipe.pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       static_cast<uint32_t>(pc.size()), pc.data());
+
+    const std::uint64_t total = static_cast<std::uint64_t>(rows) * cols;
+    const std::uint32_t gw = static_cast<std::uint32_t>((total + 255u) / 256u);
+    vkCmdDispatch(cmd, gw < 1u ? 1u : gw, 1u, 1u);
+    record_output_barrier(cmd, gpu_vk_impl(x));
+
+    if (owns_cmd)
+    {
+        auto r = submit_and_wait(cmd, desc_set);
+        NN_TRY_CHECK(r);
+    }
+    return {};
+}
+
+[[nodiscard]] Result<void> matmul_q_i8_gpu(const GpuBuffer& w, const GpuBuffer& t,
+                                           const GpuBuffer& q, const GpuBuffer& s, const GpuBuffer& y,
+                                           std::uint32_t M, std::uint32_t N, std::uint32_t K,
+                                           std::uint32_t wpr_w, std::uint32_t wpr_q, bool f16)
+{
+    if (!initialized_) NN_FAIL("GPU backend not initialized");
+    const VulkanPipeline* pipe = nullptr;
+    if (f16)
+    {
+        if (!has(PipelineId::matmul_q_i8_f16))
+            NN_FAIL("matmul_q_i8_gpu: f16 pipeline not available（设备缺 16 位存储？）");
+        pipe = &pipelines_.get(PipelineId::matmul_q_i8_f16);
+    }
+    else
+    {
+        if (!has(PipelineId::matmul_q_i8))
+            NN_FAIL("matmul_q_i8_gpu: matmul_q_i8 pipeline not available");
+        pipe = &pipelines_.get(PipelineId::matmul_q_i8);
+    }
+    const VkBuffer bindings[5]{gpu_vk_impl(w), gpu_vk_impl(t), gpu_vk_impl(q), gpu_vk_impl(s),
+                               gpu_vk_impl(y)};
+    auto ds_r = alloc_desc_set_for(pipe->descriptor_layout(), bindings);
+    NN_TRY_CHECK(ds_r);
+    VkDescriptorSet desc_set = *ds_r;
+
+    auto cmd_r = acquire_cmd();
+    if (!cmd_r)
+    {
+        release_desc_set_now(desc_set);
+        NN_TRY_CHECK(cmd_r);
+    }
+    auto [cmd, owns_cmd] = *cmd_r;
+
+    std::vector<VkBuffer> in_bufs{gpu_vk_impl(w), gpu_vk_impl(t), gpu_vk_impl(q), gpu_vk_impl(s)};
+    record_input_barriers(cmd, in_bufs);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->handle());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipeline_layout(), 0, 1,
+                            &desc_set, 0, nullptr);
+
+    struct Push
+    { std::uint32_t M, N, K, wpr_w, wpr_q; };
+    Push push{M, N, K, wpr_w, wpr_q};
+    std::vector<std::uint8_t> pc(sizeof(push));
+    std::memcpy(pc.data(), &push, sizeof(push));
+    vkCmdPushConstants(cmd, pipe->pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       static_cast<uint32_t>(pc.size()), pc.data());
+
+    const std::uint64_t total = static_cast<std::uint64_t>(M) * N;
+    const std::uint32_t gw = static_cast<std::uint32_t>((total + 255u) / 256u);
+    vkCmdDispatch(cmd, gw < 1u ? 1u : gw, 1u, 1u);
+    record_output_barrier(cmd, gpu_vk_impl(y));
+
+    if (owns_cmd)
+    {
+        auto r = submit_and_wait(cmd, desc_set);
+        NN_TRY_CHECK(r);
+    }
+    return {};
+}
+
+// ── 量化状态 AdamW 一步（AdamWInt8，领域原语，docs 21 §4.19）──────────────
+// 语义与数值口径见 compute_engine.hpp 公共入口；每线程一个打包字（4 字节）→
+// 字内 4 元素串行写回，无字节级竞态。push = 3×uint + 9×float = 48 B。
+[[nodiscard]] Result<void> quantized_adamw_step_gpu(
+    const GpuBuffer& param, const GpuBuffer& grad, const GpuBuffer& m_packed,
+    const GpuBuffer& v_packed, const GpuBuffer& ms0, const GpuBuffer& ms1, const GpuBuffer& vs0,
+    const GpuBuffer& vs1, std::uint32_t rows, std::uint32_t cols, std::uint32_t wpr, float lr,
+    float beta1, float one_m_b1, float beta2, float one_m_b2, float eps, float wd, float inv_bc1,
+    float inv_bc2)
+{
+    if (!initialized_) NN_FAIL("GPU backend not initialized");
+    if (!has(PipelineId::quantized_adamw_step))
+        NN_FAIL("quantized_adamw_step_gpu: quantized_adamw_step pipeline not available");
+    const VulkanPipeline& pipe = pipelines_.get(PipelineId::quantized_adamw_step);
+    const VkBuffer bindings[8]{gpu_vk_impl(param), gpu_vk_impl(grad), gpu_vk_impl(m_packed),
+                               gpu_vk_impl(v_packed), gpu_vk_impl(ms0), gpu_vk_impl(ms1),
+                               gpu_vk_impl(vs0), gpu_vk_impl(vs1)};
+    auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
+    NN_TRY_CHECK(ds_r);
+    VkDescriptorSet desc_set = *ds_r;
+
+    auto cmd_r = acquire_cmd();
+    if (!cmd_r)
+    {
+        release_desc_set_now(desc_set);
+        NN_TRY_CHECK(cmd_r);
+    }
+    auto [cmd, owns_cmd] = *cmd_r;
+
+    std::vector<VkBuffer> in_bufs{gpu_vk_impl(grad), gpu_vk_impl(ms0), gpu_vk_impl(ms1),
+                                  gpu_vk_impl(vs0), gpu_vk_impl(vs1)};
+    record_input_barriers(cmd, in_bufs);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.handle());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline_layout(), 0, 1,
+                            &desc_set, 0, nullptr);
+
+    struct Push
+    {
+        std::uint32_t rows, cols, wpr;
+        float lr, beta1, one_m_b1, beta2, one_m_b2, eps, wd, inv_bc1, inv_bc2;
+    };
+    Push push{rows, cols, wpr, lr, beta1, one_m_b1, beta2, one_m_b2, eps, wd, inv_bc1, inv_bc2};
+    std::vector<std::uint8_t> pc(sizeof(push));
+    std::memcpy(pc.data(), &push, sizeof(push));
+    vkCmdPushConstants(cmd, pipe.pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       static_cast<uint32_t>(pc.size()), pc.data());
+
+    const std::uint64_t total_words = static_cast<std::uint64_t>(rows) * wpr;
+    const std::uint32_t gw = static_cast<std::uint32_t>((total_words + 255u) / 256u);
+    vkCmdDispatch(cmd, gw < 1u ? 1u : gw, 1u, 1u);
+    record_output_barrier(cmd, gpu_vk_impl(param));
+    record_output_barrier(cmd, gpu_vk_impl(m_packed));
+    record_output_barrier(cmd, gpu_vk_impl(v_packed));
+
+    if (owns_cmd)
+    {
+        auto r = submit_and_wait(cmd, desc_set);
+        NN_TRY_CHECK(r);
+    }
+    return {};
+}
 // f32→f16 的 cast 每线程按整 word（两 half）写入；奇数元素 count 时最后一个
 // word 会越界 2 字节。这里把底层缓冲按偶数元素分配（多 1 槽），逻辑形状不变，
 // 写 word 永不越界；to_matrix 仍只读前 rows*cols 个元素。

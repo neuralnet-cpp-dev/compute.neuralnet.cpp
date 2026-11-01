@@ -131,6 +131,22 @@ inline std::span<const PipelineSpec> GpuBackend::pipeline_specs()
          5 * sizeof(std::uint32_t), R::always},
         {PipelineId::matmul_q_gemv_f16, "matmul_q_gemv_f16", get_matmul_q_gemv_f16_spirv, 4,
          5 * sizeof(std::uint32_t), R::needs_16bit_storage},
+        // ── int8 激活量化（P3，W1.58A8）────────────────────────────────
+        // quantize_i8：{rows, cols, wpr, col_scale}
+        {PipelineId::quantize_i8, "quantize_i8", get_quantize_i8_spirv, 3,
+         4 * sizeof(std::uint32_t), R::always},
+        // unpack_i8：{rows, cols, wpr}
+        {PipelineId::unpack_i8, "unpack_i8", get_unpack_i8_spirv, 2, 3 * sizeof(std::uint32_t),
+         R::always},
+        // matmul_q_i8：{M, N, K, wpr_w, wpr_q}
+        {PipelineId::matmul_q_i8, "matmul_q_i8", get_matmul_q_i8_spirv, 5,
+         5 * sizeof(std::uint32_t), R::always},
+        {PipelineId::matmul_q_i8_f16, "matmul_q_i8_f16", get_matmul_q_i8_f16_spirv, 5,
+         5 * sizeof(std::uint32_t), R::needs_16bit_storage},
+        // 量化状态 AdamW 一步（AdamWInt8，docs 21 §4.19）：8 个绑定（param/grad/
+        // m_packed/v_packed/ms0/ms1/vs0/vs1），push = 3×uint + 9×float = 48 B
+        {PipelineId::quantized_adamw_step, "quantized_adamw_step",
+         get_quantized_adamw_step_spirv, 8, 12 * sizeof(std::uint32_t), R::always},
     };
     return kSpecs;
 }

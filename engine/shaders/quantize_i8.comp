@@ -1,0 +1,56 @@
+// ── quantize_i8.comp — int8 激活量化原语（P3，W1.58A8）─────────────────────
+// 语义：X (rows,cols) f32 + 尺度 S → 打包字 (rows, wpr)，wpr = (cols+3)/4。
+// 布局（int8_pack.hpp）：每元素 8 bit、4 元素/32-bit 字、行内小端：
+//   字节(c) = (word >> 8·(c%4)) & 0xFF（signed int8，值域 [-127,127]）
+// 量化公式（与 CPU / int8_pack.hpp 同一口径，铁律 8 确定性）：
+//   q = round(clamp(x/s, -127, 127))（round-half-away-from-zero；先 clamp 后
+//       round ⇒ 恒 ∈ [-127,127]）；s == 0（整行/整列为零）⇒ q = 0；NaN → 0。
+// 尺度广播：col_scale=1 → S 是 (1,N)（per-token absmax，激活侧）；col_scale=0
+// → S 是 (M,1)（优化器状态/权重侧）。
+// 容器 = f32 张量承载原始字（与 trit_pack 同先例）：C++ 侧经 bit_cast 读写。
+// ─────────────────────────────────────────────────────────────────────────
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufX { float X[]; };   // (rows*cols)
+layout(std430, binding = 1) readonly  buffer BufS { float S[]; };   // (1*cols) 或 (rows*1)
+layout(std430, binding = 2) writeonly buffer BufP { uint P[]; };    // 打包字 (rows*wpr)
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint wpr;       // ceil(cols/4)
+    uint col_scale; // 1 = 尺度按列 (1,N)；0 = 按行 (M,1)
+};
+
+int quantize_byte(float v, float s)
+{
+    if (s == 0.0) return 0;
+    float c = v / s;
+    if (c >= 127.0) c = 127.0;
+    else if (c <= -127.0) c = -127.0;
+    else if (isnan(c)) c = 0.0;
+    c = c + (c < 0.0 ? -0.5 : 0.5);
+    return int(c);   // trunc toward zero = round-half-away
+}
+
+void main()
+{
+    const uint total = rows * wpr;
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint idx = gl_GlobalInvocationID.x; idx < total; idx += stride)
+    {
+        const uint row = idx / wpr;
+        const uint wi  = idx % wpr;
+        const uint c0 = wi * 4u;
+        uint word = 0u;
+        for (uint j = 0u; j < 4u; ++j)
+        {
+            const uint c = c0 + j;
+            const float s = (col_scale != 0u) ? S[c] : S[row];
+            const int q = (c < cols) ? quantize_byte(X[row * cols + c], s) : 0;
+            word |= (uint(q) & 0xFFu) << (8u * j);
+        }
+        P[idx] = word;
+    }
+}
