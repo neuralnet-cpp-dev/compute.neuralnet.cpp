@@ -281,8 +281,8 @@ public:
     // 分析（fuse_expr_graph：纯逐元素单消费者链拼接 + S5 matmul 前置段），
     // 复合 kernel 直接写回各 tail 占位存储（中间量内联为寄存器）。
     //   · CPU 引擎：普通运行 no-op（表达式照常逐个求值）；NN_EXPR_SCAN 构建期
-    //     开启录制并在 end_expr 登记复合 spec（闭合世界两端一致）。
-    //   · GPU 引擎：录制 + 融合执行；复合 spec 未命中 AOT shader 硬报错。
+    //     开启录制并在 end_expr 登记复合 spec（注册表两端一致）。
+    //   · GPU 引擎：录制 + 融合执行；复合 spec 未命中 AOT 注册表 → JIT 兜底。
     // 契约（P1）：录制段内中间量**不得逃逸**（不落 backward 缓存 / 状态张量、
     // 段外不读中间值）；段内表达式一律经开启录制的引擎求值（跨引擎 fail-fast）。
     // P2「写穿物化/多输出」将解除逃逸限制。
@@ -1307,7 +1307,7 @@ public:
     //
     // 这是"函数式逐元素原语"的表达式升级：单行内多次计算（如 RoPE 的
     // q*cos + rotate(q)*sin、残差、激活）可合并为一次调用，减少临时 Tensor。
-    // 执行策略由后端决定（CPU 编译期模板求值；Vulkan AOT 融合 shader，闭合世界），
+    // 执行策略由后端决定（CPU 编译期模板求值；Vulkan AOT 注册表 + 运行期 JIT 兜底），
     // Layer 侧无需关心——表达式是唯一逐元素编程模型。
     //
     // 语义与上限见 expr_spec.hpp（ExprSpec）。输出 = 最后一条指令的目标寄存器。

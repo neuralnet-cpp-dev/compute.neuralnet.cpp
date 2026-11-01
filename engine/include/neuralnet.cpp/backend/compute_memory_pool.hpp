@@ -47,9 +47,9 @@ public:
     //   GPT d128/L8/b32: 8MB=4449 12MB=4445 16MB=4457 32MB=4457 128MB=4557
     //   MNIST MLP      : 8MB=82   12MB=94   16MB=90   32MB=122  128MB=314
     //   MNIST CNN      :          12MB=142  16MB=154            128MB=314
-    // 阶梯分类（"最小 2 的幂"尺寸类，NN_POOL_LADDER_MAX_MB 启用）默认关闭：
-    // d128 上 ladder16=4497 比 fixed16=4457 差 40MB。
-    // 可用 NN_POOL_BLOCK_MB 覆盖做调参。
+    // 阶梯分类（"最小 2 的幂"尺寸类，ladder 启用）默认关闭：
+    // d128 上 ladder16=4497 比 fixed16=4457 差 40MB（A/B 记录见 history；
+    // NN_POOL_LADDER_MAX_MB / NN_POOL_BLOCK_MB 调参变量已随实现收敛删除，2026-11）。
     static constexpr VkDeviceSize DEFAULT_BLOCK_SIZE = 12ull * 1024 * 1024; // 12MB
     // 尺寸分类分池（抗碎片，P3）：大块底材只服务大分配，小块底材只服务小分配，
     // 避免大量高频的小临时分配在大块底材里切出不可复用碎片、破坏大分配的

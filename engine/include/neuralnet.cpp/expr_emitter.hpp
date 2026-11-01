@@ -64,7 +64,7 @@ public:
     // 签名：0 = V0 全 f32（**含 extras 复合结构**，extras 引用恒 f32）；具体
     // 签名 = 静态特化变体，仅 **extras 为空**的结构（extras 的元素类型不在签名
     // 编码里 → 带 extras 的 f16 结构仍逐 kernel 降级）。运行期分派哨兵不支持。
-    // 默认返回空串 = 该后端不支持 → 运行期回退逐 kernel 派发（闭合世界降级，
+    // 默认返回空串 = 该后端不支持 → 运行期回退逐 kernel 派发（注册表降级，
     // 不是错误）。
     [[nodiscard]] virtual std::string generate_batched(const std::string&, const ExprSpec&,
                                                        ExprPrecSig = 0) const

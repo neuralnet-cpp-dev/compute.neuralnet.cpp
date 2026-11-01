@@ -58,7 +58,7 @@ public:
     // 构建期 scan（NN_EXPR_SCAN）：begin_expr 开启录制图（dsl 的 scan 分支把
     // 表达式加入图而非直接登记），end_expr 融合分析并登记**全部融合 kernel 的
     // spec**（含未拼接的单节点）——保证 GPU 运行期 begin_expr/end_expr 融合出的
-    // 复合 spec 命中 AOT shader（闭合世界两端一致）。
+    // 复合 spec 命中 AOT 注册表（注册表两端一致）。
     [[nodiscard]] Result<void> begin_expr() override
     {
 #ifdef NN_EXPR_SCAN
@@ -940,7 +940,7 @@ public:
     // ── matmul + 行广播 bias：经 DSL 融合（单一事实源）──────────────
     // 覆盖基类默认的"matmul + host 端 to_matrix 往返加 bias"：CPU 走模板求值，
     // GPU 走 AOT 融合 shader；scan_exprs dry-run 经本路径收集该结构 → gen_fused
-    // 生成融合 kernel（结构没被收集 = GPU 闭合世界里没有对应 key）。
+    // 生成融合 kernel（结构没被收集 = GPU 注册表里没有对应 key，运行期走 JIT 兜底）。
     [[nodiscard]] Result<Tensor> matmul_with_bias_impl(const Tensor& A, const Tensor& B,
                                                        const Tensor& bias, bool transA = false,
                                                        bool transB = false,

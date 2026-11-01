@@ -207,7 +207,7 @@ enum class ExprViewKind : uint8_t
     // param 是**运行时形状数据 → 不进 expr_spec_key**（同 RowMod 的 d_k）：
     // 任意 n_rep 共用一份 shader，运行时经 push constant vp 槽填充 —— 这正是
     // 它必须做成"视图参数"而不是"算子结构字段"的原因（后者会让每个 n_rep
-    // 各要一份 shader，闭合世界对未登记 n_rep 必然 miss）。
+    // 各要一份 shader，未登记 n_rep 必然 miss（走 JIT 兜底）。
     HeadGroup = 15,
     // ── 转置读取（不物化转置副本）────────────────────────────────────
     // 逻辑网格 (rows, cols) 读取**按 (cols, rows) 存储**的输入缓冲：
@@ -637,7 +637,7 @@ struct FusedKernelMeta
 // 恒得同 key，不同结构以极大概率不同。用于：
 //   1. 构建期 scan_exprs 注册表去重（identical 表达式只合成一个 shader）
 //   2. gen_fused 产物命名（fused_<key>）与嵌入注册
-//   3. 运行时 eval_expr 折叠内联表达式 → key → 查预编译 shader（闭合世界）
+//   3. 运行时 eval_expr 折叠内联表达式 → key → 查预编译 shader（AOT 注册表；未命中 JIT 兜底）
 // 逐字段字节级串接（不用 memcpy 整个 struct，避免 padding/平台差异）。
 [[nodiscard]] inline std::string expr_spec_key(const ExprSpec& s)
 {
@@ -731,7 +731,7 @@ struct FusedKernelMeta
         // 双域字段：matmul 段（tA/tB/槽位进 key，k/batch 形状参数不进
         //   ——同顶层 MatmulSpec 规则）、vecacc（全进：weight/scale 槽位是结构）。
         //   **vec_state_len 不进 key**（形状参数——输出列数=模型 d_k，进 key 会让
-        //   每个 dk 一个 shader、闭合世界对未登记 dk 必然 miss；运行时经 PC 的
+        //   每个 dk 一个 shader、未登记 dk 必然 miss（走 JIT 兜底）；运行时经 PC 的
         //   vector_out 槽填充——同 k/batch/vp 形状无关融合先例）。vecacc 的存在性
         //   （⇔veclen>0，成对校验）由 if 包裹隐式编码。
         if (s.fold->matmul)
@@ -986,7 +986,7 @@ inline constexpr std::uint32_t EXPR_FOLD_BLOCK = 128;
 // fold v2 每 WG 行数（NR）：把"按 WG 数计费"的固定成本（Ash 预载、入退场、
 //   调度人头）摊到 NR 行——四形状拟合实测该类占 fold ~54%（γ·rows）。
 //   生成器行循环与后端 dispatch ceil(rows/NR) **同源共用**；结构常量不进
-//   key（两侧同值即可，shader 同 key 重生成，闭合世界无感）。行序外层循环
+//   key（两侧同值即可，shader 同 key 重生成，注册表无感）。行序外层循环
 //   复用全部 shared（零增长 → 占用不掉档，Ash-shrink 探针已证 shared 非
 //   约束）；越界行 clamp 到末行重复算、写回由 row_ok 统一挡（末 WG 尾部
 //   padding；ri 循环全 WG 均匀 → 体内屏障无发散）。
@@ -1020,8 +1020,7 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK_FINE = 16;
 // 饥饿判据：64-tile 网格的工作组数（含 batch 维）低于该阈值 → 派细 tile
 // 变体。32 ≈ 40HX 的 SM 数（34）——低于它基本必有一波 SM 空转；高于它
 // 64-tile 的每 WG 效率优势占优（细 tile 每输出 LDS/共享足迹更高）。
-// 设备无关的固定阈值（Vulkan 不暴露 SM 数），可用 NN_MM_NO_FINE=1 关闭
-// 做 A/B；NN_MM_FINE_NAIVE=1 另可强制 OP 级走 matmul.comp 对照。
+// 设备无关的固定阈值（Vulkan 不暴露 SM 数）。
 inline constexpr std::uint32_t EXPR_MATMUL_FINE_MIN_WGS = 32;
 // ── matmul K 切分（键后缀 #ks/#kr，wgrad 二次归约）────────────────────────
 // 细 tile 网格（M×N/256 个 WG）仍低于该阈值 → 把 K 切成 S 段、网格 × S。

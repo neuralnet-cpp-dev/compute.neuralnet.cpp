@@ -713,7 +713,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
     // prec_sig）——block 不进 PC、不进 key，只是同一结构的第二种网格
     // 粒度（输出块 16×16 vs 64×64，见 EXPR_MATMUL_BLOCK_FINE）。运行期在
     // 64-tile 网格工作组饥饿时选它（< EXPR_MATMUL_FINE_MIN_WGS）；未登记
-    // /被 NN_MM_NO_FINE 关闭 → 留在 64-tile 路径（降级，不是错误）。
+    // → 留在 64-tile 路径（降级，不是错误）。
     struct FineEmit
     {
         const nn::ExprSpec* spec;

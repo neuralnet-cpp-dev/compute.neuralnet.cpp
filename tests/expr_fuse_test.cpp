@@ -13,7 +13,7 @@
 //   7. Adam 金刚石（P2 多输出写穿，融合 vs 未融合逐位一致）
 //   8. P3 跨链批量派发（`#b`）：批量 vs 逐个逐字节一致 + CPU 对照
 //
-//  链定义在 expr_fuse_shapes.hpp（单一事实源）。闭合世界登记（NN_EXPR_SCAN
+//  链定义在 expr_fuse_shapes.hpp（单一事实源）。注册表登记（NN_EXPR_SCAN
 //  收集器 / expr_fuse_shapes.cpp）在本仓无对应物：录制段的复合 spec 若未在
 //  fused_registry 登记，GPU 端按 IR-C 规则逐成员降级派发（可观测，非错误），
 //  数值断言不变。

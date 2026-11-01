@@ -621,7 +621,8 @@ private:
     bool batch_mode_ = false;
     std::size_t batch_frame_ = 0;        // 当前录制中的帧
     bool batch_has_ops_ = false;         // 当前帧是否已录制 op（空帧不提交）
-    // 帧提交后是否立即非阻塞收割已完成帧（显存峰值优化；NN_NO_EARLY_REAP=1 关闭）
+    // 帧提交后是否立即非阻塞收割已完成帧（显存峰值优化，默认开；
+    // 历史调参变量 NN_NO_EARLY_REAP 已随实现收敛删除，2026-11）
     bool early_reap_enabled_ = true;
     VkCommandBuffer batch_cmd_ = VK_NULL_HANDLE;  // 当前帧的 command buffer
 

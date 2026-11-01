@@ -1534,7 +1534,7 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         return (sig != 0 && expr_prec_sig_in_f16(sig, i)) ? ("float(" + f32e + ")") : f32e;
     };
     // 输出列数 **运行时读 PC 的 vector_out 槽**（形状无关：同 key 服务任意
-    // d_k——veclen 若进 key 则每个 dk 一个 shader、闭合世界必然缺登记）
+    // d_k——veclen 若进 key 则每个 dk 一个 shader、必然缺登记（走 JIT 兜底）
 
     std::ostringstream L;
     L << "// ── 自动生成（AOT 算子融合 · fold v2 双域），请勿手动编辑 ──\n";

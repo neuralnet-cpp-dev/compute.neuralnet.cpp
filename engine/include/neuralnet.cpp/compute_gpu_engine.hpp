@@ -137,7 +137,7 @@ public:
     // （expr_graph.hpp），返回带 virtual_tag 的占位 GPU 张量（真实存储）。
     // end_expr 融合分析（fuse_expr_graph）→ 复合 kernel 直接写回各 tail
     // 占位存储（output_override），中间量内联为寄存器。复合 spec 未命中
-    // AOT shader = 闭合世界硬报错（须在 scan_exprs 覆盖录制段）。
+    // AOT 注册表 miss = JIT 现编兜底（须在 scan_exprs 覆盖录制段以预热）。
     [[nodiscard]] Result<void> begin_expr() override
     {
         auto& owner = fused::recording_graph_owner();
@@ -449,25 +449,7 @@ public:
             auto rb = begin_batch();
             NN_TRY_CHECK(rb);
         }
-        else if (in_batch() && fresh_dst && copy_from_drain_forced())
-        {
-            // A/B 逃生阀：NN_COPY_FROM_DRAIN=1 强制 fresh 也走旧排空路径
-            // （回落对照；进程内静态缓存，同 NN_MM_NO_KSPLIT 口径）。
-            auto r = end_batch();
-            NN_TRY_CHECK(r);
-            auto rw = backend_->wait_in_flight();
-            NN_TRY_CHECK(rw);
-            auto rb = begin_batch();
-            NN_TRY_CHECK(rb);
-        }
         return backend_->upload_blocking(dst.gpu_tensor(), src.span());
-    }
-
-    // A/B 逃生阀：强制 fresh 上传也排空（默认关）。进程内静态缓存一次。
-    [[nodiscard]] static bool copy_from_drain_forced()
-    {
-        static const bool forced = nn::dsl::env_flag("NN_COPY_FROM_DRAIN");
-        return forced;
     }
 
     [[nodiscard]] Result<Tensor> clone_impl(const Tensor& src) override
@@ -919,7 +901,7 @@ public:
     }
 
     // ── matmul + 行广播 bias：经 DSL 融合（单一事实源）──────────────
-    // 走 eval_expr → AOT fusion shader 精确匹配（闭合世界）。同时让
+    // 走 eval_expr → AOT fusion shader 精确匹配（注册表命中优先）。同时让
     // scan_exprs dry-run 收集该"Linear 结构"spec，gen_fused 生成融合 kernel，
     // 使 GPU Linear::forward 全程在 GPU（基类 matmul_with_bias 的默认实现
     // 是 to_matrix/from_matrix 的 CPU 往返路径）。
@@ -927,7 +909,7 @@ public:
     // 多精度（Phase 2 in-kernel f16）：P 必须下传——f16 时**先试带类型变体**
     // （f16 直读 / f32 累加 / f16 写回，零边界 cast：Linear::forward 是 cast
     // 临时量最大的单一来源），无变体才在本函数内回退"抬 f32 → f32 融合 →
-    // 落回"（**绝不把缺变体变成硬报错**，闭合世界原则只在 f32 结构缺失时适用）。
+    // 落回"（**绝不把缺变体变成硬报错**，AOT 注册表原则只在 f32 结构缺失时适用）。
     [[nodiscard]] Result<Tensor> matmul_with_bias_impl(const Tensor& A, const Tensor& B,
                                                        const Tensor& bias, bool transA = false,
                                                        bool transB = false,
@@ -1316,12 +1298,13 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 表达式求值（闭合世界 AOT；未命中硬报错，绝不静默回退）
+    // 表达式求值（AOT 注册表 + JIT 兜底）
     //
     // 折叠内联表达式 → expr_spec_key → 查构建期合成的融合 shader 注册表
     // （fused_registry.hpp，由 scan_exprs 收集 + gen_fused 合成）；命中则
-    // dispatch 单个融合 shader；未命中**硬报错**（无 eager、无运行时生成、
-    // 不回退 CPU），提示把该内联表达式纳入构建期扫描。
+    // dispatch 单个融合 shader；未命中默认走运行期 JIT 现编（懒加载
+    // libnn-kernelgen.so → 生成 SPIR-V → 懒建 pipeline），NN_STRICT_CLOSED_WORLD=1
+    // 恢复硬报错（opt-in 看门狗）。
     //
     // 形状无关融合：RowMod/RotateHalf 的周期/块大小（如 RoPE 的 d_k）是
     // 运行时视图参数（不进 key），dispatch 时按实际 spec 填充 push constant
@@ -1674,7 +1657,7 @@ public:
                 return to_prec(std::move(*r), P);
             }
             NN_FAIL("GpuEngine::eval_expr: fold 表达式未命中 AOT 融合 shader"
-                    "（闭合世界）；请将该 fold 结构纳入 scan_exprs；key=" +
+                    "（AOT 注册表）；请将该 fold 结构纳入 scan_exprs；key=" +
                     fkey);
         }
         // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
@@ -1687,7 +1670,7 @@ public:
         // 能编译 —— 无注册表 = NN_EXPR_SCAN 收集器 TU（注册表是它自己的产物，
         // 见 compute_vk_backend.hpp 的 NN_EXPR_SCAN 不变量）或注册表缺失的干净
         // 构建。无注册表模式下 supports_expr_precision_variant 恒 false → NVI
-        // 入口已把输入抬到 f32 → psig 必为 0 → 正确落到下方闭合世界错误。
+        // 入口已把输入抬到 f32 → psig 必为 0 → 正确落到下方注册表 miss 错误。
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 变体优先（native16 `#a` → 运行期精度分派 `#x`）：按**真实输入精度**
@@ -1738,7 +1721,7 @@ public:
             return to_prec(std::move(*r), P);
         }
         // ── 未命中 AOT 注册表 → 运行期 JIT 现编（Phase 2；docs/internal/33）──
-        // 内嵌注册表（构建期闭合世界）降级为"预热加速器"：未知结构（使用者自研
+        // 内嵌注册表（构建期 AOT）降级为"预热加速器"：未知结构（使用者自研
         // 层、未枚举签名）走 JIT —— 引擎 dlopen libnn-kernelgen.so 现编 SPIR-V、
         // 懒建 pipeline、执行，并持久化进 .nnk 缓存。**绝不静默回退 CPU/边界 cast**。
         // psig==0（此刻输入已全 f32、P==F32）→ 只 JIT V0 结构键 `key`；输出 f32。
@@ -1749,7 +1732,7 @@ public:
             return *jr;
         }
         // ── 严格模式（NN_STRICT_CLOSED_WORLD=1，opt-in 看门狗）──
-        NN_FAIL("GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；"
+        NN_FAIL("GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（AOT 注册表）；"
                 "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"
                 "或关闭 NN_STRICT_CLOSED_WORLD 走 JIT 现编；"
                 "key=" +
@@ -1765,7 +1748,7 @@ public:
         i.device = backend_->device().device_name();
         i.native_f16_move = true;      // 字节级搬运 + 引擎内 cast 回退
         i.native_f16_reduce = backend_->has(PipelineId::reduce_f16);
-        i.fused_prec_variant = true;   // 有带类型融合 shader 机制（AOT 闭合世界）
+        i.fused_prec_variant = true;   // 有带类型融合 shader 机制（AOT 注册表）
         i.ternary_gemm =
             backend_->has(PipelineId::trit_pack) && backend_->has(PipelineId::matmul_q);
         i.int8_dot = backend_->device().has_int8_dot();
@@ -1799,7 +1782,7 @@ public:
         // 后处理"的形态（如 rsqrt(col_sum(x²)*k + c)）尚未正确实现：列归约
         // 分支会把后处理链在错误的索引上求值，实测给出**静默错值**
         // （ce_fusion_test 的"归约+后处理"用例：GPU err≈1.9，CPU err≈1e-7）。
-        // 这里显式硬报错，把"静默错值"变成"立即暴露的错误"（闭合世界原则）。
+        // 这里显式硬报错，把"静默错值"变成"立即暴露的错误"（AOT 注册表原则）。
         // 改用两步写法即可：先 compute_reduce 取归约向量，再对 (rows,1)/(1,cols)
         // 小向量用 dsl::compute 施加后处理（LayerNorm/RMSNorm 即此写法）。
         // 注意：CPU 端已支持该形态（eval_expr_impl 的按指令下标反向切片），
@@ -1854,8 +1837,8 @@ public:
             NN_TRY_CHECK(r);
             return to_prec(std::move(*r), P);
         }
-        // ── 闭合世界：未命中归约融合 shader → 硬报错（绝不静默回退） ──
-        NN_FAIL("GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（闭合世界）；"
+        // ── 注册表 miss：未命中归约融合 shader → 硬报错（JIT 未接线） ──
+        NN_FAIL("GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（AOT 注册表）；"
                 "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
                 "key=" +
                 key);
@@ -1941,8 +1924,8 @@ public:
             NN_TRY_CHECK(r);
             return cast_into(tmp, dst);
         }
-        // ── 闭合世界：未命中 AOT 融合 shader → 硬报错（绝不静默回退） ──
-        NN_FAIL("GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（闭合世界）；"
+        // ── 注册表 miss：未命中 AOT 融合 shader → 硬报错（JIT 未接线） ──
+        NN_FAIL("GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（AOT 注册表）；"
                 "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
                 "key=" +
                 key);
@@ -1998,7 +1981,7 @@ public:
             return {};
         }
 #endif
-        NN_FAIL("GpuEngine::eval_expr_multi_into: 未命中 AOT 融合 shader（闭合世界）；"
+        NN_FAIL("GpuEngine::eval_expr_multi_into: 未命中 AOT 融合 shader（AOT 注册表）；"
                 "请将 begin_expr/end_expr 段纳入构建期扫描（scan_exprs）；key=" +
                 key);
     }
@@ -2357,14 +2340,14 @@ private:
                              : !d.batchable ? "key#b 未登记/无 BDA"
                                             : "同签名未集齐 2 实例（依赖/上限）");
 
-            // ── 复合 kernel 的闭合世界降级（通用机制，非单算子特例）─────────
+            // ── 复合 kernel 的注册表降级（通用机制，非单算子特例）─────────
             // 融合**分组本身依赖精度**：P2 写穿组要求成员全 F32、P1 链要求成员
             // 同精度。于是混精度 profile（`--f16` = optimizer:F32 / param:F16）
             // 会产出 f32 扫描期根本不存在的复合结构（实测 Adam 的 {K3,K4} F16
             // 尾链）→ 构建期按精度组合枚举是 2^4 爆炸，不可取。改为运行期降级：
             // 复合 kernel 未登记（或写穿前置条件不满足：多输出 V0 要求全 f32）
             // 时拆回成员逐个派发——每个成员都是**已登记的单节点结构**（scan 的
-            // 个体结构恒登记），闭合世界仍然成立，只是该段退化为"1 节点 = 1
+            // 个体结构恒登记），注册表契约仍然成立，只是该段退化为"1 节点 = 1
             // dispatch"（= IR-C 之前的形态）。未登记的**单节点**仍是硬报错。
             if (d.degraded)
             {
@@ -2475,12 +2458,12 @@ private:
             return {};
         }
 #endif
-        NN_FAIL("GpuEngine::end_expr: 融合 kernel 未命中 AOT 融合 shader（闭合世界）；"
+        NN_FAIL("GpuEngine::end_expr: 融合 kernel 未命中 AOT 融合 shader（AOT 注册表）；"
                 "请将 begin_expr/end_expr 段纳入构建期扫描（scan_exprs）；key=" +
                 key);
     }
 
-    // ── 复合 kernel 可用性查询（闭合世界降级的判据）────────────────────────
+    // ── 复合 kernel 可用性查询（注册表降级的判据）────────────────────────
     // true = 该复合结构在 AOT 注册表里可执行（含 `#a`/`#x` 精度变体与写穿形态
     // 前置条件）。**只查不判错**：miss 由调用方降级为逐成员派发（见
     // execute_fused_graph）。与 run_graph_kernel_into_ / eval_expr_multi_into
@@ -2547,7 +2530,7 @@ private:
 
     // ── P3：`key#b` 批量变体可用性（注册表 + pipeline 双命中）──────────────
     // 设备无 buffer device address 时注册期即跳过 `#b` → 此处恒 false →
-    // 调用方逐 kernel 降级（闭合世界降级，不是错误）。
+    // 调用方逐 kernel 降级（注册表降级，不是错误）。
     // sig = 组内统一精度签名（0 = 全 f32；非 0 = 静态特化批量变体，键 =
     // `key#xxxx#b`，见 fused_generate 的批量发射目标）。
     // **返回命中的批量变体"前缀"**（`key` / `key#xxxx` / `key#s`，不含 `#b`）
