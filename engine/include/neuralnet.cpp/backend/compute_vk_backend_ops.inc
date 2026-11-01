@@ -50,12 +50,12 @@ elementwise_v2_gpu(const GpuTensor& A, const GpuTensor* B, const GpuTensor* C, u
     }
 
     // 2. 分配并写入描述符集（未使用的 binding 绑定 A 作为占位）
-    VkBuffer a_buf = A.buffer().impl();
+    VkBuffer a_buf = gpu_vk_impl(A.buffer());
     const VkBuffer bindings[4]{
         a_buf,
-        B ? B->buffer().impl() : a_buf,
-        C ? C->buffer().impl() : a_buf,
-        output.buffer().impl(),
+        B ? gpu_vk_impl(B->buffer()) : a_buf,
+        C ? gpu_vk_impl(C->buffer()) : a_buf,
+        gpu_vk_impl(output.buffer()),
     };
     auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
@@ -88,7 +88,7 @@ elementwise_v2_gpu(const GpuTensor& A, const GpuTensor* B, const GpuTensor* C, u
     // vec4 kernel（与 DSL count/(256*vec_width) 同口径）：每线程 4 元素
     const uint32_t wg_count = (count + 256u * 4u - 1u) / (256u * 4u);
     ts_dispatch(cmd, "elementwise_v2", wg_count, 1, 1);
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
     // 6. 独立模式提交
     if (owns_cmd)
@@ -384,12 +384,12 @@ run_fused_gpu(const std::string& shader_name,
         std::vector<VkBuffer> kr_bindings(n_in + 2);
         for (std::size_t i = 0; i < n_in; ++i)
         {
-            ks_bindings[i] = inputs[i]->impl();
-            kr_bindings[i] = inputs[i]->impl();
+            ks_bindings[i] = gpu_vk_impl(*inputs[i]);
+            kr_bindings[i] = gpu_vk_impl(*inputs[i]);
         }
-        ks_bindings[n_in] = partial.buffer().impl();
-        kr_bindings[n_in] = partial.buffer().impl();
-        kr_bindings[n_in + 1] = output.buffer().impl();
+        ks_bindings[n_in] = gpu_vk_impl(partial.buffer());
+        kr_bindings[n_in] = gpu_vk_impl(partial.buffer());
+        kr_bindings[n_in + 1] = gpu_vk_impl(output.buffer());
 
         auto ds1_r = alloc_desc_set_for(ks_pipe.descriptor_layout(), ks_bindings);
         NN_TRY_CHECK(ds1_r);
@@ -414,7 +414,7 @@ run_fused_gpu(const std::string& shader_name,
         std::vector<VkBuffer> in_bufs;
         in_bufs.reserve(inputs.size());
         for (const auto* b : inputs)
-            in_bufs.push_back(b->impl());
+            in_bufs.push_back(gpu_vk_impl(*b));
         record_input_barriers(cmd, in_bufs);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ks_pipe.handle());
@@ -434,7 +434,7 @@ run_fused_gpu(const std::string& shader_name,
             ts_dispatch(cmd, "fused_mm", gx, gy, matmul_batch, shader_name,
                         nn::EXPR_MM_KSPLIT_SUFFIX);
         }
-        record_output_barrier(cmd, partial.buffer().impl());
+        record_output_barrier(cmd, gpu_vk_impl(partial.buffer()));
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kr_pipe.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kr_pipe.pipeline_layout(), 0,
@@ -443,7 +443,7 @@ run_fused_gpu(const std::string& shader_name,
                            static_cast<std::uint32_t>(pc_kr.size()), pc_kr.data());
         ts_dispatch(cmd, "fused_mm", (count + 256u - 1u) / 256u, 1u, 1u, shader_name,
                     nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX);
-        record_output_barrier(cmd, output.buffer().impl());
+        record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
         // 5. 提交（独立模式等待后两个描述符集均可回收；批量模式由帧池
         //    reset 统一回收，与既有路径一致）——本块只在 `owns_cmd`
@@ -476,20 +476,20 @@ run_fused_gpu(const std::string& shader_name,
         // → 另一个从不访问（无别名风险）。
         for (std::size_t i = 0; i < n_in; ++i)
         {
-            bindings[i] = inputs[i]->impl();
-            bindings[n_in + i] = inputs[i]->impl();
+            bindings[i] = gpu_vk_impl(*inputs[i]);
+            bindings[n_in + i] = gpu_vk_impl(*inputs[i]);
         }
-        bindings[2 * n_in] = output.buffer().impl();
-        bindings[2 * n_in + 1] = output.buffer().impl();
+        bindings[2 * n_in] = gpu_vk_impl(output.buffer());
+        bindings[2 * n_in + 1] = gpu_vk_impl(output.buffer());
     }
     else
     {
         for (std::size_t i = 0; i < n_in; ++i)
-            bindings[i] = inputs[i]->impl();
-        bindings[n_in] = output.buffer().impl();
+            bindings[i] = gpu_vk_impl(*inputs[i]);
+        bindings[n_in] = gpu_vk_impl(output.buffer());
         // P2 多输出：bex<k> 绑定在主输出之后（与生成器 binding 同序）
         for (std::size_t k = 0; k < extra_outs.size(); ++k)
-            bindings[n_in + 1 + k] = extra_outs[k]->buffer().impl();
+            bindings[n_in + 1 + k] = gpu_vk_impl(extra_outs[k]->buffer());
     }
     auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
@@ -508,7 +508,7 @@ run_fused_gpu(const std::string& shader_name,
     std::vector<VkBuffer> in_bufs;
     in_bufs.reserve(inputs.size());
     for (const auto* b : inputs)
-        in_bufs.push_back(b->impl());
+        in_bufs.push_back(gpu_vk_impl(*b));
     record_input_barriers(cmd, in_bufs);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
@@ -648,10 +648,10 @@ run_fused_gpu(const std::string& shader_name,
                            : (count + 256u * vec_width - 1u) / (256u * vec_width);
         ts_dispatch(cmd, "fused", wg_count, 1, 1, shader_name);
     }
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
     // P2 多输出：额外输出同样过写后屏障
     for (const GpuTensor* eo : extra_outs)
-        record_output_barrier(cmd, eo->buffer().impl());
+        record_output_barrier(cmd, gpu_vk_impl(eo->buffer()));
 
     // 5. 独立模式提交
     if (owns_cmd)
@@ -752,7 +752,7 @@ run_fused_gpu(const std::string& shader_name,
         {
             VkBufferDeviceAddressInfo ai{};
             ai.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-            ai.buffer = b->impl();
+            ai.buffer = gpu_vk_impl(*b);
             const VkDeviceAddress addr = vkGetBufferDeviceAddress(device_.device(), &ai);
             table[base + slot * 2 + 0] = static_cast<std::uint32_t>(addr & 0xffffffffull);
             table[base + slot * 2 + 1] = static_cast<std::uint32_t>(addr >> 32);
@@ -775,8 +775,7 @@ run_fused_gpu(const std::string& shader_name,
     // 实例表缓冲：小 device-local（TRANSFER_DST 走 vkCmdUpdateBuffer）。
     // 数据内联进命令缓冲 → 录制生命周期安全；缓冲本体析构走 pending_destroys_
     // 延迟队列（铁律 6，与其余录制期资源同款）。
-    auto inst_r = GpuBuffer::create_device_local(
-        device_.device(), alloc_pool(), table.size() * sizeof(std::uint32_t),
+    auto inst_r = GpuBuffer::create_device_local(reinterpret_cast<std::uint64_t>(device_.device()), alloc_pool(), table.size() * sizeof(std::uint32_t),
         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, keepalive());
     NN_TRY_CHECK(inst_r);
     std::shared_ptr<GpuBuffer> inst_buf = std::make_shared<GpuBuffer>(std::move(*inst_r));
@@ -784,7 +783,7 @@ run_fused_gpu(const std::string& shader_name,
     // 描述符：key#b pipeline 只绑 binding 0（实例表）——复用 per-pipeline
     // 描述符机制
     // 批量变体只有一个 binding：实例表
-    const VkBuffer instance_table = inst_buf->impl();
+    const VkBuffer instance_table = gpu_vk_impl(*inst_buf);
     auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), {&instance_table, 1});
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -799,7 +798,7 @@ run_fused_gpu(const std::string& shader_name,
     auto [cmd, owns_cmd] = *cmd_r;
 
     // 录制：实例表写入 → 输入屏障（含实例表，去重）→ bind → PC → dispatch
-    vkCmdUpdateBuffer(cmd, inst_buf->impl(), 0,
+    vkCmdUpdateBuffer(cmd, gpu_vk_impl(*inst_buf), 0,
                       static_cast<std::uint32_t>(table.size() * sizeof(std::uint32_t)),
                       table.data());
     {
@@ -810,8 +809,8 @@ run_fused_gpu(const std::string& shader_name,
         in_bufs.reserve(instances.size() * (n_in + 1) + 1);
         for (const FusedBatchInst& inst : instances)
             for (const GpuBuffer* b : inst.inputs)
-                in_bufs.push_back(b->impl());
-        in_bufs.push_back(inst_buf->impl());
+                in_bufs.push_back(gpu_vk_impl(*b));
+        in_bufs.push_back(gpu_vk_impl(*inst_buf));
         std::sort(in_bufs.begin(), in_bufs.end());
         in_bufs.erase(std::unique(in_bufs.begin(), in_bufs.end()), in_bufs.end());
         record_input_barriers(cmd, in_bufs);
@@ -851,9 +850,9 @@ run_fused_gpu(const std::string& shader_name,
         out_bufs.reserve(instances.size() * (1 + n_ex));
         for (const FusedBatchInst& inst : instances)
         {
-            out_bufs.push_back(inst.out->impl());
+            out_bufs.push_back(gpu_vk_impl(*inst.out));
             for (const GpuBuffer* b : inst.extra_outs)
-                out_bufs.push_back(b->impl());
+                out_bufs.push_back(gpu_vk_impl(*b));
         }
         std::sort(out_bufs.begin(), out_bufs.end());
         out_bufs.erase(std::unique(out_bufs.begin(), out_bufs.end()), out_bufs.end());
@@ -995,8 +994,8 @@ run_fused_gpu(const std::string& shader_name,
         // pass1 读输入（f16_in → f16 pipeline，ds/layout 随之）；
         // pass2 读 f32 partials → 恒 f32 pipeline（f16 shader 读 f32
         // partials = 静默错值，必须分开）
-        const VkBuffer pass1_bindings[2]{input.buffer().impl(), reduce_partial_.buffer};
-        const VkBuffer pass2_bindings[2]{reduce_partial_.buffer, output.buffer().impl()};
+        const VkBuffer pass1_bindings[2]{gpu_vk_impl(input.buffer()), reduce_partial_.buffer};
+        const VkBuffer pass2_bindings[2]{reduce_partial_.buffer, gpu_vk_impl(output.buffer())};
         auto ds1_r = alloc_desc_set_for(in_pipe.descriptor_layout(), pass1_bindings);
         NN_TRY_CHECK(ds1_r);
         VkDescriptorSet ds1 = *ds1_r;
@@ -1015,7 +1014,7 @@ run_fused_gpu(const std::string& shader_name,
         auto [cmd, owns_cmd] = *cmd_r;
 
         // pass1：行块级部分归约 → partials（读输入 → in_pipe）
-        record_input_barriers(cmd, {input.buffer().impl()});
+        record_input_barriers(cmd, {gpu_vk_impl(input.buffer())});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, in_pipe.handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, in_pipe.pipeline_layout(), 0,
                                 1, &ds1, 0, nullptr);
@@ -1038,7 +1037,7 @@ run_fused_gpu(const std::string& shader_name,
         vkCmdPushConstants(cmd, pipelines_.get(PipelineId::reduce).pipeline_layout(),
                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push2), push2);
         ts_dispatch(cmd, "reduce", (cols + 31u) / 32u, 1, 1);
-        record_output_barrier(cmd, output.buffer().impl());
+        record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
         if (owns_cmd)
         {
@@ -1050,7 +1049,7 @@ run_fused_gpu(const std::string& shader_name,
     }
 
     // 2. 分配描述符集（随 in_pipe：f16_in 时输入按 float16_t 读）
-    const VkBuffer bindings[2]{input.buffer().impl(), output.buffer().impl()};
+    const VkBuffer bindings[2]{gpu_vk_impl(input.buffer()), gpu_vk_impl(output.buffer())};
     auto ds_r = alloc_desc_set_for(in_pipe.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -1065,7 +1064,7 @@ run_fused_gpu(const std::string& shader_name,
     auto [cmd, owns_cmd] = *cmd_r;
 
     // 5. 录制
-    record_input_barriers(cmd, {input.buffer().impl()});
+    record_input_barriers(cmd, {gpu_vk_impl(input.buffer())});
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, in_pipe.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, in_pipe.pipeline_layout(), 0, 1,
                             &desc_set, 0, nullptr);
@@ -1079,7 +1078,7 @@ run_fused_gpu(const std::string& shader_name,
     //     reduce.comp 的 WG 结构契约同源）→ (cols+31)/32 个 WG
     const uint32_t workgroups = (mode == 0) ? rows : (cols + 31u) / 32u;
     ts_dispatch(cmd, "reduce", workgroups, 1, 1);
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
     // 6. 独立模式提交
     if (owns_cmd)
@@ -1129,7 +1128,7 @@ run_fused_gpu(const std::string& shader_name,
     GpuTensor output = *owned;
 
     // 2. 分配并写入描述符集
-    const VkBuffer bindings[2]{input.buffer().impl(), output.buffer().impl()};
+    const VkBuffer bindings[2]{gpu_vk_impl(input.buffer()), gpu_vk_impl(output.buffer())};
     auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -1144,7 +1143,7 @@ run_fused_gpu(const std::string& shader_name,
     auto [cmd, owns_cmd] = *cmd_r;
 
     // 5. 录制
-    record_input_barriers(cmd, {input.buffer().impl()});
+    record_input_barriers(cmd, {gpu_vk_impl(input.buffer())});
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline_layout(), 0, 1,
                             &desc_set, 0, nullptr);
@@ -1155,7 +1154,7 @@ run_fused_gpu(const std::string& shader_name,
 
     const uint32_t wg_count = (total + 255) / 256;
     ts_dispatch(cmd, "rearrange_3d", wg_count, 1, 1);
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
     // 6. 独立模式提交
     if (owns_cmd)
@@ -1176,7 +1175,7 @@ template <Precision P> [[nodiscard]] Result<void> fill_zero_gpu(GpuTensorT<P>& t
     NN_TRY_CHECK(cmd_r);
     auto [cmd, owns_cmd] = *cmd_r;
 
-    vkCmdFillBuffer(cmd, tensor.buffer().impl(), 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(cmd, gpu_vk_impl(tensor.buffer()), 0, VK_WHOLE_SIZE, 0);
 
     // 屏障确保 fill 完成后可见
     VkBufferMemoryBarrier b{};
@@ -1185,7 +1184,7 @@ template <Precision P> [[nodiscard]] Result<void> fill_zero_gpu(GpuTensorT<P>& t
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.buffer = tensor.buffer().impl();
+    b.buffer = gpu_vk_impl(tensor.buffer());
     b.offset = 0;
     b.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1424,7 +1423,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
 
     // 2. GPU 内拷贝
     const VkDeviceSize size = static_cast<VkDeviceSize>(src.rows() * src.cols() * sizeof(elem<P>));
-    auto r = copy_buffer_gpu(src.buffer().impl(), dst.buffer().impl(), size);
+    auto r = copy_buffer_gpu(gpu_vk_impl(src.buffer()), gpu_vk_impl(dst.buffer()), size);
     NN_TRY_CHECK(r);
     return dst;
 }
@@ -1440,7 +1439,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
 {
     if (!initialized_) NN_FAIL("GPU backend not initialized");
     if (!has(PipelineId::cast)) NN_FAIL("cast_gpu: cast pipeline not available");
-    const VkBuffer bindings[2]{src.impl(), dst.impl()};
+    const VkBuffer bindings[2]{gpu_vk_impl(src), gpu_vk_impl(dst)};
     auto ds_r = alloc_desc_set_for(pipelines_.get(PipelineId::cast).descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -1453,7 +1452,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
     }
     auto [cmd, owns_cmd] = *cmd_r;
 
-    std::vector<VkBuffer> in_bufs{src.impl()};
+    std::vector<VkBuffer> in_bufs{gpu_vk_impl(src)};
     record_input_barriers(cmd, in_bufs);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1477,7 +1476,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
     const auto pairs = (count + 1u) / 2u;
     const std::uint32_t wg = static_cast<std::uint32_t>((pairs + 255u) / 256u);
     ts_dispatch(cmd, "cast", wg < 1u ? 1u : wg, 1u, 1u);
-    record_output_barrier(cmd, dst.impl());
+    record_output_barrier(cmd, gpu_vk_impl(dst));
 
     if (owns_cmd)
     {
@@ -1494,7 +1493,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
 {
     if (!initialized_) NN_FAIL("GPU backend not initialized");
     if (!has(PipelineId::trit_pack)) NN_FAIL("trit_pack_gpu: trit_pack pipeline not available");
-    const VkBuffer bindings[3]{w.impl(), tau.impl(), packed.impl()};
+    const VkBuffer bindings[3]{gpu_vk_impl(w), gpu_vk_impl(tau), gpu_vk_impl(packed)};
     auto ds_r =
         alloc_desc_set_for(pipelines_.get(PipelineId::trit_pack).descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
@@ -1508,7 +1507,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
     }
     auto [cmd, owns_cmd] = *cmd_r;
 
-    std::vector<VkBuffer> in_bufs{w.impl(), tau.impl()};
+    std::vector<VkBuffer> in_bufs{gpu_vk_impl(w), gpu_vk_impl(tau)};
     record_input_barriers(cmd, in_bufs);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1532,7 +1531,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
     const std::uint32_t total = rows * wpr;
     const std::uint32_t wg = (total + 255u) / 256u;
     vkCmdDispatch(cmd, wg < 1u ? 1u : wg, 1u, 1u);
-    record_output_barrier(cmd, packed.impl());
+    record_output_barrier(cmd, gpu_vk_impl(packed));
 
     if (owns_cmd)
     {
@@ -1584,7 +1583,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
         if (!has(PipelineId::matmul_q)) NN_FAIL("matmul_q_gpu: matmul_q pipeline not available");
         pipe = &pipelines_.get(PipelineId::matmul_q);
     }
-    const VkBuffer bindings[4]{packed.impl(), tau.impl(), b.impl(), c.impl()};
+    const VkBuffer bindings[4]{gpu_vk_impl(packed), gpu_vk_impl(tau), gpu_vk_impl(b), gpu_vk_impl(c)};
     auto ds_r = alloc_desc_set_for(pipe->descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -1597,7 +1596,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
     }
     auto [cmd, owns_cmd] = *cmd_r;
 
-    std::vector<VkBuffer> in_bufs{packed.impl(), tau.impl(), b.impl()};
+    std::vector<VkBuffer> in_bufs{gpu_vk_impl(packed), gpu_vk_impl(tau), gpu_vk_impl(b)};
     record_input_barriers(cmd, in_bufs);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->handle());
@@ -1635,7 +1634,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
         const std::uint32_t gy = (M + 63u) / 64u; // y ↔ 输出行（M）
         vkCmdDispatch(cmd, gx < 1u ? 1u : gx, gy < 1u ? 1u : gy, 1u);
     }
-    record_output_barrier(cmd, c.impl());
+    record_output_barrier(cmd, gpu_vk_impl(c));
 
     if (owns_cmd)
     {
@@ -1654,7 +1653,7 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
     if (!initialized_) NN_FAIL("GPU backend not initialized");
     const std::size_t cnt = rows * cols;
     const std::size_t cnt_pad = cnt + (cnt & 1u); // 偶数槽位
-    auto b = GpuBuffer::create_device_local(device_.device(), *memory_pool_, cnt_pad * 2u,
+    auto b = GpuBuffer::create_device_local(reinterpret_cast<std::uint64_t>(device_.device()), *memory_pool_, cnt_pad * 2u,
                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -1684,7 +1683,7 @@ template <Precision P>
     auto [cmd, owns_cmd] = *cmd_r;
 
     VkBufferCopy cp{src_offset, 0, size};
-    vkCmdCopyBuffer(cmd, src.buffer().impl(), dst.buffer().impl(), 1, &cp);
+    vkCmdCopyBuffer(cmd, gpu_vk_impl(src.buffer()), gpu_vk_impl(dst.buffer()), 1, &cp);
 
     VkBufferMemoryBarrier b{};
     b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1692,7 +1691,7 @@ template <Precision P>
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.buffer = dst.buffer().impl();
+    b.buffer = gpu_vk_impl(dst.buffer());
     b.offset = 0;
     b.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1730,7 +1729,7 @@ template <Precision P>
     auto [cmd, owns_cmd] = *cmd_r;
 
     VkBufferCopy cp{0, dst_offset, size};
-    vkCmdCopyBuffer(cmd, src.buffer().impl(), dst.buffer().impl(), 1, &cp);
+    vkCmdCopyBuffer(cmd, gpu_vk_impl(src.buffer()), gpu_vk_impl(dst.buffer()), 1, &cp);
 
     VkBufferMemoryBarrier b{};
     b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1738,7 +1737,7 @@ template <Precision P>
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.buffer = dst.buffer().impl();
+    b.buffer = gpu_vk_impl(dst.buffer());
     b.offset = 0;
     b.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1760,12 +1759,10 @@ template <Precision P>
 {
     if (!initialized_) NN_FAIL("GPU backend not initialized");
     // 1. 创建临时 GPU buffers（byte count = 元素数 × sizeof(float)，§6.3）
-    auto a_buf = GpuBuffer::create_device_local(
-        device_.device(), *memory_pool_, M * K * sizeof(float),
+    auto a_buf = GpuBuffer::create_device_local(reinterpret_cast<std::uint64_t>(device_.device()), *memory_pool_, M * K * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, keepalive());
     NN_TRY_CHECK(a_buf);
-    auto b_buf = GpuBuffer::create_device_local(
-        device_.device(), *memory_pool_, K * N * sizeof(float),
+    auto b_buf = GpuBuffer::create_device_local(reinterpret_cast<std::uint64_t>(device_.device()), *memory_pool_, K * N * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, keepalive());
     NN_TRY_CHECK(b_buf);
     // 2. 上传数据
@@ -1825,7 +1822,7 @@ template <Precision P>
     GpuTensor output = *owned;
 
     // 分配描述符集
-    const VkBuffer bindings[2]{A.buffer().impl(), output.buffer().impl()};
+    const VkBuffer bindings[2]{gpu_vk_impl(A.buffer()), gpu_vk_impl(output.buffer())};
     auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -1840,7 +1837,7 @@ template <Precision P>
     auto [cmd, owns_cmd] = *cmd_r;
 
     // 录制
-    record_input_barriers(cmd, {A.buffer().impl()});
+    record_input_barriers(cmd, {gpu_vk_impl(A.buffer())});
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline_layout(), 0, 1,
                             &desc_set, 0, nullptr);
@@ -1861,7 +1858,7 @@ template <Precision P>
     const uint32_t bx = (tx + 7u) / 8u;
     const uint32_t by = (ty + 7u) / 8u;
     ts_dispatch(cmd, "transpose", 8, 8, bx * by);
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
     if (owns_cmd)
     {
@@ -1910,7 +1907,7 @@ template <Precision P>
         output = std::move(*out_res);
     }
 
-    const VkBuffer bindings[2]{x.buffer().impl(), output.buffer().impl()};
+    const VkBuffer bindings[2]{gpu_vk_impl(x.buffer()), gpu_vk_impl(output.buffer())};
     auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -1923,7 +1920,7 @@ template <Precision P>
     }
     auto [cmd, owns_cmd] = *cmd_r;
 
-    record_input_barriers(cmd, {x.buffer().impl()});
+    record_input_barriers(cmd, {gpu_vk_impl(x.buffer())});
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline_layout(), 0, 1,
                             &desc_set, 0, nullptr);
@@ -1938,7 +1935,7 @@ template <Precision P>
     const std::size_t total = rows * cols;
     const uint32_t wg_count = static_cast<uint32_t>((total + 255) / 256);
     ts_dispatch(cmd, "im2col", wg_count, 1, 1);
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
     if (owns_cmd)
     {
@@ -1982,7 +1979,7 @@ template <Precision P>
         output = std::move(*out_res);
     }
 
-    const VkBuffer bindings[2]{col.buffer().impl(), output.buffer().impl()};
+    const VkBuffer bindings[2]{gpu_vk_impl(col.buffer()), gpu_vk_impl(output.buffer())};
     auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -1995,7 +1992,7 @@ template <Precision P>
     }
     auto [cmd, owns_cmd] = *cmd_r;
 
-    record_input_barriers(cmd, {col.buffer().impl()});
+    record_input_barriers(cmd, {gpu_vk_impl(col.buffer())});
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline_layout(), 0, 1,
                             &desc_set, 0, nullptr);
@@ -2010,7 +2007,7 @@ template <Precision P>
     const std::size_t total = rows * cols;
     const uint32_t wg_count = static_cast<uint32_t>((total + 255) / 256);
     ts_dispatch(cmd, "col2im", wg_count, 1, 1);
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
     if (owns_cmd)
     {
@@ -2047,7 +2044,7 @@ template <Precision P>
     NN_TRY_CHECK(out_res);
     GpuTensor output = std::move(*out_res);
 
-    const VkBuffer bindings[2]{x.buffer().impl(), output.buffer().impl()};
+    const VkBuffer bindings[2]{gpu_vk_impl(x.buffer()), gpu_vk_impl(output.buffer())};
     auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -2060,7 +2057,7 @@ template <Precision P>
     }
     auto [cmd, owns_cmd] = *cmd_r;
 
-    record_input_barriers(cmd, {x.buffer().impl()});
+    record_input_barriers(cmd, {gpu_vk_impl(x.buffer())});
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline_layout(), 0, 1,
                             &desc_set, 0, nullptr);
@@ -2073,7 +2070,7 @@ template <Precision P>
     const std::size_t total = G * N;
     const uint32_t wg_count = static_cast<uint32_t>((total + 255) / 256);
     ts_dispatch(cmd, "group_reduce", wg_count, 1, 1);
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
     if (owns_cmd)
     {
@@ -2124,8 +2121,8 @@ template <Precision P>
     GpuTensor output = *owned;
 
     // 分配描述符集
-    const VkBuffer bindings[3]{table.buffer().impl(), indices.buffer().impl(),
-                               output.buffer().impl()};
+    const VkBuffer bindings[3]{gpu_vk_impl(table.buffer()), gpu_vk_impl(indices.buffer()),
+                               gpu_vk_impl(output.buffer())};
     auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -2140,7 +2137,7 @@ template <Precision P>
     auto [cmd, owns_cmd] = *cmd_r;
 
     // 录制
-    record_input_barriers(cmd, {table.buffer().impl(), indices.buffer().impl()});
+    record_input_barriers(cmd, {gpu_vk_impl(table.buffer()), gpu_vk_impl(indices.buffer())});
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline_layout(), 0, 1,
                             &desc_set, 0, nullptr);
@@ -2153,7 +2150,7 @@ template <Precision P>
     // vec4 kernel（与 elementwise/broadcast/DSL 同口径）：每线程 4 元素
     const uint32_t wg_count = (total + 256u * 4u - 1u) / (256u * 4u);
     ts_dispatch(cmd, "gather", wg_count, 1, 1);
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
     if (owns_cmd)
     {
@@ -2195,7 +2192,7 @@ template <Precision P>
 
     // 分配描述符集
     // dst 使用 uint 视图用于原子操作
-    const VkBuffer bindings[3]{dst.buffer().impl(), indices.buffer().impl(), grad.buffer().impl()};
+    const VkBuffer bindings[3]{gpu_vk_impl(dst.buffer()), gpu_vk_impl(indices.buffer()), gpu_vk_impl(grad.buffer())};
     auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -2220,11 +2217,11 @@ template <Precision P>
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.offset = 0;
         b.size = VK_WHOLE_SIZE;
-        b.buffer = dst.buffer().impl();
+        b.buffer = gpu_vk_impl(dst.buffer());
         barriers.push_back(b);
-        b.buffer = indices.buffer().impl();
+        b.buffer = gpu_vk_impl(indices.buffer());
         barriers.push_back(b);
-        b.buffer = grad.buffer().impl();
+        b.buffer = gpu_vk_impl(grad.buffer());
         barriers.push_back(b);
         vkCmdPipelineBarrier(cmd,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -2252,7 +2249,7 @@ template <Precision P>
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.buffer = dst.buffer().impl();
+        b.buffer = gpu_vk_impl(dst.buffer());
         b.offset = 0;
         b.size = VK_WHOLE_SIZE;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

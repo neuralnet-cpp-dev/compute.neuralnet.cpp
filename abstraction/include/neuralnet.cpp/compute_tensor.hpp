@@ -29,6 +29,7 @@
 #include "core_domain.hpp"
 #include <neuralnet.cpp/precision.hpp>
 #include "algebra_matrix.hpp"
+#include "backend/compute_gpu_storage.hpp"   // GpuTensorT/GpuBuffer（跨界布局与宏无关）
 
 namespace nn
 {
@@ -92,12 +93,10 @@ private:
     using CpuF32 = std::shared_ptr<MatrixT<Precision::F32>>;
     std::variant<CpuF16, CpuF32> cpu_data_;   // default: index 0 (F16 slot, empty ptr)
 
-#ifdef NN_HAS_VULKAN
     // ── GPU 存储：类型擦除（std::variant，§6.3）──────────────────────────
     using GpuF16 = std::shared_ptr<GpuTensorT<Precision::F16>>;
     using GpuF32 = std::shared_ptr<GpuTensorT<Precision::F32>>;
     std::variant<GpuF16, GpuF32> gpu_data_;
-#endif
 
 
     // ── variant 安全访问辅助（避免 std::get UB，§6.1）────────────────────
@@ -123,7 +122,6 @@ private:
         return cpu_data_.index() == slot ? std::get<slot>(cpu_data_).get() : nullptr;
     }
 
-#ifdef NN_HAS_VULKAN
     template <Precision P> [[nodiscard]] std::shared_ptr<GpuTensorT<P>> gpu_get() const noexcept
     {
         constexpr auto slot = static_cast<std::size_t>(P);
@@ -142,7 +140,6 @@ private:
         constexpr auto slot = static_cast<std::size_t>(P);
         return gpu_data_.index() == slot ? std::get<slot>(gpu_data_).get() : nullptr;
     }
-#endif
 
 public:
     Tensor() = default;
@@ -190,7 +187,6 @@ private:
         return Tensor(std::make_shared<MatrixT<P>>(rows, cols));
     }
 
-#ifdef NN_HAS_VULKAN
     // ── GPU 构造（f32）────────────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<GpuTensor> t)
         : device_(Device::GPU), precision_(Precision::F32), rows_(t->rows()), cols_(t->cols()),
@@ -212,7 +208,6 @@ private:
     // ── 从 GpuTensorT<F16> 创建（f16）─────────────────────────────────────
     static Tensor from_gpu(GpuTensorT<Precision::F16> t)
     { return Tensor(std::make_shared<GpuTensorT<Precision::F16>>(std::move(t))); }
-#endif
 
 public:
     // ── 访问器 ────────────────────────────────────────────────────────────
@@ -245,13 +240,9 @@ public:
                        ? cpu_get<Precision::F16>() == o.cpu_get<Precision::F16>()
                        : cpu_get<Precision::F32>() == o.cpu_get<Precision::F32>();
         }
-#ifdef NN_HAS_VULKAN
         return precision_ == Precision::F16
                    ? gpu_get<Precision::F16>() == o.gpu_get<Precision::F16>()
                    : gpu_get<Precision::F32>() == o.gpu_get<Precision::F32>();
-#else
-        return false;
-#endif
     }
 
     // ── valid：存储匹配 precision_ 且非空 ────────────────────────────────
@@ -263,13 +254,9 @@ public:
                 return cpu_data_.index() == 0 && static_cast<bool>(cpu_get<Precision::F16>());
             return cpu_data_.index() == 1 && static_cast<bool>(cpu_get<Precision::F32>());
         }
-#ifdef NN_HAS_VULKAN
         if (precision_ == Precision::F16)
             return gpu_data_.index() == 0 && static_cast<bool>(gpu_get<Precision::F16>());
         return gpu_data_.index() == 1 && static_cast<bool>(gpu_get<Precision::F32>());
-#else
-        return false;
-#endif
     }
 
     // ── 写版本（write epoch）──────────────────────────────────────────────
@@ -319,7 +306,6 @@ private:
     [[nodiscard]] std::shared_ptr<MatrixT<P>> cpu_shared() const noexcept
     { return cpu_get<P>(); }
 
-#ifdef NN_HAS_VULKAN
     // ── GPU 存储访问（模板化，P 默认 F32，§6.1）──────────────────────────
     template <Precision P = Precision::F32> [[nodiscard]] GpuTensorT<P>& gpu_tensor()
     {
@@ -348,7 +334,6 @@ private:
     template <Precision P = Precision::F32>
     [[nodiscard]] std::shared_ptr<GpuTensorT<P>> gpu_shared() const noexcept
     { return gpu_get<P>(); }
-#endif
 
     // 推进写版本：**只允许 ComputeEngine 的写入口护栏调用**（friend 限定）。
     // 无存储 / 槽位与 precision_ 不符 → 静默跳过（空槽不变量由 valid() 守卫）。
@@ -373,13 +358,11 @@ private:
     [[nodiscard]] DomainId device_domain_() const noexcept
     {
         if (device_ == Device::CPU) return valid() ? kHostDomain : 0;
-#ifdef NN_HAS_VULKAN
         if (!valid()) return 0;
         if (const auto* t16 = gpu_get_ptr<Precision::F16>())
             return t16->buffer().backend_identity();
         if (const auto* t32 = gpu_get_ptr<Precision::F32>())
             return t32->buffer().backend_identity();
-#endif
         return 0;
     }
 
@@ -397,9 +380,7 @@ private:
         t.precision_ = precision_;
         t.rows_ = new_rows;
         t.cols_ = new_cols;
-#ifdef NN_HAS_VULKAN
         t.gpu_data_ = gpu_data_;
-#endif
         if (device_ == Device::CPU)
         {
             // 复制数据到新形状的 Matrix：按 precision_ 选择正确的 variant 槽位（§6.1）。
@@ -441,7 +422,6 @@ inline std::uint64_t Tensor::write_epoch() const noexcept
         const MatrixT<Precision::F32>* p = cpu_get_ptr<Precision::F32>();
         return p ? p->write_epoch() : 0;
     }
-#ifdef NN_HAS_VULKAN
     if (precision_ == Precision::F16)
     {
         auto p = gpu_get<Precision::F16>();
@@ -449,9 +429,6 @@ inline std::uint64_t Tensor::write_epoch() const noexcept
     }
     auto p = gpu_get<Precision::F32>();
     return p ? p->shared_buffer()->write_epoch() : 0;
-#else
-    return 0;
-#endif
 }
 
 // ── 存储标识（RV-03，声明见类内）──────────────────────────────────────────
@@ -463,7 +440,6 @@ inline std::uintptr_t Tensor::storage_id() const noexcept
             return reinterpret_cast<std::uintptr_t>(cpu_get_ptr<Precision::F16>());
         return reinterpret_cast<std::uintptr_t>(cpu_get_ptr<Precision::F32>());
     }
-#ifdef NN_HAS_VULKAN
     if (precision_ == Precision::F16)
     {
         auto p = gpu_get<Precision::F16>();
@@ -471,9 +447,6 @@ inline std::uintptr_t Tensor::storage_id() const noexcept
     }
     auto p = gpu_get<Precision::F32>();
     return p ? reinterpret_cast<std::uintptr_t>(p->shared_buffer().get()) : 0;
-#else
-    return 0;
-#endif
 }
 
 inline void Tensor::touch_write_epoch_() noexcept
@@ -488,14 +461,12 @@ inline void Tensor::touch_write_epoch_() noexcept
         if (auto* p = cpu_get_ptr<Precision::F32>()) p->mark_content_changed();
         return;
     }
-#ifdef NN_HAS_VULKAN
     if (precision_ == Precision::F16)
     {
         if (auto p = gpu_get<Precision::F16>()) p->shared_buffer()->mark_content_changed();
         return;
     }
     if (auto p = gpu_get<Precision::F32>()) p->shared_buffer()->mark_content_changed();
-#endif
 }
 
 // ── 引擎域内访问通道（M1，docs/internal/17 §4.1 豁免之一）──────────────

@@ -37,10 +37,10 @@ CpuEngine + CPU 原语    GpuEngine + Vulkan backend + shader + kernelgen
   Layer/Model/DSL 模板面在主仓库（MIT）。
 - **跨界 ABI 契约（C++ 直出的前提）**：
   1. 消费方与 .so **同编译器 / 同标准库 / 同 `-fno-exceptions`** 编译；
-  2. **Tensor 布局随 `NN_HAS_VULKAN` 条件编译** → 链接 `libnn-gpu.so` 的消费方必须
-     以 `-DNN_HAS_VULKAN=1` 编译（GPU 相关存储类型布局与 .so 一致）；CPU-only
-     消费方无需宏；
-  3. GPU 值类型（GpuBuffer）析构经 .so 符号（PIMPL 式），消费方不需要完整后端类型；
+  2. **Tensor 布局与 `NN_HAS_VULKAN` 无关**（2026-11 重构）：GpuBuffer 用 PIMPL
+     （Vulkan 句柄藏在引擎侧 `Impl`），抽象层头零 Vulkan 依赖 → 消费方
+     **无需同宏编译、无需 Vulkan SDK**，CPU/GPU 引擎共用同一跨界布局；
+  3. GPU 值类型析构经 .so 符号（PIMPL 式），消费方不需要完整后端类型；
   4. `std::shared_ptr` / `std::expected` / `std::string` 跨界由同标准库保证。
 
 ## 构建与测试
@@ -53,7 +53,7 @@ cmake --build build
 # GPU（默认 ON，需 Vulkan + glslc）：
 cmake -B build -G Ninja
 cmake --build build
-./build/gpu_consumer_test                      # GPU 消费方（-DNN_HAS_VULKAN=1 编译）
+./build/gpu_consumer_test                      # GPU 消费方（无需宏/无需 Vulkan SDK）
 LD_LIBRARY_PATH=<Vulkan SDK>/lib ./build/kernelgen_smoke   # JIT 生成器 C ABI
 ```
 

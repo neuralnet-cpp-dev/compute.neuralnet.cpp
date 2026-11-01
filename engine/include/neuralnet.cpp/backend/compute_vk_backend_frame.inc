@@ -208,7 +208,7 @@ template <Precision P>
         if (!r) return r;
 
         VkBufferCopy cp{0, 0, total_bytes};
-        vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), dst.buffer().impl(), 1, &cp);
+        vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), gpu_vk_impl(dst.buffer()), 1, &cp);
 
         r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
         if (!r) return r;
@@ -275,7 +275,7 @@ template <Precision P>
         if (!r) return r;
 
         VkBufferCopy cp{0, dst_offset, this_chunk};
-        vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), dst.buffer().impl(), 1, &cp);
+        vkCmdCopyBuffer(cmd, staging_ring_->buffer(ri), gpu_vk_impl(dst.buffer()), 1, &cp);
 
         r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
         if (!r) return r;
@@ -353,7 +353,7 @@ template <Precision P>
         }
 
         VkBufferCopy cp{0, 0, total_bytes};
-        vkCmdCopyBuffer(cmd, src.buffer().impl(), staging_ring_->buffer(ri), 1, &cp);
+        vkCmdCopyBuffer(cmd, gpu_vk_impl(src.buffer()), staging_ring_->buffer(ri), 1, &cp);
 
         r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
         if (!r)
@@ -442,7 +442,7 @@ template <Precision P>
         }
 
         VkBufferCopy cp{src_offset, 0, this_chunk};
-        vkCmdCopyBuffer(cmd, src.buffer().impl(), staging_ring_->buffer(ri), 1, &cp);
+        vkCmdCopyBuffer(cmd, gpu_vk_impl(src.buffer()), staging_ring_->buffer(ri), 1, &cp);
 
         r = detail::vk_check(vkEndCommandBuffer(cmd), __FILE__, __LINE__);
         if (!r)
@@ -525,8 +525,8 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
     const std::size_t n = inputs.size() + 1;
     std::vector<VkBuffer> bindings(n);
     for (std::size_t i = 0; i < inputs.size(); ++i)
-        bindings[i] = inputs[i].buffer().impl();
-    bindings[n - 1] = output.buffer().impl();
+        bindings[i] = gpu_vk_impl(inputs[i].buffer());
+    bindings[n - 1] = gpu_vk_impl(output.buffer());
     auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
     NN_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
@@ -542,7 +542,7 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
     std::vector<VkBuffer> in_bufs;
     in_bufs.reserve(inputs.size());
     for (const auto& t : inputs)
-        in_bufs.push_back(t.buffer().impl());
+        in_bufs.push_back(gpu_vk_impl(t.buffer()));
     record_input_barriers(cmd, in_bufs);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
@@ -552,7 +552,7 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
         vkCmdPushConstants(cmd, pipeline.pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
                            static_cast<uint32_t>(pc.size()), pc.data());
     ts_dispatch(cmd, ts_label, wg_x, wg_y, wg_z, ts_detail);
-    record_output_barrier(cmd, output.buffer().impl());
+    record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
 
     if (owns_cmd)
     {

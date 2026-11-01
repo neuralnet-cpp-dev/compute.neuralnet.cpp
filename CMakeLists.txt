@@ -194,10 +194,10 @@ add_test(NAME consumer_test COMMAND consumer_test)
 
 if(TARGET nn_gpu)
     add_executable(gpu_consumer_test tests/gpu_consumer_test.cpp)
-    target_include_directories(gpu_consumer_test PRIVATE ${ABST_INCLUDE} ${Vulkan_INCLUDE_DIRS})
-    # 跨界 ABI 契约：Tensor 布局随 NN_HAS_VULKAN 条件编译 → 消费方必须与 .so
-    # 同宏编译（GpuBuffer 析构经 .so 符号，消费方无需完整后端类型）。
-    target_compile_definitions(gpu_consumer_test PRIVATE NN_HAS_VULKAN=1)
+    # 跨界 ABI 契约（2026-11 重构后）：Tensor 布局与 NN_HAS_VULKAN **无关**
+    # （GpuBuffer PIMPL：Vulkan 句柄藏在引擎侧 Impl）→ 消费方无需同宏编译、
+    # 无需 Vulkan SDK。链接 .so 即可。
+    target_include_directories(gpu_consumer_test PRIVATE ${ABST_INCLUDE})
     target_link_libraries(gpu_consumer_test PRIVATE nn_gpu)
     set_target_properties(gpu_consumer_test PROPERTIES
         BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR})

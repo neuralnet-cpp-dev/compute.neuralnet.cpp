@@ -198,7 +198,7 @@ public:
         if (src.is_cpu()) return {};
         const VkDeviceSize size = static_cast<VkDeviceSize>(src.size() * sizeof(float));
         return backend_->copy_buffer_region_gpu(
-            src.gpu_tensor().buffer().impl(), 0, buffer.gpu_tensor().buffer().impl(),
+            gpu_vk_impl(src.gpu_tensor().buffer()), 0, gpu_vk_impl(buffer.gpu_tensor().buffer()),
             static_cast<VkDeviceSize>(offset * sizeof(float)), size);
     }
 
@@ -209,9 +209,9 @@ public:
         auto dst = GpuTensor::create_empty(rows, cols, *backend_);
         NN_TRY_CHECK(dst);
         const VkDeviceSize size = static_cast<VkDeviceSize>(rows * cols * sizeof(float));
-        auto r = backend_->copy_buffer_region_gpu(buffer.gpu_tensor().buffer().impl(),
+        auto r = backend_->copy_buffer_region_gpu(gpu_vk_impl(buffer.gpu_tensor().buffer()),
                                                   static_cast<VkDeviceSize>(offset * sizeof(float)),
-                                                  dst->buffer().impl(), 0, size);
+                                                  gpu_vk_impl(dst->buffer()), 0, size);
         NN_TRY_CHECK(r);
         return Tensor::from_gpu(std::move(*dst));
     }
@@ -226,7 +226,7 @@ public:
         if (t.is_cpu()) NN_FAIL("submit_scalar_readback: 期望 GPU 张量");
         if (t.precision() != Precision::F32)
             NN_FAIL("submit_scalar_readback: 仅支持 F32 标量（调用方先 cast）");
-        return backend_->submit_scalar_readback(slot, t.gpu_tensor().buffer().impl());
+        return backend_->submit_scalar_readback(slot, gpu_vk_impl(t.gpu_tensor().buffer()));
     }
 
     [[nodiscard]] Result<bool> poll_scalar_readback(std::size_t slot, Scalar& out) override
@@ -390,11 +390,11 @@ public:
             NN_FAIL("copy_into: 操作数不在本 GPU 引擎的设备域");
         const std::size_t count = dst.rows() * dst.cols();
         if (dst.precision() == Precision::F16)
-            return backend_->copy_buffer_gpu(src.gpu_tensor<Precision::F16>().buffer().impl(),
-                                             dst.gpu_tensor<Precision::F16>().buffer().impl(),
+            return backend_->copy_buffer_gpu(gpu_vk_impl(src.gpu_tensor<Precision::F16>().buffer()),
+                                             gpu_vk_impl(dst.gpu_tensor<Precision::F16>().buffer()),
                                              static_cast<VkDeviceSize>(count * 2u));
-        return backend_->copy_buffer_gpu(src.gpu_tensor().buffer().impl(),
-                                         dst.gpu_tensor().buffer().impl(),
+        return backend_->copy_buffer_gpu(gpu_vk_impl(src.gpu_tensor().buffer()),
+                                         gpu_vk_impl(dst.gpu_tensor().buffer()),
                                          static_cast<VkDeviceSize>(count * sizeof(float)));
     }
 

@@ -445,6 +445,29 @@ namespace detail
 }
 }  // namespace detail
 
+// ── GpuBuffer::Impl：真实 GPU 存储（Vulkan 类型可见；backend frame/ops 片段
+//    在 GpuBackend 类体内用 gpu_vk_impl()，故本块必须在类定义之前）────────
+struct GpuBuffer::Impl
+{
+    VkDevice device = VK_NULL_HANDLE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    MemoryPool::Allocation alloc;
+    observer_ptr<MemoryPool> pool;
+    std::uint64_t write_epoch = 0;
+};
+
+// GpuBuffer 无 backend 依赖的方法（Impl 完整才可访问；声明在 MIT 抽象层）
+[[nodiscard]] inline VkBuffer gpu_vk_impl(const GpuBuffer& b)
+{ return reinterpret_cast<VkBuffer>(b.impl()); }
+[[nodiscard]] inline VkDevice gpu_vk_device(const GpuBuffer& b)
+{ return reinterpret_cast<VkDevice>(b.device_handle()); }
+inline std::uint64_t GpuBuffer::device_handle() const noexcept
+{ return impl_ ? reinterpret_cast<std::uint64_t>(impl_->device) : 0; }
+inline std::uint64_t GpuBuffer::impl() const noexcept
+{ return impl_ ? reinterpret_cast<std::uint64_t>(impl_->buffer) : 0; }
+inline bool GpuBuffer::valid() const noexcept
+{ return impl_ && impl_->buffer != VK_NULL_HANDLE; }
+
 // ── P3 跨链批量派发：单实例描述（run_fused_gpu_batch 的输入）──────────────
 // 与 run_fused_gpu 的单 kernel 调用同一组形参的实例化：每实例自带输入/输出
 // 缓冲与元素数，共享一份 push constants（consts/rparams/vp 同值是分组前提）。
@@ -798,10 +821,11 @@ public:
 // ══════════════════════════════════════════════════════════════════════
 inline GpuBuffer::~GpuBuffer()
 {
-    if (buffer_ == VK_NULL_HANDLE) return;
+    if (!impl_ || impl_->buffer == VK_NULL_HANDLE) return;
 
     // 本 keepalive 保证 backend 在析构全程存活；不再经全局 instance() 取
-    // 一个可能已经销毁的单例。
+    // 一个可能已经销毁的单例。impl 在本函数末尾析构（其 keepalive 已移走）。
+    auto impl = std::move(impl_);
     auto backend = std::move(backend_keepalive_);
     if (backend && backend->is_initialized() && backend->needs_deferred_destroy())
     {
@@ -814,22 +838,22 @@ inline GpuBuffer::~GpuBuffer()
         // 时立即销毁 + 归还内存——锁窗只到所属帧，不跨越整个 batch
         // （多帧流水线）。
         // 内存归还也一并延迟到 buffer 销毁之后。若此处立即
-        // pool_->free()，新 buffer 可能分配到本 buffer 尚未销毁的同一区间
+        // pool->free()，新 buffer 可能分配到本 buffer 尚未销毁的同一区间
         // → 两个存活 buffer 内存重叠，违反 Vulkan 规范。
         // GpuBuffer 只经 MemoryPool 创建（create_device_local /
-        // create_host_visible），pool_ 恒有效；alloc_ 无效时 free 为 no-op。
-        backend->defer_buffer_destroy(device_, buffer_, alloc_, pool_);
+        // create_host_visible），pool 恒有效；alloc 无效时 free 为 no-op。
+        backend->defer_buffer_destroy(impl->device, impl->buffer, impl->alloc, impl->pool);
     }
     else
     {
         // 无在飞帧引用：立即销毁 + 归还内存
-        vkDestroyBuffer(device_, buffer_, nullptr);
-        if (pool_ && alloc_.valid()) pool_->free(alloc_);
+        vkDestroyBuffer(impl->device, impl->buffer, nullptr);
+        if (impl->pool && impl->alloc.valid()) impl->pool->free(impl->alloc);
     }
 
-    buffer_ = VK_NULL_HANDLE;
-    alloc_ = {};
-    pool_.reset();
+    impl->buffer = VK_NULL_HANDLE;
+    impl->alloc = {};
+    impl->pool.reset();
 }
 
 } // namespace nn
