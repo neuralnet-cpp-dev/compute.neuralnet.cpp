@@ -65,13 +65,51 @@ LD_LIBRARY_PATH=<Vulkan SDK>/lib ./build/kernelgen_smoke   # JIT 生成器 C ABI
   + `scan_exprs` AOT 融合（158 条表达式 → `fused_registry.hpp`）；真实 850M matmul PASS。
 - **libnn-kernelgen.so ✅**：运行期 JIT 算子生成器（shaderc），`nnk_generate_spirv`
   现编 SPIR-V 冒烟 PASS；GPU 引擎运行期 dlopen（懒加载，`NN_KERNELGEN_PATH` 可覆盖）。
+- **主仓库接入 ✅**（T9，2026-11-01）：主仓库 `neuralnet.cpp` 以 submodule 挂载本仓库
+  （`engine/`），全 cli 改链双引擎 .so（只 include 抽象层头 + 工厂 + 链接）；LGPL
+  可替换验证 = `bench/lgpl_verify.sh`（符号级 + patched `libnn-cpu.so` → `layer_bench
+  --op matmul --hash` 原 hash → patched hash → 复原）。边界清单/实施记录：
+  `neuralnet.cpp/docs/internal/34` §10。
+
+## 引擎级测试（tests/，消费方形态）
+
+引擎回归从主仓库迁入本仓 `tests/`，**只 include MIT 抽象层接口头 + 引擎侧 LGPL 头，
+引擎经工厂创建（真实实现编在 .so），GPU 不可用 → 返回 77 = ctest SKIP**：
+
+```bash
+cmake -B build -G Ninja -DNN_BUILD_TESTS=ON      # 默认 Release（-march=native，见下）
+cmake --build build
+NN_VULKAN_DEVICE=850M ctest --test-dir build -j1   # 10/10 全绿（GPU 测试用权威设备）
+```
+
+| 测试 | 链接 | 覆盖 |
+|------|------|------|
+| `consumer_test` / `gpu_consumer_test` / `kernelgen_smoke` | .so | 消费方最小闭环 / GPU 跨界 ABI / JIT 生成器 C ABI |
+| `gpu_test` | nn_cpu + nn_gpu | 引擎原语 CPU↔GPU 对拍（matmul/转置/归约/扫描）+ 性能 |
+| `gpu_f16_test` | nn_cpu + nn_gpu | f16 存储变体对拍（reduce/grouped/scatter/im2col/col2im/扫描族） |
+| `scan_bitwise_test` | nn_cpu + nn_gpu | 扫描原语 **逐位**回归（61 用例，dk 16/31/32/33/64 × causal/state/bnd × f32/f16） |
+| `gpt_offload_test` / `rapt_offload_test` | nn_gpu | GPT/RAPT activation offload 一致性（vs 全存基线） |
+| `expr_graph_test` | nn_cpu | IR-C 图融合分析（链/边界/上限/确定性/多输出） |
+| `expr_fuse_test` | nn_cpu + nn_gpu | begin_expr/end_expr 融合 GPU 端到端（3 节点链/matmul 链/Adam 金刚石/批量 vs 逐个逐字节一致） |
+
+**验证基线（2026-11-01，本机 850M）**：ctest 10/10 全绿；`scan_bitwise_test` 61/61
+逐位一致（Linux Release + 850M 权威口径；Windows/Debug 按设计 77 = SKIP）。
+
+**⚠ 两条编译口径**：
+1. **默认 Release 必须带 `-march=native`**：CPU 参考需要 FMA 收缩，否则与 GPU kernel
+   （glslc 默认 FMA）累加路径不同 → `scan_bitwise_test` 位型漂移（裸 `-O3` 实测 57/61
+   失败，加 `-march=native` 后 61/61）。CMakeLists 已内置（`NN_ENABLE_NATIVE=OFF` 可关，
+   但逐位锚测试将 SKIP）。
+2. **`expr_fuse_test` 的闭合世界登记**：其录制段链（`tests/expr_fuse_shapes.hpp` 单一
+   事实源）由 `scan_exprs` 的 **test_cover_pass** 在构建期登记进 `fused_registry.hpp`
+   ——否则 GPU `end_expr` 按 IR-C 闭合世界硬报错。链定义改动时两端自动同步（共用
+   同一组链函数）。
 
 ## 待办（后续）
 
-1. **主仓库 cli 改链 .so**：主仓库已 submodule 挂载本仓库（`engine/`），下一步把
-   cli 从 header-only 引擎改为 include 抽象层头 + 链 .so（mnist_train 先，再全量）。
-2. **双引擎各自 `.so` 替换验证**：对 `libnn-cpu.so` / `libnn-gpu.so` 分别做
-   `bench/lgpl_verify.sh` 式替换验证（改一个原语实现，同一消费方二进制行为随新
-   `.so` 变化）。
-3. **eval_expr 消费方测试**：ExprSpec 载荷生产方是引擎 DSL，消费方手编 spec 的
-   跨界用例待引擎侧工具支持后补充。
+1. **GPU .so 的 lgpl_verify 扩展**：当前只验 `libnn-cpu.so`（patched matmul → hash 变化）；
+   GPU 同法 patch 原语 + GPU 观测。
+2. **mem_probe 探针迁回**（可选）：主仓库探针目标随 T9 删除；如需 GPU 池账本/显存
+   统计探针，可在本仓以 `NN_ENABLE_PROBES` 门控形态重建。
+3. **eval_expr 消费方手编 spec 用例**：ExprSpec 载荷生产方是引擎 DSL，消费方手编 spec
+   的跨界用例待引擎侧工具支持后补充（`expr_graph_test` 已覆盖图分析侧）。

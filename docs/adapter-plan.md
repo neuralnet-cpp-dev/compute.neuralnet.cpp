@@ -1,6 +1,8 @@
 # 完整适配方案：抽象层升级为 nn::ComputeEngine 完整接口面（T7）
 
-> 状态：**方案待审**（2026-11，用户裁定"完整适配：全 cli 改链"）。
+> 状态：**已实施**（T9 于 2026-11-01 落地；本文件是当时的实施蓝图，落地差异见
+> 末尾"实施差异"节。实施记录与验证基线见主仓库 `neuralnet.cpp/docs/internal/34`
+> §10.4 与 `docs/history/history.md`「引擎 .so 化（T9）」条）。
 > 目标：新仓库抽象层（MIT）从"最小原语面"升级为**主仓库 layer/model/dsl 能直接
 > 使用的完整引擎接口面**；主仓库 cli 改链 .so；引擎实现全部收敛到 .so（LGPL）。
 
@@ -79,3 +81,24 @@ backend/ 等），include 路径改指 submodule 抽象层头 + 链 .so。
   `describe()` 能力——能力信息须在完整接口面里可见。
 - **双轨维护**：拆分后 engine/include 与 abstraction/include 不再有重复接口头，
   只保留实现侧依赖（单向：LGPL 头 include MIT 头）。
+
+## 6. 实施差异（T9 落地后，2026-11-01）
+
+- **工厂形态**：§1 提到"`nn::CpuEngine::create()` 转发声明或自由函数工厂"→ 实际为
+  **自由函数工厂** `nn::create_cpu_engine()` / `nn::create_gpu_engine(device)` /
+  `nn::last_error()`（声明在抽象层 `compute_engine.hpp`，实现在 `engine/src/*_engine_so.cpp`）。
+  抽象层**没有** `CpuEngine`/`GpuEngine` 具体类（消费方统一用 `nn::ComputeEngine&` 接口）。
+- **2.1 头拆分实际落点**：`expr_graph.hpp`（图 IR + 融合分析）与 §2.2 的预期相反，也在
+  **抽象层**（`begin_expr/end_expr` 的 ExprGraph 类型跨界）；`compute_gpu_storage.hpp`
+  未单独成头（GpuBuffer 定义并入 `compute_tensor.hpp`，PIMPL 化后布局与 `NN_HAS_VULKAN`
+  无关）；`kernel_cache.hpp` 留在主仓库（.nnk 缓存属消费侧工具）；`core_parallel.hpp`
+  在抽象层（模板面）。**原则**：凡"消费方 TU 需要构造/读取的类型"都进抽象层，
+  凡"引擎实现体"都留 engine/include——`expr_spec/expr_opt/expr_graph/precision/core_*/algebra_*`
+  是跨界唯一版本（.so 与消费方同份编译），无双份漂移。
+- **DSL 头归属**：`expr_dsl.hpp`（CPU 模板求值）在 engine/include（LGPL）——消费方
+  layer/model 必须 include 它才能写 `dsl::compute`（模板在消费方 TU 实例化、数值与
+  .so 一致）；这是 LGPL 头的消费方 include（动态链接语境），设计如此。
+- **引擎级测试**：主仓库引擎级测试迁入 `tests/`（消费方形态，见 README"引擎级测试"节），
+  共 10 个 ctest；`scan_exprs` 增 **test_cover_pass**（登记 `tests/expr_fuse_shapes.hpp`
+  链，闭合世界两端一致）。
+- **未做**：§2.1 的 `kernel_cache.hpp` 迁移（留主仓库）；`core_parallel.hpp` 已在抽象层。
