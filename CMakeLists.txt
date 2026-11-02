@@ -18,8 +18,20 @@ if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYP
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-set(CMAKE_CXX_STANDARD 26)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# C++ 标准：Clang/GCC 走标准 CMAKE_CXX_STANDARD=26；MSVC 同主仓口径
+#（CMake 4.3 尚未内置 MSVC 的 CXX26 方言标志映射，VS2026 cl 19.51 也不认
+# /std:c++26，C++26 特性走 /std:c++latest）→ MSVC 用 23 让方言探测通过，
+# 再显式传 /std:c++latest（发布门禁 MSVC 矩阵实测，2026-11）。
+if(MSVC)
+    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD_REQUIRED OFF)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+    add_compile_options(/std:c++latest)
+else()
+    set(CMAKE_CXX_STANDARD 26)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # 与源引擎一致的严格旗标（-fno-exceptions 是 ABI 前提：消费方与 .so 必须同款）
