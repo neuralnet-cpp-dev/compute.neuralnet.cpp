@@ -34,8 +34,16 @@ else()
 endif()
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 与源引擎一致的严格旗标（-fno-exceptions 是 ABI 前提：消费方与 .so 必须同款）
-add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic)
+# 严格旗标：Clang/GCC 用 -fno-exceptions（ABI 前提：消费方与 .so 必须同款）
+# + -Wall -Wextra -Wpedantic；MSVC 同主仓口径（/W4 /permissive- /Zc:preprocessor
+# /utf-8 /bigobj；保留异常，ppltasks.h 需要；/STACK 对齐 Linux 8 MB），
+# 发布门禁 MSVC 矩阵实测，2026-11。
+if(MSVC)
+    add_compile_options(/W4 /permissive- /Zc:preprocessor /utf-8 /bigobj)
+    add_link_options(/STACK:8388608)
+else()
+    add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic)
+endif()
 find_package(Threads REQUIRED)
 
 # ── Release 优化（同主仓库口径）───────────────────────────────────────────
@@ -43,10 +51,15 @@ find_package(Threads REQUIRED)
 # ⚠ -march=native 是**逐位锚前提**：CPU 参考必须走 FMA 收缩（Haswell+），
 #   否则与 GPU kernel（glslc 默认 FMA 收缩）累加路径不同 → scan_bitwise_test
 #   等逐位测试 1-2 ULP 漂移（实测：裸 -O3 下 57/61 用例位型不同）。
+# MSVC 对应 /O2 /fp:precise（/fp:fast 禁用 NaN 语义，同铁律 8）。
 option(NN_ENABLE_NATIVE "Enable -march=native (max perf, non-portable binary)" ON)
-set(NN_RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops)
-if(NN_ENABLE_NATIVE)
-    list(APPEND NN_RELEASE_FLAGS -march=native)
+if(MSVC)
+    set(NN_RELEASE_FLAGS /O2 /fp:precise)
+else()
+    set(NN_RELEASE_FLAGS -O3 -fno-math-errno -fno-trapping-math -funroll-loops)
+    if(NN_ENABLE_NATIVE)
+        list(APPEND NN_RELEASE_FLAGS -march=native)
+    endif()
 endif()
 add_compile_options("$<$<CONFIG:Release>:${NN_RELEASE_FLAGS}>")
 
