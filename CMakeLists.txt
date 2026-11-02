@@ -96,6 +96,11 @@ set(GENERATED_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 # ── libnn-cpu.so（LGPL）：CPU 引擎 + 原语，C++ 直出 ───────────────────────
 add_library(nn_cpu SHARED engine/src/cpu_engine_so.cpp)
+# Windows/MSVC：SHARED 库无导出符号不生成 .lib 导入库（链接方 LNK1104）。
+# 与 Linux .so 默认全导出对齐 → WINDOWS_EXPORT_ALL_SYMBOLS（发布门禁 MSVC 实测）。
+if(MSVC)
+    set_target_properties(nn_cpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 target_include_directories(nn_cpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp)
 target_link_libraries(nn_cpu PRIVATE Threads::Threads)
 set_target_properties(nn_cpu PROPERTIES
@@ -197,6 +202,9 @@ if(NN_ENABLE_GPU)
 
         # 3. libnn-gpu.so：依赖全部生成头
         add_library(nn_gpu SHARED engine/src/gpu_engine_so.cpp)
+        if(MSVC)
+            set_target_properties(nn_gpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+        endif()
         target_include_directories(nn_gpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${GENERATED_INCLUDE})
         target_link_libraries(nn_gpu PRIVATE Threads::Threads Vulkan::Vulkan)
         target_compile_definitions(nn_gpu PRIVATE NN_HAS_VULKAN=1)
