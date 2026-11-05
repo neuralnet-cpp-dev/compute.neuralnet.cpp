@@ -21,6 +21,9 @@
 //        包含本头 → 宏定义 → 尾部回包含跳过 → 重开 namespace nn 继续
 //        parse_number（NN_FAIL 已可见）。
 //     ③ 入口 = core_assert：→ 本头 → …（同 ② 走完）→ fatal_at 定义。
+//   ⚠ 尾部包含次序：**core_errors 必须在 core_assert 之前**——core_assert 的
+//     fatal_at 引用 nn::detail::fail_abort（定义于 core_errors）。此前靠 PCH
+//     预注入 nn.hpp 掩盖了反序缺陷（P5/D8 移除 PCH 后立刻暴露）。
 //   ⚠ 任何包含都**不得落在 namespace nn 内部**：被包含头的 namespace nn
 //     会变成 nn::nn（实测 'Error' in 'nn::nn' / fail_abort 未声明）。
 //   任何"把依赖包含挪到宏定义之前"的改动都会让入口 ① 在
@@ -170,5 +173,5 @@
 // detail::check_exit / detail::contextualize / detail::fatal_at。
 // include 放这里与文件头「环形包含的合法次序」说明绑定——挪到宏定义之前
 // 会让「入口 = 本头」的路径在 core_errors::parse_number 处报 NN_FAIL 未定义。
-#include "neuralnet.cpp/core_assert.hpp"
 #include "neuralnet.cpp/core_errors.hpp"
+#include "neuralnet.cpp/core_assert.hpp"
