@@ -127,8 +127,14 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::from_matrix(const MatrixT<P>& cpu_ma
                                                         GpuBackend& backend)
 {
     if (cpu_mat.empty()) NN_FAIL("Empty matrix");
-    // buffer 字节数 = 元素数 × sizeof(elem<P>)（§6.3）
-    const std::size_t byte_count = cpu_mat.size() * sizeof(elem<P>);
+    // buffer 字节数 = 元素数 × sizeof(elem<P>)（§6.3），**4 B 对齐**（见下）
+    // ⚠ 缓冲字节数 4 B 对齐（P3 验收门 D 实测修复）：f16 按 2 B/元素，奇数
+    //   元素数时 packHalf2x16 类写点（cast.comp 的 D[pairs-1] 等）的最后一个
+    //   uint 会越出缓冲末尾 1~2 B —— 越界 store 被驱动丢弃 → **末元素永不写入**
+    //   （实测 (65,17) f16 目标 idx1104 恒缺失；新分配的零内存把它掩盖成
+    //   "新进程首跑正确"，池复用后残留旧值 → 静默错值/NaN）。f32/f64 天然
+    //   4 B 对齐、零行为变化。
+    const std::size_t byte_count = (cpu_mat.size() * sizeof(elem<P>) + 3u) & ~std::size_t{3};
     auto buf_res =
         GpuBuffer::create_device_local(reinterpret_cast<std::uint64_t>(backend.device().device()), backend.alloc_pool(), byte_count,
                                        TENSOR_BUFFER_USAGE, backend.keepalive());
@@ -146,8 +152,14 @@ template <Precision P>
 inline Result<GpuTensorT<P>> GpuTensorT<P>::create_empty(std::size_t rows, std::size_t cols,
                                                          GpuBackend& backend)
 {
-    // buffer 字节数 = 元素数 × sizeof(elem<P>)（§6.3）
-    const std::size_t byte_count = rows * cols * sizeof(elem<P>);
+    // buffer 字节数 = 元素数 × sizeof(elem<P>)（§6.3），**4 B 对齐**（见下）
+    // ⚠ 缓冲字节数 4 B 对齐（P3 验收门 D 实测修复）：f16 按 2 B/元素，奇数
+    //   元素数时 packHalf2x16 类写点（cast.comp 的 D[pairs-1] 等）的最后一个
+    //   uint 会越出缓冲末尾 1~2 B —— 越界 store 被驱动丢弃 → **末元素永不写入**
+    //   （实测 (65,17) f16 目标 idx1104 恒缺失；新分配的零内存把它掩盖成
+    //   "新进程首跑正确"，池复用后残留旧值 → 静默错值/NaN）。f32/f64 天然
+    //   4 B 对齐、零行为变化。
+    const std::size_t byte_count = (rows * cols * sizeof(elem<P>) + 3u) & ~std::size_t{3};
     // TRANSFER_DST_BIT: 允许 vkCmdFillBuffer (zero) 和 vkCmdCopyBuffer (insert_rows) 写入
     // TRANSFER_SRC_BIT: 允许 vkCmdCopyBuffer (clone/slice_rows) 读取
     auto buf_res =
@@ -163,7 +175,7 @@ GpuTensorT<P>::create_host_visible_empty(std::size_t rows, std::size_t cols, Gpu
 {
     // Host Visible 存储（activation offload）：数据驻留主机可见内存（§6.6）。
     // 仅用于 vkCmdCopyBuffer 中转（TRANSFER_DST/SRC）。
-    const std::size_t byte_count = rows * cols * sizeof(elem<P>);
+    const std::size_t byte_count = (rows * cols * sizeof(elem<P>) + 3u) & ~std::size_t{3};  // 4 B 对齐（同上）
     auto buf_res =
         GpuBuffer::create_host_visible(reinterpret_cast<std::uint64_t>(backend.device().device()), backend.alloc_pool(), byte_count,
                                        TENSOR_BUFFER_USAGE, backend.keepalive());

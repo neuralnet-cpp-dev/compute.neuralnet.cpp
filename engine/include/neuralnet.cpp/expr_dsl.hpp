@@ -1542,106 +1542,6 @@ template <typename E>
 // 会**卡死不退出**，构建随之挂死（单线程探针可正常退出 3，问题只在多线程上下文出现）。
 // _Exit 立即终止、不碰信号处理器与堆，ninja 拿到非零退出码即判构建失败。
 // ══════════════════════════════════════════════════════════════════════════
-#ifdef NN_EXPR_SCAN
-[[noreturn]] inline void scan_reject(const nn::Error& e)
-{
-    std::fprintf(stderr, "[scan] validate_expr_spec 失败: %s\n", e.message.c_str());
-    std::fflush(nullptr);
-    std::_Exit(3);
-}
-
-// ── AOT 自登记锚点（"结构 = 表达式类型"）──────────────────────────────────
-// 每个 `dsl::compute*` 实例化 odr-use 一个 `FusedAnchor<Expr>`：其**静态初始化期**
-// 把"从类型默认构造的符号实例"折叠出的结构登记进全局注册表（去重）。
-//
-// 与"执行路径捕获"（dry-run 跑 Layer）互补：
-//   · dry-run 只覆盖**跑到的**路径（配置分支没跑到就漏）；
-//   · 锚点覆盖**编译进来的每个调用点**——调用点在函数体里，函数被编译即实例化，
-//     与运行期是否走到该分支无关（因此这是"编译期可达"而非"运行期可达"）。
-//
-// ⚠ 只登记**结构**：精度签名已不是构建期集合（生成阶段对每个结构发一份
-//   运行期精度分派 shader，键 `key#x`，运行期按真实精度填 PC `prec`）——
-//   故既不存在 `sig` 形参，也不需要 profile_f32/profile_f16 两遍扫描。
-//
-// 结构非法（裸视图作根 → 空指令表等）在构建期即 `_Exit(3)`，与 dry-run 同一闸门。
-//
-// 可用 `-DNN_SCAN_NO_ANCHOR` 关掉锚点做 A/B（只影响登记集合，不影响语义）。
-//
-// 锚点登记进**独立注册表**：scan_exprs 在结尾把两者合并并打印"锚点独有结构数"
-// —— 这是"结构覆盖已不依赖手写清单"的常驻台账（锚点独有 = 手写 dry-run 覆盖
-// 不到的调用点；该数突然变大通常意味着新增了未纳入 dry-run 的层路径）。
-[[nodiscard]] inline nn::fused::ExprRegistry& anchor_registry()
-{
-    static nn::fused::ExprRegistry reg;
-    return reg;
-}
-
-// 锚点：每个被扫描的表达式**类型**实例化一个 `FusedAnchor<Expr>`，其静态
-// 初始化期把"从类型默认构造的符号实例"折叠出的结构登记进**锚点注册表**
-// （scan_exprs 结尾与 dry-run 注册表合并，见下）。
-template <class Expr> struct FusedAnchor
-{
-    static inline const int reg = []
-    {
-        const Expr sym{};
-        auto [spec, inputs] = to_expr_spec(sym);
-        (void)inputs;   // 符号实例：inputs 全是占位张量，注册只用结构
-        if (auto v = validate_expr_spec(spec, spec.views.size()); !v) scan_reject(v.error());
-        anchor_registry().add(spec);
-        return 0;
-    }();
-};
-
-// fold 锚点：fold spec 由**值构造器**产出（make_fold_*），类型不编码结构——
-// FusedAnchor 按类型登记覆盖不到（视图种类/参数是构造实参）。由**消费方**
-// 在静态初始化期经本锚点自登记"本调用点实际会构造的结构变体"（k / view
-// param 等形状参数不进 key，取代表值即可），与 FusedAnchor 同机制/同注册表：
-// **新增 fold 表达式无需改 scan_exprs**（表达式自登记约定）。
-struct FoldAnchor
-{
-    explicit FoldAnchor(ExprSpec s)
-    {
-        if (auto v = validate_expr_spec(s, s.views.size()); !v) scan_reject(v.error());
-        anchor_registry().add(std::move(s));
-    }
-};
-
-// ── 构建期扫描的单点登记（三个 dsl 入口共用）────────────────────────────
-// 折叠表达式 → 校验 → 登记进全局注册表，并返回折叠出的 spec（compute_reduce
-// 还要用它判定归约轴）。
-// 登记两项：
-//   ① **结构**（按 canonical key 去重）——运行期注册表的键；
-//   ② **观察到的精度签名**（真实张量精度 + 真实 P）——生成阶段据此发
-//      **编译期特化** shader（键 `key#xxxx`，f16 存储 + f32 算术）。这是一个
-//      纯优化：热循环里不带 `prec` 三元（实测 CE 融合注意力 −18%）；
-//      未枚举到的签名仍由运行期分派变体 `key#x` 兜底。
-// 锚点（FusedAnchor，按**类型**登记）由本函数统一 odr-use，保证三个入口的
-// 锚点覆盖行为一致（此前三处各写一遍，漏一处 = 该入口的调用点失去编译期可达
-// 覆盖，且只在 GPU 注册表 miss（JIT 兜底）时才暴露）。锚点路径的输入是**符号占位张量**
-// （默认 f32）→ 其签名恒 0，不会污染特化集合。
-template <class Expr>
-[[nodiscard]] inline ExprSpec scan_register(const Expr& e, Precision P = Precision::F32)
-{
-#if !defined(NN_SCAN_NO_ANCHOR)
-    (void)FusedAnchor<Expr>::reg;
-#endif
-    auto [spec, inputs] = to_expr_spec(e);
-    if (auto v = validate_expr_spec(spec, inputs.size()); !v) scan_reject(v.error());
-    fused::global_registry().add(spec);
-    // 签名位：bit i = 第 i 个输入是 f16，bit16 = 输出是 f16（与运行时
-    // expr_prec_sig_of / 生成阶段同源）。这里就地算，避免依赖 compute_engine
-    // 的 include 顺序（expr_dsl 被 compute_engine 包含）。
-    {
-        std::uint32_t bits = 0;
-        const std::size_t n = inputs.size() < 16u ? inputs.size() : 16u;
-        for (std::size_t i = 0; i < n; ++i)
-            if (inputs[i].precision() == Precision::F16) bits |= (1u << i);
-        fused::global_registry().add_variant(spec, expr_prec_sig_make(bits, P == Precision::F16));
-    }
-    return spec;
-}
-
-#endif   // NN_EXPR_SCAN
 
 // ══════════════════════════════════════════════════════════════════════════
 // 统一入口：engine.compute(expr, rows, cols[, P])
@@ -1670,33 +1570,6 @@ template <typename E>
         std::fprintf(stderr, "[dsl] compute 拒绝非存储精度: %s\n", ok.error().message.c_str());
         return Tensor{};
     }
-#ifdef NN_EXPR_SCAN
-    // 构建期扫描模式：折叠内联表达式的**结构**并登记进全局注册表，
-    // 返回占位张量让 dry-run 流程继续（scan 只关心表达式集合，不真算）。
-    // 表达式文本仍只出现在 Layer；这里登记的是派生物 ExprSpec。
-    // 自登记锚点（按类型登记结构）在 scan_register 内统一处理。
-    (void)eng;
-    // IR-C：个体结构**恒登记**（录制段内也登记——锚点的
-    // 符号实例与运行期实例可能折叠出不同 key，双保险；注册表按 key 去重，
-    // 冗余无害。P2 教训：只入图不登记会让未融合回退/单节点 kernel 走 JIT 兜底
-    // miss），录制段内再入图（end_expr 时融合并登记复合 spec）。
-    const ExprSpec reg_spec = scan_register(e, P);
-    if (auto* g = fused::recording_graph())
-    {
-        auto [spec, inputs] = to_expr_spec(e);
-        if (auto v = validate_expr_spec(spec, inputs.size()); !v) scan_reject(v.error());
-        const int node = g->add_node(spec, inputs, rows, cols,
-                                     /*vector_out=*/false, P);
-        Tensor ph = (P == Precision::F16 ? TensorAccess::cpu<Precision::F16>(rows, cols)
-                                         : TensorAccess::cpu(rows, cols));
-        ph.set_virtual_tag(g->tag_of_node[static_cast<std::size_t>(node)]);
-        g->node_outputs[node] = ph;
-        return ph;
-    }
-    (void)reg_spec;
-    return (P == Precision::F16 ? TensorAccess::cpu<Precision::F16>(rows, cols)
-                                : TensorAccess::cpu(rows, cols));
-#else
     if (eng.device() == Device::CPU)
     {
         if constexpr (nn::dsl::has_reduction_v<E>)
@@ -1723,7 +1596,6 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     NN_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr(spec, inputs, rows, cols, P);  // AOT 注册表：GPU 未命中走 JIT 兜底
-#endif
 }
 
 // ── 无形状重载：dsl::compute(engine, expr[, P]) ────────────────────────────
@@ -1801,28 +1673,6 @@ template <typename E>
 [[nodiscard]] Result<void> compute_into(ComputeEngine& eng, const E& e, Tensor& dst)
 {
     NN_PROF_OP("dsl::compute_into");   // CPU 模板路径不经引擎入口，须在此计时（剖析器）
-#ifdef NN_EXPR_SCAN
-    // 构建期扫描：与 compute() 一样只登记结构（不真算、不关心 dst 的值），
-    // 锚点自登记在 scan_register 内统一处理
-    (void)eng;
-    // 个体结构恒登记（录制段内也登记，双保险——见 compute 的说明）
-    (void)scan_register(e, dst.precision());
-    // IR-C（P2）：录制段内作为目标传递节点入图（输出 = dst 既有张量，
-    // end_expr 的复合 kernel 写回其存储）
-    if (auto* g = fused::recording_graph())
-    {
-        auto [tspec, tinputs] = to_expr_spec(e);
-        if (auto v = validate_expr_spec(tspec, tinputs.size()); !v) scan_reject(v.error());
-        const int node = g->add_node(tspec, tinputs, dst.rows(), dst.cols(),
-                                     /*vector_out=*/false, dst.precision(),
-                                     // RV-03：写目标存储标识（同目标写序的显式建边依据）
-                                     dst.storage_id());
-        g->node_outputs[node] = dst;
-        return {};
-    }
-    (void)dst;
-    return {};
-#else
     if (eng.device() == Device::CPU)
     {
         if (!dst.is_cpu()) NN_FAIL("dsl::compute_into: dst not on CPU");
@@ -1863,7 +1713,6 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     NN_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr_into(spec, inputs, dst.rows(), dst.cols(), dst);
-#endif
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1882,43 +1731,6 @@ template <typename E>
 {
     NN_PROF_OP("dsl::compute_reduce"); // CPU 模板路径不经引擎入口，须在此计时（剖析器）
     NN_TRY(pc, check_precision_supported(P)); // 同 compute()：拒绝非存储精度
-#ifdef NN_EXPR_SCAN
-    // 构建期扫描：同 compute()，登记结构（归约轴供下面取占位张量形状）。
-    // 占位张量按归约轴取向量形状 (rows,1)/(1,cols)，使 Layer 后续
-    // add_inplace 等形状相关操作在 dry-run 中不因形状失配而中断。
-    // 锚点自登记在 scan_register 内统一处理。
-    (void)eng;
-    // 个体结构恒登记（录制段内也登记，双保险——见 compute 的说明）
-    const ExprSpec reg_spec = scan_register(e, P);
-    // IR-C：录制段内加入图（归约向量占位 + tag）
-    if (auto* g = fused::recording_graph())
-    {
-        auto [rspec, rinputs] = to_expr_spec(e);
-        if (auto v = validate_expr_spec(rspec, rinputs.size()); !v) scan_reject(v.error());
-        const int raxis0 = expr_spec_reduce_axis(rspec);
-        const int node = g->add_node(rspec, rinputs, rows, cols,
-                                     /*vector_out=*/true, P);
-        Tensor ph =
-            (P == Precision::F16 ? ((raxis0 == 0)   ? TensorAccess::cpu<Precision::F16>(rows, 1)
-                                    : (raxis0 == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
-                                                    : TensorAccess::cpu<Precision::F16>(rows, cols))
-                                 : ((raxis0 == 0)   ? TensorAccess::cpu(rows, 1)
-                                    : (raxis0 == 1) ? TensorAccess::cpu(1, cols)
-                                                    : TensorAccess::cpu(rows, cols)));
-        ph.set_virtual_tag(g->tag_of_node[static_cast<std::size_t>(node)]);
-        g->node_outputs[node] = ph;
-        return ph;
-    }
-    const ExprSpec spec = reg_spec;
-    const int raxis = expr_spec_reduce_axis(spec);
-    if (P == Precision::F16)
-        return ((raxis == 0)   ? TensorAccess::cpu<Precision::F16>(rows, 1)
-                : (raxis == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
-                               : TensorAccess::cpu<Precision::F16>(rows, cols));
-    return ((raxis == 0)   ? TensorAccess::cpu(rows, 1)
-            : (raxis == 1) ? TensorAccess::cpu(1, cols)
-                           : TensorAccess::cpu(rows, cols));
-#else
     if (eng.device() == Device::CPU)
     {
         // 必须用 if constexpr：非归约根节点的 E 不能实例化 reduce_vector_tensor
@@ -1938,7 +1750,6 @@ template <typename E>
     auto [spec, inputs] = to_expr_spec(e);
     NN_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr_reduce(spec, inputs, rows, cols, P);
-#endif
 }
 
 // ── 无形状重载：dsl::compute_reduce(engine, expr[, P]) ─────────────────────

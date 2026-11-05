@@ -141,6 +141,8 @@ public:
     // AOT 注册表 miss = JIT 现编兜底（须在 scan_exprs 覆盖录制段以预热）。
     [[nodiscard]] Result<void> begin_expr() override
     {
+        // 临时 A/B（NN_NO_GRAPH=1）：跳过录制，表达式直求值（排查 full-f16 图路径）
+        if (std::getenv("NN_NO_GRAPH") != nullptr) return {};
         auto& owner = fused::recording_graph_owner();
         if (owner) NN_FAIL("begin_expr: 嵌套录制（已有未结束的 begin_expr）");
         owner = std::make_unique<ExprGraph>();
@@ -151,6 +153,7 @@ public:
     [[nodiscard]] Result<void> end_expr() override
     {
         auto& owner = fused::recording_graph_owner();
+        if (std::getenv("NN_NO_GRAPH") != nullptr && !owner) return {};   // A/B：与 begin 对称跳过
         // 录制图是 thread_local：跨线程 end_expr 看不到别人线程的 begin_expr。
         // 原实现静默 return {} ⇒ 录制图悬挂到下一次 begin_expr 才以"嵌套录制"
         // 报错（现场丢失）。这里明确报错，把"begin/end 必须同线程配对"变成
@@ -1555,12 +1558,43 @@ public:
         return strict;
     }
 
-    // 懒加载生成器 .so + 内存 KernelCache（各只做一次；失败 NN_FAIL 带 dlerror）。
-    [[nodiscard]] Result<void> ensure_jit_() const
+    // ── JIT 两段前置：.nnk 缓存加载 与 生成器 dlopen（彼此解耦）────────────
+    // 缓存读取不需要 glslang——NN_STRICT_CLOSED_WORLD=1（D6：只用预生成
+    // 缓存、miss 即报错）与"预热命中跑"都不应 dlopen libnn-kernelgen.so。
+    [[nodiscard]] Result<void> ensure_cache_() const
+    {
+        if (kernel_cache_) return {};
+        const std::string& cpath = nn::fused::kernel_cache_path();
+        std::string bytes;
+        if (std::ifstream f(cpath, std::ios::binary); f)
+        {
+            std::ostringstream ss;
+            ss << f.rdbuf();
+            bytes = ss.str();
+        }
+        if (bytes.empty())
+        {
+            auto c = std::make_shared<nn::fused::KernelCache>();
+            c->generator_version = nn::fused::kKernelCacheGeneratorVersion;
+            c->rec.set("nnk_format_version", nn::fused::kKernelCacheFormatVersion);
+            c->rec.set("generator_version", nn::fused::kKernelCacheGeneratorVersion);
+            kernel_cache_ = std::move(c);
+        }
+        else
+        {
+            auto r = nn::fused::KernelCache::from_bytes(bytes, nn::fused::kKernelCacheGeneratorVersion);
+            if (!r) NN_FAIL("kernels.nnk 缓存解析失败（损坏？）：" + cpath);
+            kernel_cache_ = std::make_shared<nn::fused::KernelCache>(std::move(*r));
+        }
+        return {};
+    }
+
+    // 生成器 .so 懒加载（仅"缓存 miss 且非 strict"才走到；失败 NN_FAIL 带 dlerror）。
+    [[nodiscard]] Result<void> ensure_generator_() const
     {
         if (jit_init_tried_) return {};
         jit_init_tried_ = true;
-        // 1) dlopen libnn-kernelgen.so（NN_KERNELGEN_PATH 覆盖 → 系统库搜索）
+        // dlopen libnn-kernelgen.so（NN_KERNELGEN_PATH 覆盖 → 系统库搜索）
         std::string path = nn::detail::env_string_raw("NN_KERNELGEN_PATH");
         if (path.empty()) path = "libnn-kernelgen.so";
 #ifdef _WIN32
@@ -1586,30 +1620,15 @@ public:
         jit_.version = reinterpret_cast<decltype(jit_.version)>(sym("nnk_generator_version"));
         if (!jit_.generate || !jit_.free || !jit_.version)
             NN_FAIL("libnn-kernelgen.so 符号不完整（缺 nnk_generate_spirv/free/version）");
-        // 2) 加载 .nnk 缓存（generator_version 不符 → KernelCache::from_bytes 判陈旧重建）
-        const std::string& cpath = nn::fused::kernel_cache_path();
-        std::string bytes;
-        if (std::ifstream f(cpath, std::ios::binary); f)
-        {
-            std::ostringstream ss;
-            ss << f.rdbuf();
-            bytes = ss.str();
-        }
-        if (bytes.empty())
-        {
-            auto c = std::make_shared<nn::fused::KernelCache>();
-            c->generator_version = nn::fused::kKernelCacheGeneratorVersion;
-            c->rec.set("nnk_format_version", nn::fused::kKernelCacheFormatVersion);
-            c->rec.set("generator_version", nn::fused::kKernelCacheGeneratorVersion);
-            kernel_cache_ = std::move(c);
-        }
-        else
-        {
-            auto r = nn::fused::KernelCache::from_bytes(bytes, nn::fused::kKernelCacheGeneratorVersion);
-            if (!r) NN_FAIL("kernels.nnk 缓存解析失败（损坏？）：" + cpath);
-            kernel_cache_ = std::make_shared<nn::fused::KernelCache>(std::move(*r));
-        }
         return {};
+    }
+
+    // 兼容调用点：缓存 + 生成器（原 ensure_jit_ 语义）。
+    [[nodiscard]] Result<void> ensure_jit_() const
+    {
+        NN_TRY(a, ensure_cache_());
+        (void)a;
+        return ensure_generator_();
     }
 
     // 原子写盘（temp+rename）+ 进程锁（flock，POSIX）：锁内重读盘上缓存并合并
@@ -1690,14 +1709,23 @@ public:
 
     // 编译（或缓存命中）得到某 key 的 SPIR-V；miss → 生成器现编 → 内存缓存 insert
     // + 落盘。prec_sig=0（V0）或 EXPR_PREC_SIG_DISPATCH（`#x`）。
+    // D6 语义（NN_STRICT_CLOSED_WORLD=1）：**只用预生成的 .nnk 缓存**——
+    // 命中照常返回；miss 即报错，既不 dlopen 生成器也不现编（缓存即预生成物，
+    // 由 model_warmup / nn_warmup 产出 kernels.nnk 随发布分发）。
     [[nodiscard]] Result<std::vector<std::uint32_t>> jit_compile_(const std::string& key,
                                                                   const nn::ExprSpec& spec,
                                                                   std::uint32_t prec_sig) const
     {
-        NN_TRY(unused, ensure_jit_());
+        NN_TRY(unused, ensure_cache_());
         (void)unused;
         const std::string K = nn::fused::kernel_cache_key(key, prec_sig);
         if (const auto* spv = kernel_cache_->hit(K)) return *spv;
+        if (jit_strict_())
+            NN_FAIL("NN_STRICT_CLOSED_WORLD=1：只允许使用预生成的 .nnk 缓存（kernels.nnk），"
+                    "该 key 未命中——先经 model_warmup/nn_warmup 预热生成缓存；K=" +
+                    K);
+        NN_TRY(unused2, ensure_generator_());
+        (void)unused2;
         const auto spec_bytes = nn::fused::encode_expr_spec(spec);
         std::uint8_t* spirv = nullptr;
         std::size_t len = 0;
@@ -1718,6 +1746,8 @@ public:
     // 完整 miss 路径：JIT 编译 V0（f32）→ 后端懒建 pipeline → 执行。
     // 调用方在 psig!=0 时已抬 f32 重入（eval_expr_impl 边界 cast 语义），故此处
     // 只 JIT V0 结构键；输出按 P 由调用方回贴（f16 → GpuTensorF16）。
+    // fold 形态经同一路径：fold_k 是运行时形态参数（不进 key），kernelgen 的
+    // generate() 对 spec.fold 内部分派 generate_glsl_fold(_v2)。
     [[nodiscard]] Result<Tensor> jit_run_(const nn::ExprSpec& spec, const std::string& key,
                                           std::span<const Tensor> inputs, std::size_t rows,
                                           std::size_t cols, Precision P)
@@ -1735,7 +1765,7 @@ public:
             key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/false, vp, spec.rparams,
             /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
             nn::expr_spec_runtime_matmul_batch(spec), nn::expr_spec_runtime_matmul_trans(spec),
-            /*fold_k=*/std::nullopt, /*out_f16=*/false, /*prec_sig=*/0);
+            nn::expr_spec_runtime_fold_k(spec), /*out_f16=*/false, /*prec_sig=*/0);
         NN_TRY_CHECK(out);
         if (P == Precision::F16)
             return Tensor::from_gpu(GpuTensorF16(out->shared_buffer(), rows, cols));
@@ -1801,9 +1831,11 @@ public:
                 NN_TRY_CHECK(r);
                 return to_prec(std::move(*r), P);
             }
-            NN_FAIL("GpuEngine::eval_expr: fold 表达式未命中 AOT 融合 shader"
-                    "（AOT 注册表）；请将该 fold 结构纳入 scan_exprs；key=" +
-                    fkey);
+            // fold 未命中（此处已全 f32）→ JIT：kernelgen 对 spec.fold 内部分派
+            // generate_glsl_fold(_v2)；strict 语义在 jit_compile_ 内生效（D6）。
+            auto jr_fold = jit_run_(raw_spec, fkey, inputs, rows, cols, P);
+            NN_TRY_CHECK(jr_fold);
+            return *jr_fold;
         }
         // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
         //    key 与 shader 合成两端一致；dispatch 用 canonical 的 consts ──
@@ -1865,23 +1897,15 @@ public:
             NN_TRY_CHECK(r);
             return to_prec(std::move(*r), P);
         }
-        // ── 未命中 AOT 注册表 → 运行期 JIT 现编（Phase 2；docs/internal/33）──
-        // 内嵌注册表（构建期 AOT）降级为"预热加速器"：未知结构（使用者自研
-        // 层、未枚举签名）走 JIT —— 引擎 dlopen libnn-kernelgen.so 现编 SPIR-V、
-        // 懒建 pipeline、执行，并持久化进 .nnk 缓存。**绝不静默回退 CPU/边界 cast**。
+        // ── 未命中 → 运行期 JIT 现编（D4 后为唯一 miss 路径；docs/internal/33/35）──
+        // 引擎 dlopen libnn-kernelgen.so 现编 SPIR-V、懒建 pipeline、执行，并
+        // 持久化进 .nnk 缓存。**绝不静默回退 CPU/边界 cast**。
         // psig==0（此刻输入已全 f32、P==F32）→ 只 JIT V0 结构键 `key`；输出 f32。
-        if (!jit_strict_())
-        {
-            auto jr = jit_run_(spec, key, inputs, rows, cols, P);
-            NN_TRY_CHECK(jr);
-            return *jr;
-        }
-        // ── 严格模式（NN_STRICT_CLOSED_WORLD=1，opt-in 看门狗）──
-        NN_FAIL("GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（AOT 注册表）；"
-                "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）"
-                "或关闭 NN_STRICT_CLOSED_WORLD 走 JIT 现编；"
-                "key=" +
-                key);
+        // strict（NN_STRICT_CLOSED_WORLD=1，D6 新语义 = 只用预生成 .nnk 缓存、
+        // miss 即报错）在 jit_compile_ 内生效，此处不再分支。
+        auto jr = jit_run_(spec, key, inputs, rows, cols, P);
+        NN_TRY_CHECK(jr);
+        return *jr;
     }
 
     // ── 能力摘要（唯一对外通道；只披露事实，不用于选路）──────────────────
@@ -1982,11 +2006,26 @@ public:
             NN_TRY_CHECK(r);
             return to_prec(std::move(*r), P);
         }
-        // ── 注册表 miss：未命中归约融合 shader → 硬报错（JIT 未接线） ──
-        NN_FAIL("GpuEngine::eval_expr_reduce: 未找到该归约表达式的 AOT 融合 shader（AOT 注册表）；"
-                "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
-                "key=" +
-                key);
+        // ── 注册表 miss → 运行期 JIT（P3/D4：AOT 收集链已删，JIT 是唯一路径）──
+        // 归约形态：vector_out=1（thread 0 写 (rows,1)/(1,cols) 归约向量，同 AOT
+        // 命中路径参数）；psig==0（非 f32 已在上一块边界 cast 回退）→ 只 JIT V0。
+        // strict 语义在 jit_compile_ 内生效（D6）。
+        NN_TRY(spv_r, jit_compile_(key, spec, /*prec_sig=*/0));
+        {
+            auto fi_r = fused_buffers_(inputs);
+            NN_TRY_CHECK(fi_r);
+            const nn::FusedKernelMeta meta = nn::fused_kernel_meta_of(spec);
+            NN_TRY_CHECK(backend_->ensure_fused_kernel(key, *spv_r, meta, spec));
+            const auto vp = nn::expr_spec_runtime_view_params(spec);
+            auto out = backend_->run_fused_gpu(
+                key, fi_r->bufs, spec.consts, rows, cols, /*vector_out=*/true, vp, spec.rparams,
+                /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
+                nn::expr_spec_runtime_matmul_batch(spec),
+                nn::expr_spec_runtime_matmul_trans(spec),
+                /*fold_k=*/std::nullopt, /*out_f16=*/false, /*prec_sig=*/0);
+            NN_TRY_CHECK(out);
+            return Tensor::from_gpu(std::move(*out));
+        }
     }
 
     // ── 目标传递（destination-passing）：结果直接写回已有张量 ─────────────
@@ -2069,11 +2108,33 @@ public:
             NN_TRY_CHECK(r);
             return cast_into(tmp, dst);
         }
-        // ── 注册表 miss：未命中 AOT 融合 shader → 硬报错（JIT 未接线） ──
-        NN_FAIL("GpuEngine::eval_expr_into: 未找到该表达式的 AOT 融合 shader（AOT 注册表）；"
-                "请将对应表达式纳入构建期扫描（scan_exprs dry-run 需覆盖该 Layer 路径）；"
-                "key=" +
-                key);
+        // ── miss → 运行期 JIT（P3/D4；output_override = dst，同 AOT 命中路径）──
+        // psig==0 ⇒ 输入与 dst 均 f32（f16 目标已在上一块边界 cast 回退）。
+        // strict 语义在 jit_compile_ 内生效（D6）。
+        NN_TRY(spv_r, jit_compile_(key, spec, /*prec_sig=*/0));
+        {
+            auto fi_r = fused_buffers_(inputs);
+            NN_TRY_CHECK(fi_r);
+            auto dst_gpu = import(dst);
+            NN_TRY_CHECK(dst_gpu);
+            if (!dst_gpu->gpu_shared<Precision::F32>())
+                NN_FAIL("eval_expr_into: f32 目标缺少 f32 GPU 存储"
+                        "（precision 标签与存储不一致）");
+            GpuTensor* dst_override = &dst_gpu->gpu_tensor();
+            const nn::FusedKernelMeta meta = nn::fused_kernel_meta_of(spec);
+            NN_TRY_CHECK(backend_->ensure_fused_kernel(key, *spv_r, meta, spec));
+            const auto vp = nn::expr_spec_runtime_view_params(spec);
+            auto out = backend_->run_fused_gpu(
+                key, fi_r->bufs, spec.consts, rows, cols, /*vector_out=*/false, vp, spec.rparams,
+                dst_override, nn::expr_spec_runtime_matmul_k(spec),
+                nn::expr_spec_runtime_matmul_batch(spec), nn::expr_spec_runtime_matmul_trans(spec),
+                /*fold_k=*/std::nullopt, /*out_f16=*/false, /*prec_sig=*/0);
+            NN_TRY_CHECK(out);
+            // dst 原为 CPU staging 时，import 上传了新 buffer（结果在它上面）
+            // → 用 upload 后的张量替换 dst，保证调用方看到更新后的数据
+            if (dst.is_cpu()) dst = std::move(*dst_gpu);
+            return {};
+        }
     }
 
     // ── P2 多输出（IR-C 写穿物化）────────────────────────────────────────
@@ -2126,9 +2187,38 @@ public:
             return {};
         }
 #endif
-        NN_FAIL("GpuEngine::eval_expr_multi_into: 未命中 AOT 融合 shader（AOT 注册表）；"
-                "请将 begin_expr/end_expr 段纳入构建期扫描（scan_exprs）；key=" +
-                key);
+        // ── miss → 运行期 JIT（P3/D4；多输出 extras 同 AOT 命中路径）────────
+        // NVI 已验全 f32 → 只 JIT V0；kernelgen 的 generate() 对 extras 在
+        // sig=0 写穿全部成员输出。strict 语义在 jit_compile_ 内生效（D6）。
+        NN_TRY(spv_r, jit_compile_(key, spec, /*prec_sig=*/0));
+        {
+            auto fi_r = fused_buffers_(inputs);
+            NN_TRY_CHECK(fi_r);
+            std::vector<GpuTensor> owned;       // 视图持有者（ptrs 指向其元素）
+            std::vector<GpuTensor*> ptrs;
+            owned.reserve(outs.size());
+            ptrs.reserve(outs.size());
+            for (auto& t : outs)
+            {
+                auto g = import(t);
+                NN_TRY_CHECK(g);
+                if (!g->gpu_shared<Precision::F32>())
+                    NN_FAIL("eval_expr_multi_into: f32 输出缺少 f32 GPU 存储");
+                owned.push_back(g->gpu_tensor());
+                ptrs.push_back(&owned.back());
+            }
+            const nn::FusedKernelMeta meta = nn::fused_kernel_meta_of(spec);
+            NN_TRY_CHECK(backend_->ensure_fused_kernel(key, *spv_r, meta, spec));
+            std::vector<GpuTensor*> extra_ptrs(ptrs.begin() + 1, ptrs.end());
+            const auto vp = nn::expr_spec_runtime_view_params(spec);
+            auto r = backend_->run_fused_gpu(key, fi_r->bufs, spec.consts, rows, cols,
+                                             /*vector_out=*/false, vp, spec.rparams, ptrs[0],
+                                             /*matmul_k=*/std::nullopt, /*matmul_batch=*/1u,
+                                             /*matmul_trans=*/0u, /*fold_k=*/std::nullopt,
+                                             /*out_f16=*/false, /*prec_sig=*/0, extra_ptrs);
+            NN_TRY_CHECK(r);
+            return {};
+        }
     }
 
 private:
@@ -2498,7 +2588,7 @@ private:
             {
                 // 通用诊断（NN_IRC_TRACE=1；与 NN_PREC_TRACE 同哲学：降级不是
                 // 错误，但必须可观测——否则"某段悄悄没融合"无从归因）。
-                if (nn::dsl::env_flag("NN_IRC_TRACE"))
+                if (std::getenv("NN_IRC_TRACE") != nullptr)
                     std::fprintf(stderr,
                                  "[ir-c][degrade] 复合 kernel(%zu 成员, extras=%zu)"
                                  " 未登记 → 逐成员派发\n",
@@ -2510,6 +2600,11 @@ private:
                 continue;
             }
 
+            if (std::getenv("NN_IRC_TRACE") != nullptr)
+                std::fprintf(stderr,
+                             "[ir-c][run] extras=%zu members=%zu rows=%zu cols=%zu outP=%d vec=%d\n",
+                             k.spec.extras.size(), k.members.size(), k.rows, k.cols,
+                             (int)d.out.precision(), k.vector_out ? 1 : 0);
             if (k.spec.extras.empty())
             {
                 auto r = run_graph_kernel_into_(k.spec, d.ins, k.rows, k.cols, k.vector_out, d.out);
@@ -2557,8 +2652,31 @@ private:
         const ExprSpec spec = is_fold ? raw_spec : nn::canonicalize_expr_spec(raw_spec);
         const std::string key = nn::expr_spec_key(spec);
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, out.precision());
+        // ── psig≠0（任一 f16 参与）→ 边界 cast（F2 语义）──────────────────
+        // 输入抬 f32 → 递归走 V0（JIT 只现编 V0 f32 算术 kernel）→ cast_into
+        // 写回 out 的真实存储。正确性优先：f16 静态特化 JIT（按 sig 现编
+        // f16-storage shader）与 AOT #s/#xxxx 时代行为存在实测差异——门 D 实测
+        // full-f16 第 1 步更新即 NaN（f16_writeback 的混合签名场景通过，但
+        // optimizer=f16 全 f16 签名链条 NaN），故图内执行统一走边界 cast。
+        if (psig != 0)
+        {
+            // A/B：与直求值同形态（eval_expr 分配输出 → cast_into 写回），
+            // 排查 output_override/tmp 路径在 f16 图成员上的 NaN。
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            if (vector_out)
+            {
+                auto tmp = create_tensor(out.rows(), out.cols(), Precision::F32);
+                auto r0 = run_graph_kernel_into_(raw_spec, *in32, rows, cols, vector_out, tmp);
+                NN_TRY_CHECK(r0);
+                return cast_into(tmp, out);
+            }
+            auto r = eval_expr_impl(raw_spec, *in32, rows, cols, Precision::F32);
+            NN_TRY_CHECK(r);
+            return cast_into(*r, out);
+        }
 #ifndef NN_FUSED_REGISTRY_EMBEDDED
-        // 无注册表模式（NN_EXPR_SCAN 收集器 TU）：融合分支整体不编译
+        // 无注册表模式（P3/D4 起的常态）：融合分支整体不编译
         (void)rows;
         (void)cols;
         (void)vector_out;
@@ -2603,9 +2721,48 @@ private:
             return {};
         }
 #endif
-        NN_FAIL("GpuEngine::end_expr: 融合 kernel 未命中 AOT 融合 shader（AOT 注册表）；"
-                "请将 begin_expr/end_expr 段纳入构建期扫描（scan_exprs）；key=" +
-                key);
+        // ── miss → 运行期 JIT（P3/D4：AOT 收集链已删，JIT 是唯一 miss 路径）──
+        // 按**具体签名**现编（kernelgen 的 emitter 支持静态签名特化，与构建期
+        // key#xxxx 变体同源；psig 是位图、不是 #x 分派哨兵），f16 输入/输出
+        // 直接命中、无需边界 cast。管线名 = .nnk 缓存键（含签名后缀），
+        // 与 V0 管线（纯 key）互不冲突。strict 语义在 jit_compile_ 内生效（D6）。
+        {
+            auto spv_r = jit_compile_(key, spec, psig);
+            NN_TRY_CHECK(spv_r);
+            const std::string pname = nn::fused::kernel_cache_key(key, psig);
+            auto fi_r = fused_buffers_(inputs);
+            NN_TRY_CHECK(fi_r);
+            auto out_gpu = import(out);
+            NN_TRY_CHECK(out_gpu);
+            std::optional<GpuTensor> out_view;
+            GpuTensor* out_override = nullptr;
+            if (out_gpu->precision() == Precision::F16)
+            {
+                if (!out_gpu->gpu_shared<Precision::F16>())
+                    NN_FAIL("run_graph_kernel_into: f16 占位缺少 f16 GPU 存储"
+                            "（precision 标签与存储不一致）");
+                out_view = f16_view(*out_gpu);
+                out_override = &*out_view;
+            }
+            else
+            {
+                if (!out_gpu->gpu_shared<Precision::F32>())
+                    NN_FAIL("run_graph_kernel_into: f32 占位缺少 f32 GPU 存储"
+                            "（precision 标签与存储不一致）");
+                out_override = &out_gpu->gpu_tensor();
+            }
+            const nn::FusedKernelMeta meta = nn::fused_kernel_meta_of(spec);
+            NN_TRY_CHECK(backend_->ensure_fused_kernel(pname, *spv_r, meta, spec));
+            const auto vp = nn::expr_spec_runtime_view_params(spec);
+            auto r = backend_->run_fused_gpu(
+                pname, fi_r->bufs, spec.consts, rows, cols, vector_out, vp, spec.rparams,
+                out_override, nn::expr_spec_runtime_matmul_k(spec),
+                nn::expr_spec_runtime_matmul_batch(spec), nn::expr_spec_runtime_matmul_trans(spec),
+                is_fold ? nn::expr_spec_runtime_fold_k(spec) : std::nullopt,
+                /*out_f16=*/false, psig);
+            NN_TRY_CHECK(r);
+            return {};
+        }
     }
 
     // ── 复合 kernel 可用性查询（注册表降级的判据）────────────────────────
@@ -2619,10 +2776,14 @@ private:
                                                    const Tensor& out) const
     {
 #ifndef NN_FUSED_REGISTRY_EMBEDDED
-        (void)k;
-        (void)ins;
-        (void)out;
-        return true;   // 收集器 TU：融合执行分支整体不编译
+        // 无注册表（P3/D4 起的常态）：可用性 = JIT 能否执行。
+        //   · 单输出链：JIT 兜底覆盖（fold/reduce/静态签名，run_graph_kernel_into_）→ 可用；
+        //   · 多输出（extras）：仅全 f32 可用（eval_expr_multi_into 的 NVI 前置
+        //     校验同条件；f16 成员降级为逐成员派发，与注册表时代的判据一致）。
+        if (k.spec.extras.empty()) return true;
+        for (const auto& t : ins)
+            if (t.precision() != Precision::F32) return false;
+        return out.precision() == Precision::F32;
 #else
         if (k.spec.extras.empty())
         {

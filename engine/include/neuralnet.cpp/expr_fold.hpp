@@ -191,17 +191,3 @@ namespace nn::expr
 //  ⚠ `expr_dsl.hpp`（`FoldAnchor` 所在）只在本扫描段内包含：普通构建里本头
 //    仍只依赖 `expr_spec.hpp`（保持轻量）。
 // ═══════════════════════════════════════════════════════════════════════════
-#if defined(NN_EXPR_SCAN) && !defined(NN_SCAN_NO_ANCHOR)
-#include "expr_dsl.hpp"
-namespace nn::expr
-{
-// k（= 本头的唯一形状参数）不进 key → 一个代表值覆盖所有收缩长度。
-inline const bool g_fold_sample_anchors = []
-{
-    (void)dsl::FoldAnchor{make_fold_rowmax(64)};
-    (void)dsl::FoldAnchor{make_fold_rowsum(64)};
-    (void)dsl::FoldAnchor{make_fold_softmax_denom(64)};
-    return true;
-}();
-} // namespace nn::expr
-#endif

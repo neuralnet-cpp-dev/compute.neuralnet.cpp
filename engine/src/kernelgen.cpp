@@ -73,12 +73,26 @@ nnk_status nnk_generate_spirv(const std::uint8_t* spec_bytes, std::size_t spec_l
     const std::string glsl = (raxis >= 0)
                                  ? emitter->generate_reduce("jit_kernel", canon, prec_sig)
                                  : emitter->generate("jit_kernel", canon, prec_sig, /*alu=*/false);
-    if (glsl.empty()) return NNK_COMPILE_FAIL;
+    if (glsl.empty())
+    {
+        // 生成器对该形态返回空串（不支持的视图/指令组合）——诊断到 stderr：
+        // 调用方只见 NNK_COMPILE_FAIL，缺这行无法区分"生成空"还是"shaderc 报错"。
+        std::fprintf(stderr, "[kernelgen] GLSL 生成为空: raxis=%d fold=%d extras=%zu\n",
+                     raxis, canon.fold ? 1 : 0, canon.extras.size());
+        return NNK_COMPILE_FAIL;
+    }
 
-    // 4) shaderc 编译 GLSL compute → SPIR-V（默认目标环境 = Vulkan 1.0）
+    // 4) shaderc 编译 GLSL compute → SPIR-V。
+    //    ⚠ 目标环境必须 ≥ Vulkan 1.2（SPIR-V 1.3）：归约/fold 的 GLSL 用
+    //      subgroup 指令（subgroupAdd/subgroupBroadcast…），默认 Vulkan 1.0
+    //      会报 `'subgroup op' : requires SPIR-V 1.3`（实测 softmax row 归约、
+    //      row_max(matmul) 两个 key）。与手写 shader 的策略同源——engine
+    //      CMake 对 reduce.comp 一族显式 `--target-env=vulkan1.2`。
     shaderc_compiler_t compiler = shaderc_compiler_initialize();
     if (compiler == nullptr) return NNK_COMPILE_FAIL;
     shaderc_compile_options_t opts = shaderc_compile_options_initialize();
+    shaderc_compile_options_set_target_env(opts, shaderc_target_env_vulkan,
+                                           shaderc_env_version_vulkan_1_2);
     shaderc_compilation_result_t res = shaderc_compile_into_spv(
         compiler, glsl.data(), glsl.size(), shaderc_compute_shader, "jit", "main", opts);
     shaderc_compile_options_release(opts);
@@ -86,7 +100,13 @@ nnk_status nnk_generate_spirv(const std::uint8_t* spec_bytes, std::size_t spec_l
     if (res == nullptr ||
         shaderc_result_get_compilation_status(res) != shaderc_compilation_status_success)
     {
-        if (res != nullptr) shaderc_result_release(res);
+        if (res != nullptr)
+        {
+            const char* err = shaderc_result_get_error_message(res);
+            std::fprintf(stderr, "[kernelgen] shaderc 编译失败: %s\n",
+                         err != nullptr ? err : "(无错误信息)");
+            shaderc_result_release(res);
+        }
         return NNK_COMPILE_FAIL;
     }
     const std::size_t len = shaderc_result_get_length(res);

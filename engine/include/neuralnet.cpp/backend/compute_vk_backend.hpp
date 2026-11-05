@@ -458,10 +458,8 @@
 //   （或反过来短路）：clang 21 实测 `#if` 条件里的 `__has_include` **无论是否被
 //   短路求值、都会被 -MD 记进 depfile**（该写法会触发上述依赖环）；
 //   只有把整组条件编译**跳过**（组内不出词法）才不产生探测记录。
-#ifndef NN_EXPR_SCAN
 #if __has_include("fused_registry.hpp")
 #include "fused_registry.hpp"
-#endif
 #endif
 
 // Vulkan 设备/Pipeline 辅助类（detail::vk_check/convert + VulkanDevice + VulkanPipeline）

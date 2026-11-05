@@ -63,32 +63,8 @@ else()
 endif()
 add_compile_options("$<$<CONFIG:Release>:${NN_RELEASE_FLAGS}>")
 
-# std::stacktrace 运行时库探测（仅 tools/scan_exprs 用；GCC/Clang+libstdc++ 需
-# stdc++exp 或 stdc++_libbacktrace，见源仓库 CMakeLists.txt §247）。
-# MSVC 自带 std::stacktrace（无需额外库）→ 跳过探测：GNU 库名作为
-# CMAKE_REQUIRED_LIBRARIES 会让 MSVC 的 try_compile 因无效链接库直接失败
-#（发布门禁 MSVC 矩阵实测，2026-11）。
-include(CheckCXXSourceCompiles)
-set(NN_STACKTRACE_LIB "")
-if(NOT MSVC)
-    foreach(_lib stdc++exp stdc++_libbacktrace)
-        if(NN_STACKTRACE_LIB)
-            break()
-        endif()
-        set(CMAKE_REQUIRED_LIBRARIES ${_lib})
-        check_cxx_source_compiles("
-            #include <stacktrace>
-            int main() { return std::stacktrace::current().empty() ? 1 : 0; }
-        " NN_HAS_STACKTRACE_${_lib})
-        unset(CMAKE_REQUIRED_LIBRARIES)
-        if(NN_HAS_STACKTRACE_${_lib})
-            set(NN_STACKTRACE_LIB ${_lib})
-        endif()
-    endforeach()
-endif()
-if(NN_STACKTRACE_LIB)
-    message(STATUS "std::stacktrace 运行时库: ${NN_STACKTRACE_LIB}")
-endif()
+# std::stacktrace 探测已随 tools/scan_exprs 删除（P3/D4，docs/internal/35）：
+# 引擎库与测试零 std::stacktrace 使用（全仓 grep 证实）。
 
 set(ABST_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/abstraction/include)
 set(ENGINE_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/engine/include)
@@ -186,19 +162,9 @@ if(NN_ENABLE_GPU)
         nn_embed_shader(matmul_q_f16 ${SHADER_DIR}/matmul_q.comp -DNN_SHADER_F16=1)
         nn_embed_shader(matmul_q_gemv_f16 ${SHADER_DIR}/matmul_q_gemv.comp --target-env=vulkan1.2 -DNN_SHADER_F16=1)
 
-        # 2. AOT 融合 shader：scan_exprs（单步 = 收集 + 生成）→ fused_registry.hpp
-        set(NN_FUSED_REGISTRY_HPP ${GENERATED_INCLUDE}/fused_registry.hpp)
-        add_executable(scan_exprs engine/tools/scan_exprs.cpp)
-        target_include_directories(scan_exprs PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-        target_link_libraries(scan_exprs PRIVATE Threads::Threads Vulkan::Vulkan ${NN_STACKTRACE_LIB})
-        add_custom_command(
-            OUTPUT ${NN_FUSED_REGISTRY_HPP}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_INCLUDE}
-            COMMAND scan_exprs ${GENERATED_INCLUDE} ${GLSLC}
-            DEPENDS scan_exprs ${CMAKE_CURRENT_SOURCE_DIR}/engine/tools/scan_exprs.cpp
-                    ${CMAKE_CURRENT_SOURCE_DIR}/engine/tools/fused_generate.hpp
-            COMMENT "[GPU] Scan + synthesize fused shaders (scan_exprs) → fused_registry.hpp")
-        list(APPEND GPU_GENERATED_HPP ${NN_FUSED_REGISTRY_HPP})
+        # （P3/D4，docs/internal/35）AOT 收集链已删：scan_exprs 目标与
+        # fused_registry.hpp 生成命令不再存在——融合 shader 改由运行期 JIT
+        #（libnn-kernelgen.so + .nnk 缓存，model_warmup 预热）提供。
 
         # 3. libnn-gpu.so：依赖全部生成头
         add_library(nn_gpu SHARED engine/src/gpu_engine_so.cpp)
@@ -215,7 +181,7 @@ if(NN_ENABLE_GPU)
             CXX_VISIBILITY_PRESET default
             BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR})
         install(TARGETS nn_gpu LIBRARY DESTINATION lib)
-        message(STATUS "libnn-gpu.so 启用（Vulkan + glslc + ${GPU_SHADERS} + fused 融合）")
+        message(STATUS "libnn-gpu.so 启用（Vulkan + glslc + ${GPU_SHADERS}；融合走 JIT）")
     else()
         message(STATUS "Vulkan/glslc 不可用，跳过 libnn-gpu.so")
     endif()
