@@ -2600,11 +2600,10 @@ private:
                 continue;
             }
 
-            if (std::getenv("NN_IRC_TRACE") != nullptr)
-                std::fprintf(stderr,
-                             "[ir-c][run] extras=%zu members=%zu rows=%zu cols=%zu outP=%d vec=%d\n",
-                             k.spec.extras.size(), k.members.size(), k.rows, k.cols,
-                             (int)d.out.precision(), k.vector_out ? 1 : 0);
+            // C3（36 号台账，2026-11-06）：每 kernel 的 `[ir-c][run]` 打印已删
+            // ——命中执行是热路径常态，逐 kernel 刷屏只有排查期价值；降级
+            // （[ir-c][degrade]）与批量（[ir-c][batch]/[batch-degrade]）打印保留
+            // （低频、可观测"某段悄悄没融合"，AGENTS §7 口径）。
             if (k.spec.extras.empty())
             {
                 auto r = run_graph_kernel_into_(k.spec, d.ins, k.rows, k.cols, k.vector_out, d.out);
