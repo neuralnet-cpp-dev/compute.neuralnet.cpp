@@ -74,7 +74,10 @@ set(GENERATED_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 add_library(nn_cpu SHARED engine/src/cpu_engine_so.cpp)
 # Windows/MSVC：SHARED 库无导出符号不生成 .lib 导入库（链接方 LNK1104）。
 # 与 Linux .so 默认全导出对齐 → WINDOWS_EXPORT_ALL_SYMBOLS（发布门禁 MSVC 实测）。
-if(MSVC)
+if(WIN32)
+    # clang（GNU 驱动）下 CMake 的 MSVC 变量为 FALSE，但 Windows DLL 同样
+    # 需要导出（40HX 实测：if(MSVC) 使 create_cpu_engine 未导出 → 主仓链接
+    # undefined symbol）
     set_target_properties(nn_cpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 target_include_directories(nn_cpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp)
@@ -168,8 +171,11 @@ if(NN_ENABLE_GPU)
 
         # 3. libnn-gpu.so：依赖全部生成头
         add_library(nn_gpu SHARED engine/src/gpu_engine_so.cpp)
-        if(MSVC)
+        if(WIN32)
             set_target_properties(nn_gpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+            # Vulkan 头（vulkan.h → windows.h）定义 min/max 宏会炸 std::min/max；
+            # MSVC CRT 的 getenv 弃用 + -Werror 也需逃生阀（40HX 实测，clang GNU）
+            target_compile_definitions(nn_gpu PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
         endif()
         target_include_directories(nn_gpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${GENERATED_INCLUDE})
         target_link_libraries(nn_gpu PRIVATE Threads::Threads Vulkan::Vulkan)
@@ -192,10 +198,17 @@ endif()
 # 内嵌 GlslEmitter（IR→GLSL）+ shaderc（GLSL→SPIR-V），与构建期 glslc 同源。
 find_path(SHADERC_INCLUDE_DIR shaderc/shaderc.h
     HINTS ${Vulkan_INCLUDE_DIRS} /home/ethan/vulkan/1.4.357.1/x86_64/include)
+get_filename_component(_vk_lib_dir "${Vulkan_LIBRARY}" DIRECTORY)
 find_library(SHADERC_LIBRARY NAMES shaderc_shared
-    HINTS ${Vulkan_LIBRARY_DIR} /home/ethan/vulkan/1.4.357.1/x86_64/lib)
+    HINTS ${Vulkan_LIBRARY_DIR} ${_vk_lib_dir}
+    /home/ethan/vulkan/1.4.357.1/x86_64/lib)
 if(SHADERC_INCLUDE_DIR AND SHADERC_LIBRARY)
     add_library(nn_kernelgen SHARED engine/src/kernelgen.cpp)
+    if(WIN32)
+        # kernelgen 的 nnk_* C ABI 符号必须导出（运行期 LoadLibrary 取地址，
+        # 40HX 实测缺 WINDOWS_EXPORT_ALL_SYMBOLS 时 GetProcAddress 全空）
+        set_target_properties(nn_kernelgen PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endif()
     target_include_directories(nn_kernelgen PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${SHADERC_INCLUDE_DIR})
     target_link_libraries(nn_kernelgen PRIVATE Threads::Threads ${SHADERC_LIBRARY})
     set_target_properties(nn_kernelgen PROPERTIES

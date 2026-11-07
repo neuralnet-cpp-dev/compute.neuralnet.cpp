@@ -50,7 +50,26 @@
 #include <fcntl.h>       // open/O_CREAT（.nnk 缓存进程锁）
 #include <sys/file.h>    // flock
 #include <unistd.h>      // close / rename
+#include <sys/stat.h>    // mkdir（.nnk 缓存目录自动创建）
 #endif
+
+namespace
+{
+// .nnk 缓存目录首次运行可能不存在（Windows 尤其：%LOCALAPPDATA% 下无
+// neuralnet-cpp），写盘前自动创建（EEXIST / ERROR_ALREADY_EXISTS 无害）。
+// 项目禁异常（-fno-exceptions）→ 不用 std::filesystem，走平台 API。
+inline void ensure_nnk_cache_dir_(const std::string& path)
+{
+    const auto pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) return;
+    const std::string dir = path.substr(0, pos);
+#ifdef _WIN32
+    CreateDirectoryA(dir.c_str(), nullptr);
+#else
+    ::mkdir(dir.c_str(), 0755);
+#endif
+}
+}  // namespace
 
 #include "compute_engine.hpp"
 #include "expr_opt.hpp"
@@ -1594,9 +1613,15 @@ public:
     {
         if (jit_init_tried_) return {};
         jit_init_tried_ = true;
-        // dlopen libnn-kernelgen.so（NN_KERNELGEN_PATH 覆盖 → 系统库搜索）
+        // dlopen libnn-kernelgen.so（NN_KERNELGEN_PATH 覆盖 → 系统库搜索）；
+        // Windows 平台产物为 nn-kernelgen.dll（40HX 实测 LoadLibrary 按 .so 名
+        // 查找报 win32 error 126）
         std::string path = nn::detail::env_string_raw("NN_KERNELGEN_PATH");
+#ifdef _WIN32
+        if (path.empty()) path = "nn-kernelgen.dll";
+#else
         if (path.empty()) path = "libnn-kernelgen.so";
+#endif
 #ifdef _WIN32
         HMODULE h = LoadLibraryA(path.c_str());
         if (!h)
@@ -1678,6 +1703,7 @@ public:
             }
         }
         const std::string data = kernel_cache_->serialize();
+        ensure_nnk_cache_dir_(path);
         const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -1695,6 +1721,7 @@ public:
 #else
         const std::string data = kernel_cache_->serialize();
         const std::string& path = nn::fused::kernel_cache_path();
+        ensure_nnk_cache_dir_(path);
         const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
