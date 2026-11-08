@@ -322,33 +322,38 @@ public:
     // ── 激活 offload（L1-offload）───────────────────────────────────
     // ── activation offload slab（L1-offload，持久复用缓冲） ────────────
     // 每个 GPTBlock / RAPTBlock 持有一块持久 host-visible slab，所有激活按
-    // float 偏移写入/读出，跨 step 复用 → RAM = 激活实际体积（避免每 tensor
+    // **字节偏移**写入/读出，跨 step 复用 → RAM = 激活实际体积（避免每 tensor
     // 独立 128MB 块导致的碎片膨胀）。CPU 引擎 no-op（开启只会得到 1×1 张量）。
+    // 存储精度 = 激活**自身**精度（f32 = 4 B/元素，f16 = 2 B/元素，#P8）——
+    // 混合精度层（如 RMSNorm 的 1/rms 恒 f32）可以和 f16 激活共享同一块 slab。
     [[nodiscard]] Result<Tensor> create_offload_buffer(std::size_t bytes)
     {
         NN_PROF_OP("create_offload_buffer");
         return create_offload_buffer_impl(bytes);
     }
-    // 把 src 复制到 buffer 的 offset（float 单位）处
-    // ── 边界 cast 入口：f16 激活在写入 slab 前抬到 f32（slab 恒 f32 存）──
-    // restore 出来是 f32，后续运算由入口层适配（正确性不受影响，代价是该份
-    // 激活按 f32 存、不享 f16 存储折半）。
-    [[nodiscard]] Result<void> offload_save(const Tensor& buffer, std::size_t offset,
+    // 把 src 按**自身精度**复制到 buffer 的 byte_offset（字节单位，#P8）处
+    [[nodiscard]] Result<void> offload_save(const Tensor& buffer, std::size_t byte_offset,
                                             const Tensor& src)
     {
         NN_PROF_OP("offload_save");
         NN_TRY(ec, bind_check_({&buffer, &src}));
-        auto s = to_f32(src);
-        NN_TRY_CHECK(s);
-        return offload_save_impl(buffer, offset, *s);
+        // 可存储精度只到 f16/f32：bf16/f64/t1_58 在 Phase 1 既不建 Tensor 也不进 slab。
+        if (src.precision() != Precision::F32 && src.precision() != Precision::F16)
+            NN_FAIL("offload_save: 仅支持 f32/f16 激活存储（当前 " +
+                    std::string(precision_name(src.precision())) + "）");
+        return offload_save_impl(buffer, byte_offset, src);
     }
-    // 从 buffer 的 offset（float 单位）处复制 rows×cols 到新 GPU tensor
-    [[nodiscard]] Result<Tensor> offload_restore(const Tensor& buffer, std::size_t offset,
-                                                 std::size_t rows, std::size_t cols)
+    // 从 buffer 的 byte_offset（字节单位）处复制 rows×cols 到新 GPU tensor（精度 P）
+    [[nodiscard]] Result<Tensor> offload_restore(const Tensor& buffer, std::size_t byte_offset,
+                                                 std::size_t rows, std::size_t cols,
+                                                 Precision P = Precision::F32)
     {
         NN_PROF_OP("offload_restore");
         NN_TRY(ec, bind_check_({&buffer}));
-        return offload_restore_impl(buffer, offset, rows, cols);
+        if (P != Precision::F32 && P != Precision::F16)
+            NN_FAIL("offload_restore: 仅支持 f32/f16 激活存储（当前 " +
+                    std::string(precision_name(P)) + "）");
+        return offload_restore_impl(buffer, byte_offset, rows, cols, P);
     }
 
     // ── 异步标量回读（非阻塞取 loss）──────────────────────────────
@@ -1572,15 +1577,16 @@ protected:
     [[nodiscard]] virtual Result<Tensor> create_offload_buffer_impl(std::size_t /*bytes*/)
     { return create_tensor(1, 1); }
     [[nodiscard]] virtual Result<Tensor> offload_restore_impl(const Tensor& /*buffer*/,
-                                                              std::size_t /*offset*/,
+                                                              std::size_t /*byte_offset*/,
                                                               std::size_t /*rows*/,
-                                                              std::size_t /*cols*/)
+                                                              std::size_t /*cols*/,
+                                                              Precision /*P*/)
     { return create_tensor(1, 1); }
 
     // ── offload / 回读 ────────────────────────────────────────────────────
     // CPU no-op 默认（激活 offload 是 GPU 特性；CPU 开启只得到 1×1 张量）
     [[nodiscard]] virtual Result<void>
-    offload_save_impl(const Tensor& /*buffer*/, std::size_t /*offset*/, const Tensor& /*src*/)
+    offload_save_impl(const Tensor& /*buffer*/, std::size_t /*byte_offset*/, const Tensor& /*src*/)
     { return {}; }
     // 默认实现（CPU / 其他同步引擎）：submit 立刻取标量存值，poll 恒立刻就绪。
     // （入口已统一抬到 f32，这里只读 f32；f16 分支保留作健壮性兜底。）

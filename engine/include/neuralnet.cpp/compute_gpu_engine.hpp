@@ -205,34 +205,56 @@ public:
     // ── activation offload slab（持久复用缓冲） ───────────────────────
     [[nodiscard]] Result<Tensor> create_offload_buffer_impl(std::size_t bytes) override
     {
-        auto g = GpuTensor::create_host_visible_empty(1, bytes, *backend_);
+        // #P8：slab 以 f32 视图持有一块原始字节缓冲（capacity = bytes）。
+        // create_host_visible_empty 的单位是 f32 元素（内部 4 B 对齐），故按
+        // 4 字节字向上取整分配——f16 激活（2 B/元素）同样落在这块缓冲里。
+        auto g = GpuTensor::create_host_visible_empty(1, (bytes + 3u) / 4u, *backend_);
         NN_TRY_CHECK(g);
         return Tensor::from_gpu(std::move(*g));
     }
 
-    // 把 src 复制到 buffer 的 offset（float 单位）处（录制式）
-    [[nodiscard]] Result<void> offload_save_impl(const Tensor& buffer, std::size_t offset,
+    // 把 src 按**自身精度**复制到 buffer 的 byte_offset 处（录制式，#P8）
+    [[nodiscard]] Result<void> offload_save_impl(const Tensor& buffer, std::size_t byte_offset,
                                                  const Tensor& src) override
     {
         if (src.is_cpu()) return {};
-        const VkDeviceSize size = static_cast<VkDeviceSize>(src.size() * sizeof(float));
+        const std::size_t elem_bytes = (src.precision() == Precision::F16) ? 2u : 4u;
+        const VkDeviceSize size = static_cast<VkDeviceSize>(src.size() * elem_bytes);
+        const VkBuffer sbuf =
+            (src.precision() == Precision::F16)
+                ? gpu_vk_impl(src.gpu_tensor<Precision::F16>().buffer())
+                : gpu_vk_impl(src.gpu_tensor<Precision::F32>().buffer());
         return backend_->copy_buffer_region_gpu(
-            gpu_vk_impl(src.gpu_tensor().buffer()), 0, gpu_vk_impl(buffer.gpu_tensor().buffer()),
-            static_cast<VkDeviceSize>(offset * sizeof(float)), size);
+            sbuf, 0, gpu_vk_impl(buffer.gpu_tensor().buffer()),
+            static_cast<VkDeviceSize>(byte_offset), size);
     }
 
-    // 从 buffer 的 offset（float 单位）处复制 rows×cols 到新 GPU tensor（录制式）
-    [[nodiscard]] Result<Tensor> offload_restore_impl(const Tensor& buffer, std::size_t offset,
-                                                      std::size_t rows, std::size_t cols) override
+    // 从 buffer 的 byte_offset 处复制 rows×cols 到新 GPU tensor（精度 P）（录制式）
+    [[nodiscard]] Result<Tensor> offload_restore_impl(const Tensor& buffer, std::size_t byte_offset,
+                                                      std::size_t rows, std::size_t cols,
+                                                      Precision P) override
     {
-        auto dst = GpuTensor::create_empty(rows, cols, *backend_);
-        NN_TRY_CHECK(dst);
-        const VkDeviceSize size = static_cast<VkDeviceSize>(rows * cols * sizeof(float));
+        const std::size_t elem_bytes = (P == Precision::F16) ? 2u : 4u;
+        const VkDeviceSize size = static_cast<VkDeviceSize>(rows * cols * elem_bytes);
+        VkBuffer dst_buf = VK_NULL_HANDLE;
+        Tensor out;
+        if (P == Precision::F16)
+        {
+            NN_TRY(r16, GpuTensorF16::create_empty(rows, cols, *backend_));
+            dst_buf = gpu_vk_impl(r16->buffer());
+            out = Tensor::from_gpu(std::move(*r16));
+        }
+        else
+        {
+            NN_TRY(r32, GpuTensor::create_empty(rows, cols, *backend_));
+            dst_buf = gpu_vk_impl(r32->buffer());
+            out = Tensor::from_gpu(std::move(*r32));
+        }
         auto r = backend_->copy_buffer_region_gpu(gpu_vk_impl(buffer.gpu_tensor().buffer()),
-                                                  static_cast<VkDeviceSize>(offset * sizeof(float)),
-                                                  gpu_vk_impl(dst->buffer()), 0, size);
+                                                  static_cast<VkDeviceSize>(byte_offset), dst_buf, 0,
+                                                  size);
         NN_TRY_CHECK(r);
-        return Tensor::from_gpu(std::move(*dst));
+        return out;
     }
 
     // ── 异步标量回读───────────────────────────────────────────
