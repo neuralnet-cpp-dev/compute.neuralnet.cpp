@@ -42,10 +42,18 @@ class GpuEngine;
 
 namespace detail
 {
-// 引擎域内通道（M1，docs/internal/17 §4.1 豁免之一）：
+// ══════════════════════════════════════════════════════════════════════════
+// ⚠ `nn::detail` 不是公开 API（#R6）：库外使用者只能依赖 `nn::` 下的符号。
+//
+// 本命名空间只剩**禁用后门**：引擎域内通道（M1，docs/internal/17 §4.1 豁免）。
 // Tensor 存储访问器与静态直构工厂私有化后，DSL 求值器（expr_dsl.hpp 的
 // eval_cpu / 扫描占位 / 求值叶子）经此创建与访问 Tensor 存储。
-// 库外（测试/tools/CLI）禁止使用——绕过引擎的编译期强制靠下方访问器私有化。
+// 库外（examples/、下游工程、测试/tools/CLI）**禁止使用**——存储访问的强制
+// 收口靠下方访问器私有化 + friend；本结构是唯一被 friend 放行的非引擎通道，
+// 只服务于库内 DSL 求值器，不承诺任何兼容性。
+//
+// 公开宿主桥（upload_span / download_span / download_vector）已归属 `nn::`。
+// ══════════════════════════════════════════════════════════════════════════
 struct TensorAccess;
 } // namespace detail
 
@@ -470,9 +478,11 @@ inline void Tensor::touch_write_epoch_() noexcept
 }
 
 // ── 引擎域内访问通道（M1，docs/internal/17 §4.1 豁免之一）──────────────
+// ⚠ 内部契约 / 禁用后门（#R6）：**库外禁止引用** `nn::detail::TensorAccess`。
+// 它不是公开 API，随时可能随 DSL 求值器实现变化；库外摸张量的正道是
+// engine.create_tensor / read / write / import / from_matrix / to_matrix。
 // Tensor 的存储访问器/静态直构工厂已私有化；DSL 求值器（expr_dsl.hpp）在
-// friend 关系下经本结构创建与读写存储。库外（测试/tools/CLI）不得使用——
-// 绕过引擎摸张量的正道是 engine.from_matrix / to_matrix / create_tensor。
+// friend 关系下经本结构创建与读写存储。
 struct detail::TensorAccess
 {
     template <Precision P = Precision::F32> [[nodiscard]] static MatrixT<P>& cpu_matrix(Tensor& t)

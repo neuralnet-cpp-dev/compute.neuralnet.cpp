@@ -610,7 +610,7 @@ public:
     // ⚠ 本函数（以及下面每一个"写张量存储"的公共入口）首行的
     //   `WriteEpochGuard` 是**契约的一部分**，不要删：参数派生缓冲
     //   （BitLinear 的三值权重）靠写版本判断"要不要重算"，见下方说明。
-    // fresh_dst 语义见 copy_from（默认 false；仅 detail::upload_span 传 true）。
+    // fresh_dst 语义见 copy_from（默认 false；仅 nn::upload_span 传 true）。
     template <class T>
     [[nodiscard]] Result<void> write(Tensor& t, std::span<T> src, bool fresh_dst = false)
     {
@@ -843,7 +843,7 @@ public:
     // f16 目标：先按 f32 上传，再 cast_into 写进 dst 的原存储
     //
     // fresh_dst（默认 false）= 调用方声明 **dst 是刚创建、当前录制帧与在飞
-    // 帧都不可能引用的全新张量**（detail::upload_span 的 create→write 相邻
+    // 帧都不可能引用的全新张量**（nn::upload_span 的 create→write 相邻
     // 形态即此类）。此时 GPU 侧**跳过录制窗口的整条流水线排空**：
     //   · 不存在"当前帧先前命令写 dst、被先执行的上传覆盖"的反向依赖——
     //     全新 buffer 无任何已录命令引用（池化复用只在写出方帧完成后还块，
@@ -856,7 +856,7 @@ public:
     // fresh_dst=false（默认）保留原排空语义 → load_model / 测试直写既有张量
     // 零回归。
     // ⚠ 契约：fresh_dst=true 仅当 dst 未被任何**已录制或在飞**命令引用；
-    // 误传 = 数据竞争。库内唯一承诺方是 detail::upload_span。
+    // 误传 = 数据竞争。库内唯一承诺方是 nn::upload_span。
     [[nodiscard]] Result<void> copy_from(Tensor& dst, const Matrix& src, bool fresh_dst = false)
     {
         NN_PROF_OP("copy_from");
@@ -2298,14 +2298,11 @@ private:
     return v;
 }
 
-namespace detail
-{
-// 过渡别名（宿主桥正式归属 nn::）：库内既有调用点不破坏；
-// 库外请直接用 nn::upload_span / nn::download_span / nn::download_vector。
-using nn::download_span;
-using nn::download_vector;
-using nn::upload_span;
-} // namespace detail
+// ── API 边界（#R6）──────────────────────────────────────────────────────
+// 库外使用者（examples/、下游工程、第三方测试）只允许依赖 `nn::` 下的符号；
+// `nn::detail` 不是公开 API：其内容为实现细节/禁用后门，不承诺兼容性，库外
+// 引用即越界。宿主桥已全部归属 `nn::`（见上方 upload_span / download_span /
+// download_vector），`detail::` 下不再保留同名过渡别名。
 
 // ── IR-C 录制段 RAII 守卫（P2）───────────────────────────────
 // 作用域退出（含 NN_TRY 错误早退）自动 end_expr 收口，防录制图悬挂；

@@ -65,7 +65,8 @@ namespace nn::dsl
 {
 
 // M1（docs/internal/17 §4.1）：Tensor 存储访问已私有化，DSL 求值器经
-// 引擎域内通道 detail::TensorAccess 创建/读写张量（friend 关系，库外禁用）。
+// 引擎域内通道 detail::TensorAccess 创建/读写张量（friend 关系；内部契约，
+// 库外禁用，见 compute_tensor.hpp 的边界说明）。
 using TensorAccess = ::nn::detail::TensorAccess;
 
 // ── DSL 逐元素模板路径的并行门控 ────────────────────────────────────────
