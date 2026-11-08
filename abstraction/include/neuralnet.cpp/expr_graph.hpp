@@ -34,6 +34,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <span>
@@ -305,6 +307,23 @@ namespace fused
         // 0) RV-03：与已并入成员有顺序隐患 → 不合组（保序优先于省 dispatch）
         for (const int m : cur.members)
             if (has_hazard(m, bi)) return false;
+
+        // 0a) 图外持有保护（pitfalls §2.6 / 模式 I）：当前 tail 若是目标传递
+        //   节点（dst_id != 0，输出存储 = 图外持久句柄持有的既有张量，如优化器
+        //   m_/v_），拼接后 tail 成为融合中间量、该存储不再被写入 → 图外持有者
+        //   读未初始化内存（全 f16 训练 NaN 根因）。compute_into 是"要求落盘"
+        //   的显式声明，融合器必须尊重：拒绝拼接，该节点保持独立 kernel。
+        //   降级可观测：NN_IRC_TRACE=1 时打印（与 [ir-c][degrade] 同哲学）。
+        if (g.nodes[static_cast<std::size_t>(tail)].dst_id != 0)
+        {
+            if (std::getenv("NN_IRC_TRACE") != nullptr)
+                std::fprintf(stderr,
+                             "[ir-c][fuse-decline] into 节点输出（node %d, key %s）"
+                             "拒绝拼接为非尾 → 独立 kernel 落盘\n",
+                             tail,
+                             expr_spec_key(g.nodes[static_cast<std::size_t>(tail)].spec).c_str());
+            return false;
+        }
 
         // 1) 前置：均逐元素（无归约）、非归约输出、形状相同、精度相同
         if (cur.vector_out || B.vector_out) return false;

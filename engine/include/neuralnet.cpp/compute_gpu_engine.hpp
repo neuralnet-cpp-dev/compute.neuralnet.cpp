@@ -160,8 +160,6 @@ public:
     // AOT 注册表 miss = JIT 现编兜底（须在 scan_exprs 覆盖录制段以预热）。
     [[nodiscard]] Result<void> begin_expr() override
     {
-        // 临时 A/B（NN_NO_GRAPH=1）：跳过录制，表达式直求值（排查 full-f16 图路径）
-        if (std::getenv("NN_NO_GRAPH") != nullptr) return {};
         auto& owner = fused::recording_graph_owner();
         if (owner) NN_FAIL("begin_expr: 嵌套录制（已有未结束的 begin_expr）");
         owner = std::make_unique<ExprGraph>();
@@ -172,7 +170,6 @@ public:
     [[nodiscard]] Result<void> end_expr() override
     {
         auto& owner = fused::recording_graph_owner();
-        if (std::getenv("NN_NO_GRAPH") != nullptr && !owner) return {};   // A/B：与 begin 对称跳过
         // 录制图是 thread_local：跨线程 end_expr 看不到别人线程的 begin_expr。
         // 原实现静默 return {} ⇒ 录制图悬挂到下一次 begin_expr 才以"嵌套录制"
         // 报错（现场丢失）。这里明确报错，把"begin/end 必须同线程配对"变成
@@ -2678,16 +2675,16 @@ private:
         const ExprSpec spec = is_fold ? raw_spec : nn::canonicalize_expr_spec(raw_spec);
         const std::string key = nn::expr_spec_key(spec);
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, out.precision());
-        // ── psig≠0（任一 f16 参与）→ 边界 cast（F2 语义）──────────────────
+        // ── psig≠0（任一 f16 参与）→ 边界 cast（F2 语义，有据设计）──────────
         // 输入抬 f32 → 递归走 V0（JIT 只现编 V0 f32 算术 kernel）→ cast_into
-        // 写回 out 的真实存储。正确性优先：f16 静态特化 JIT（按 sig 现编
-        // f16-storage shader）与 AOT #s/#xxxx 时代行为存在实测差异——门 D 实测
-        // full-f16 第 1 步更新即 NaN（f16_writeback 的混合签名场景通过，但
-        // optimizer=f16 全 f16 签名链条 NaN），故图内执行统一走边界 cast。
+        // 写回 out 的真实存储（与直求值同形态：eval_expr 分配输出 → cast_into）。
+        // C4 已裁决（2026-11-07）：四层对拍（输入位级 → to_f32_all → f32 eval →
+        // cast_into）证明历史 full-f16 NaN 与本路径无关——根因是融合内联了图外
+        // 持有的持久输出（pitfalls §2.6，已修）；边界 cast 链全程净，保留为
+        // f16 图执行的正确路径。「静态签名 JIT 直写 vs 边界 cast」的性能 A/B
+        // 不再依赖 C1，降级为可选优化项。
         if (psig != 0)
         {
-            // A/B：与直求值同形态（eval_expr 分配输出 → cast_into 写回），
-            // 排查 output_override/tmp 路径在 f16 图成员上的 NaN。
             auto in32 = to_f32_all(inputs);
             NN_TRY_CHECK(in32);
             if (vector_out)

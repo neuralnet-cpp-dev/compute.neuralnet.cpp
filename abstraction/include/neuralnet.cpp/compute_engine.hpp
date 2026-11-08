@@ -1839,6 +1839,11 @@ protected:
                                     // （AdamW 的 decay→update 等）据此建显式顺序边
                                     out.storage_id());
         g.node_outputs[node] = out;   // 输出 = dst 张量（end_expr 写回其存储）
+        // stamp 输出 tag：图内后续读者 leaf(dst) 据此建立依赖边（dep_of_input）。
+        // 缺此步则依赖退化为"外部输入 + RV-03 顺序边"，P2 分量/链式融合的
+        // 连通性断裂（perf 回退），且调度只能靠列表序巧合保序。
+        // 持久张量上的旧 tag 跨图永不命中（全局唯一发号），无串图风险。
+        out.set_virtual_tag(g.tag_of_node[static_cast<std::size_t>(node)]);
         return {};
     }
 
