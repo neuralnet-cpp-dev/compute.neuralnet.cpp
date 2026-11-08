@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
@@ -71,7 +72,12 @@ namespace nn
 // 字段口径必须与 expr_spec_key 一致：**结构进哈希、运行期值不进**
 // （view param、consts/rparams 值、matmul k/batch/trans、fold k 均排除）。
 // ⚠ 该哈希只用于**进程内**计划缓存索引（不是 shader 身份；shader 身份
-//   仍由 expr_spec_key 字符串承担）。口径若漂移只影响缓存命中率，不改数值。
+//   仍由 expr_spec_key 字符串承担）。它**刻意排除**运行期值，因此被排除的
+//   字段必须在命中计划时另行处理，否则同结构不同值的图会沿用首次建计划的
+//   值（静默错值 / GPU 越界读，见 #M1）：
+//     · views[].param/param2、matmul k/batch/trans、fold k → 由
+//       `instantiate_plan_into` 按当前图重推导；
+//     · const 值 → 进 `graph_cache_key`（池布局依赖值本身，无法按下标回填）。
 [[nodiscard]] inline std::uint64_t expr_spec_struct_hash(const ExprSpec& s) noexcept
 {
     constexpr std::uint64_t kFnvOffset = 0xcbf29ce484222325ull; // FNV-1a 64 offset
@@ -265,6 +271,12 @@ struct FusedKernel
     Precision prec = Precision::F32;   // 成员共同精度（恢复时新增）
     int tail = -1;        // 末尾节点（输出节点）在图中下标
     std::vector<int> members;     // kernel 包含的节点（顺序 = 融合顺序）
+    // #M1：fused `spec.views[i]` 的来源 = (图节点 view_src_node[i],
+    // 该节点 spec.views 的 view_src_slot[i] 槽)。`views[].param/param2` 是
+    // **运行期形状数据**（不进结构 key），计划缓存命中时必须按当前图重取，
+    // 否则沿用首次建计划的值（静默错值）。与 spec.views 同长、同序。
+    std::vector<int> view_src_node;
+    std::vector<std::uint8_t> view_src_slot;
 };
 
 // ── 全局录制状态（线程局部，D3 修复） ──────────────────────────────────
@@ -502,11 +514,16 @@ namespace fused
             if (static_cast<std::size_t>(ins.dst) + A.num_regs >= 256) return false;
 
         std::vector<ExprView> views = A.views;
+        // #M1：views 来源簿记随拼接同步（与 views 一一对应）
+        std::vector<int> vsrc_node = cur.view_src_node;
+        std::vector<std::uint8_t> vsrc_slot = cur.view_src_slot;
         std::vector<int> b_view_map(Bs.views.size(), -1);
         for (const int k : other_slots)
         {
             b_view_map[static_cast<std::size_t>(k)] = static_cast<int>(views.size());
             views.push_back(Bs.views[static_cast<std::size_t>(k)]);
+            vsrc_node.push_back(bi);
+            vsrc_slot.push_back(static_cast<std::uint8_t>(k));
         }
 
         std::vector<Scalar> consts = A.consts;
@@ -589,6 +606,8 @@ namespace fused
                     FusedKernelInput{/*node=*/B.dep_of_input[kk], /*external=*/Tensor{}});
         }
         cur.spec = std::move(fused);
+        cur.view_src_node = std::move(vsrc_node);
+        cur.view_src_slot = std::move(vsrc_slot);
         cur.inputs = std::move(new_inputs);
         cur.rows = B.rows;
         cur.cols = B.cols;
@@ -667,6 +686,9 @@ namespace fused
         k.members.push_back(static_cast<int>(i));
         for (std::size_t kk = 0; kk < N.spec.views.size(); ++kk)
         {
+            // #M1：单节点 kernel 的 views 全部来自节点 i 自身
+            k.view_src_node.push_back(static_cast<int>(i));
+            k.view_src_slot.push_back(static_cast<std::uint8_t>(kk));
             if (kk >= N.dep_of_input.size() || N.dep_of_input[kk] < 0)
                 k.inputs.push_back(FusedKernelInput{
                     /*node=*/-1,
@@ -713,6 +735,9 @@ namespace fused
         std::vector<std::uint8_t> outs = outs0;
 
         std::vector<ExprView> views = cur.spec.views;
+        // #M1：views 来源簿记（P2 拼接时 B 的新输入槽全部来自节点 bi）
+        std::vector<int> vsrc_node = cur.view_src_node;
+        std::vector<std::uint8_t> vsrc_slot = cur.view_src_slot;
         std::vector<FusedKernelInput> inputs = cur.inputs;
         std::vector<int> slot_map(Bs.views.size(), -2);   // -2=成员引用，≥0=新输入槽
         for (std::size_t k = 0; k < Bs.views.size(); ++k)
@@ -728,6 +753,8 @@ namespace fused
             {
                 slot_map[k] = static_cast<int>(views.size());
                 views.push_back(Bs.views[k]);
+                vsrc_node.push_back(static_cast<int>(bi));
+                vsrc_slot.push_back(static_cast<std::uint8_t>(k));
                 if (dep < 0)
                     inputs.push_back(FusedKernelInput{
                         /*node=*/-1,
@@ -800,6 +827,8 @@ namespace fused
             return false;   // 超限/非法 → 放弃并入（保守）
 
         cur.spec = std::move(fused);
+        cur.view_src_node = std::move(vsrc_node);
+        cur.view_src_slot = std::move(vsrc_slot);
         cur.inputs = std::move(inputs);
         cur.rows = B.rows;
         cur.cols = B.cols;
@@ -895,6 +924,9 @@ struct FusedKernelPlan
     Precision prec = Precision::F32;
     int tail = -1;
     std::vector<int> members;
+    // #M1：fused views 的来源（命中时按当前图重取 views[].param/param2）
+    std::vector<int> view_src_node;
+    std::vector<std::uint8_t> view_src_slot;
 };
 
 // 整图结构 key（FNV-1a）：覆盖节点 spec 结构哈希、形状、vector_out、精度、依赖拓扑。
@@ -940,6 +972,18 @@ struct FusedKernelPlan
             mix_u64(static_cast<std::uint64_t>(grp));
         }
         mix_u64(n.spec_hash);   // P11：录制期已算好的结构哈希（替代 expr_spec_key 字符串）
+        // #M1：const 值也必须进 key。canonicalize 里 consts 池要经"相等值去重 +
+        // 按首次引用紧凑"，**池布局依赖值本身** → 命中时无法按下标回填值；
+        // 而 consts 是每结构的固定字面量（RParam 才是每步变的），进 key 不损失
+        // 训练热路径的命中率（每层一份计划）。
+        mix_u64(static_cast<std::uint64_t>(n.spec.consts.size()));
+        for (const Scalar c : n.spec.consts)
+        {
+            std::uint32_t bits = 0;
+            static_assert(sizeof(Scalar) == sizeof(bits), "Scalar 需为 32 位");
+            std::memcpy(&bits, &c, sizeof(bits));
+            mix_u64(bits);
+        }
         mix_u64(static_cast<std::uint64_t>(n.dep_of_input.size()));
         for (const int d : n.dep_of_input)
             mix_u64(static_cast<std::uint64_t>(d));
@@ -964,6 +1008,8 @@ struct FusedKernelPlan
     p.prec = k.prec;
     p.tail = k.tail;
     p.members = k.members;
+    p.view_src_node = k.view_src_node;
+    p.view_src_slot = k.view_src_slot;
     p.input_node.reserve(k.inputs.size());
     p.input_ext_node.reserve(k.inputs.size());
     p.input_ext_slot.reserve(k.inputs.size());
@@ -1015,8 +1061,7 @@ inline void instantiate_plan_into(const FusedKernelPlan& p, const ExprGraph& g, 
     // 计划缓存只复用结构，值必须按成员序从当前图节点重拼（拼接规则 =
     // 成员序各池顺序追加，与 fuse 侧 concat 同源；canonicalize 对 rparams
     // 原样透传、顺序稳定）。否则缓存命中的 kernel 永远用第 1 步的超参
-    // （P2 实测：GPU 字节锚偏移的真凶）。consts 是结构字面量、不随步变，
-    // 随计划缓存安全。
+    // （P2 实测：GPU 字节锚偏移的真凶）。
     k.spec.rparams.clear();
     for (const int m : k.members)
     {
@@ -1025,6 +1070,56 @@ inline void instantiate_plan_into(const FusedKernelPlan& p, const ExprGraph& g, 
     }
     // P4：canonical 形态共用同一份当前 rparams（结构相同、只是值随步变）。
     k.canon.rparams = k.spec.rparams;
+
+    // ── #M1：其余**运行期值**同样必须按当前图重推导 ──────────────────────
+    // 图 key 只覆盖结构（节点结构哈希 + 形状 + 精度 + 依赖拓扑），而
+    // `expr_spec_struct_hash`/`expr_spec_key` 明确把下列字段排除在结构外：
+    //   · `views[].param/param2`（RowMod 的 d_k、RowAccess 的 mod/offset、
+    //     HeadGroup 的 n_rep、Transpose 的行距、GroupedReduce 的 R …）；
+    //   · 顶层 `matmul->k/batch/transA/transB`；
+    //   · `fold->k` 与 fold 内 `matmul->k/batch`。
+    // 沿用首次建计划的值 = 同结构不同 K/不同形状静默用错参数（K 更大时
+    // GPU 越界读）。const 值不在此列：池布局经 dedupe/renumber 后依赖值
+    // 本身、无法按下标回填，已改为进 graph_cache_key（见那里）。
+    for (std::size_t i = 0; i < p.view_src_node.size() && i < k.spec.views.size(); ++i)
+    {
+        const std::size_t sn = static_cast<std::size_t>(p.view_src_node[i]);
+        const std::size_t slot = p.view_src_slot[i];
+        if (sn >= g.nodes.size()) continue;
+        const auto& src_views = g.nodes[sn].spec.views;
+        if (slot < src_views.size()) k.spec.views[i] = src_views[slot];
+    }
+    if (!k.members.empty())
+    {
+        // matmul 段恒在链首成员（融合只允许 matmul 位于头部）；fold kernel
+        // 不参与融合（恒单成员），两者都取首成员的当前值。
+        const auto& head = g.nodes[static_cast<std::size_t>(k.members.front())].spec;
+        if (k.spec.matmul && head.matmul) k.spec.matmul = head.matmul;
+        if (k.spec.fold && head.fold)
+        {
+            k.spec.fold->k = head.fold->k;
+            if (k.spec.fold->matmul && head.fold->matmul)
+            {
+                k.spec.fold->matmul->k = head.fold->matmul->k;
+                k.spec.fold->matmul->batch = head.fold->matmul->batch;
+            }
+        }
+    }
+    // P4：canonical 形态与 spec 结构同构（canonicalize 不改 views/matmul/fold
+    // 的顺序与个数），逐字段同源刷新 —— 批量组键 `batch_group_key_` 读的是
+    // canon 的 vp/consts/rparams，漏刷新会把"结构同、运行期值不同"的批并错。
+    k.canon.views.resize(k.spec.views.size());
+    std::copy(k.spec.views.begin(), k.spec.views.end(), k.canon.views.begin());
+    k.canon.matmul = k.spec.matmul;
+    if (k.canon.fold && k.spec.fold)
+    {
+        k.canon.fold->k = k.spec.fold->k;
+        if (k.canon.fold->matmul && k.spec.fold->matmul)
+        {
+            k.canon.fold->matmul->k = k.spec.fold->matmul->k;
+            k.canon.fold->matmul->batch = k.spec.fold->matmul->batch;
+        }
+    }
 }
 
 [[nodiscard]] inline FusedKernel instantiate_plan(const FusedKernelPlan& p, const ExprGraph& g)

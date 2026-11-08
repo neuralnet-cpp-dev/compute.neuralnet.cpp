@@ -2328,6 +2328,9 @@ private:
         // P2-12 图级缓存跨 step 复用：训练每 step 图结构重复，命中缓存则跳过
         // 融合分析 + 拼接 canonicalize + validate（缓存只复用结构决策，运行时
         // 按 plan 绑定 node_outputs 与外部张量；不改数值、不破确定性）。
+        // #M1：命中路径必须**按当前图重推导**运行期值（rparams、views 参数、
+        // matmul k/batch/trans、fold k），const 值则进 graph_cache_key——单靠
+        // "结构相同"复用陈旧运行期值会静默错值（K 更大时 GPU 越界读）。
         // P11：kernel 容器 thread_local 复用——命中路径按 plan 原位填充
         // （instantiate_plan_into），稳态不再每 step 为每个 kernel 重新分配
         // vector；执行序重排改为**就地 swap**（同样保留各 kernel 的容量）。
@@ -2525,8 +2528,9 @@ private:
             // P3 批量资格：纯逐元素（含 extras 复合）+ 全 f32 GPU + 不降级 +
             // `key#b` 已登记（无 BDA 时注册期即跳过 → 天然不可批量）。
             // P4：bspec 直接指向 kernel 计划缓存的 canonical 形态与 key 同源，
-            // 不再每 kernel 每 step 重新 canonicalize（运行期 rparams 已由
-            // instantiate_plan_into 按当前图重填）。
+            // 不再每 kernel 每 step 重新 canonicalize。#M1：运行期字段（rparams、
+            // views 参数、matmul k/batch/trans、fold k）已由 instantiate_plan_into
+            // 按当前图重填，故 bspec 的 vp/consts/rparams 与本次图一致。
             const ExprSpec& bspec = k.canon;
             d.bspec = &bspec;
             if (!d.degraded && !k.vector_out && nn::expr_spec_batchable(bspec) && batch_enabled &&

@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -772,7 +773,178 @@ void test_matmul_pure_chain_fuse()
     std::printf("[OK] test_matmul_pure_chain_fuse\n");
 }
 
-// ── 测试 12：IR-D emitter 抽象（一份 canonical IR → 多后端） ───────────
+// ── 测试 12（#M1）：图计划缓存命中时，运行期值必须按**当前图**重推导 ──
+// `graph_cache_key` 只覆盖结构（节点结构哈希 + 形状 + 精度 + 依赖拓扑），而
+// matmul 的 k/batch/trans、`fold->k`、`views[].param/param2` 都是**运行期值**
+// （`expr_spec_struct_hash`/`expr_spec_key` 明确排除）。命中计划若沿用首次
+// 建计划时的值：同结构不同 K 会静默用错 k（K 更大时 GPU 越界读）。
+//
+// 本用例完全走引擎真实协议（graph_plan_cache + plan_from_kernel +
+// instantiate_plan_into），在同一结构、不同运行期值的图上验证：
+//   · 只有 k / view param 不同 → 必须同 key（真的命中缓存），值须是当前图的；
+//   · 只有 const 值不同 → 池布局依赖值本身（dedupe/renumber），故 key 必须不同；
+// 每步变化的 rparams 仍按成员序重填（既有行为，此处一并回归）。
+void test_plan_cache_runtime_values()
+{
+    auto eng_owner = nn::create_cpu_engine();
+    nn::ComputeEngine& eng = *eng_owner;
+    auto& cache = nn::fused::graph_plan_cache();
+    cache.clear();
+
+    const std::size_t M = 4, N = 2;
+    struct Case
+    {
+        std::uint32_t k;        // matmul 收缩维（运行期值，不进结构 key）
+        std::uint8_t transB;    // 顶层 matmul 转置（运行期值，不进结构 key）
+        std::uint32_t row_mod;  // RowMod 的 param（运行期形状数据，不进结构 key）
+        Scalar c;               // const 池值（进图 key：池布局依赖值）
+    };
+
+    // node0 = matmul(A0,B0) + bias（matmul 段 + 尾链）；node1 = RowMod(x) + c。
+    // 两节点互不依赖 → 两个 kernel，分别覆盖 matmul 段与 views 段的刷新。
+    const auto build = [&](const Case& cs)
+    {
+        auto g = std::make_unique<nn::ExprGraph>();
+        nn::Tensor A0 = make_tensor(eng, M, cs.k, 0.5f, 0.03f);
+        nn::Tensor B0 = make_tensor(eng, cs.transB ? N : cs.k, cs.transB ? cs.k : N, -0.2f, 0.04f);
+        nn::Tensor bias = make_tensor(eng, M, N, 0.1f, 0.01f);
+        nn::ExprSpec sa;
+        sa.views = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
+        sa.num_regs = 1;
+        sa.matmul = nn::MatmulSpec{0, 1, 0, cs.transB, cs.k, 1};
+        sa.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add),
+                             0,
+                             nn::expr::matmul_op(),
+                             nn::expr::input(2),
+                             {}});
+        g->add_node(sa, std::vector<nn::Tensor>{A0, B0, bias}, M, N, false);
+
+        nn::Tensor x = make_tensor(eng, cs.row_mod, N, 0.0f, 1.0f);  // RowMod 要求输入 (param, cols)
+        nn::ExprSpec sb;
+        nn::ExprView v;
+        v.kind = static_cast<std::uint8_t>(nn::ExprViewKind::RowMod);
+        v.param = cs.row_mod;
+        sb.views.push_back(v);
+        sb.consts.push_back(cs.c);
+        sb.num_regs = 1;
+        sb.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add),
+                             0,
+                             nn::expr::input(0),
+                             nn::expr::cst(0),
+                             {}});
+        g->add_node(sb, std::vector<nn::Tensor>{x}, M, N, false);
+        return g;
+    };
+
+    // 引擎缓存协议（与 GpuEngine::execute_fused_graph 同构）
+    int hits = 0;
+    const auto run_cached = [&](nn::ExprGraph& g) -> std::vector<nn::FusedKernel>
+    {
+        const std::uint64_t key = nn::graph_cache_key(g);
+        std::vector<nn::FusedKernel> kernels;
+        const auto it = cache.find(key);
+        if (it != cache.end())
+        {
+            ++hits;
+            kernels.resize(it->second.size());
+            for (std::size_t i = 0; i < it->second.size(); ++i)
+                nn::instantiate_plan_into(it->second[i], g, kernels[i]);
+        }
+        else
+        {
+            kernels = nn::fuse_expr_graph(g);
+            std::vector<nn::FusedKernelPlan> plans;
+            plans.reserve(kernels.size());
+            for (const auto& k : kernels) plans.push_back(nn::plan_from_kernel(k));
+            for (std::size_t i = 0; i < kernels.size(); ++i)
+                nn::instantiate_plan_into(plans[i], g, kernels[i]);
+            cache.emplace(key, std::move(plans));
+        }
+        return kernels;
+    };
+
+    // ① 基线：k=2 / transB=0 / row_mod=2 / c=1
+    auto g1 = build(Case{2, 0, 2, Scalar{1}});
+    const auto k1 = run_cached(*g1);
+    CHECK(k1.size() == 2, "#M1: 图应产出 2 个 kernel");
+    if (k1.size() != 2) return;
+    CHECK(k1[0].spec.matmul && k1[0].spec.matmul->k == 2, "基线 matmul k");
+    CHECK(k1[1].spec.views.size() == 1 && k1[1].spec.views[0].param == 2, "基线 view param");
+
+    // ② 同结构、不同 k / view param（matmul k 与 RowMod param 不进结构 key）
+    auto g2 = build(Case{3, 0, 4, Scalar{1}});
+    CHECK(nn::graph_cache_key(*g2) == nn::graph_cache_key(*g1),
+          "#M1: 结构相同（仅运行期值不同）应同 key —— 用例确为命中路径");
+    const auto k2 = run_cached(*g2);
+    CHECK(hits == 1, "#M1: 第二张图必须命中缓存计划");
+    if (k2.size() != 2) return;
+    CHECK(k2[0].spec.matmul && k2[0].spec.matmul->k == 3,
+          "#M1: 命中后 matmul k 必须按当前图重推导（否则静默用错 k/越界读）");
+    CHECK(k2[1].spec.views.size() == 1 && k2[1].spec.views[0].param == 4,
+          "#M1: 命中后 views[].param 必须按当前图重推导");
+
+    // 数值锚：RowMod(4) + 1 —— 陈旧 param=2 会让第 2/3 行读到第 0/1 行
+    {
+        std::vector<nn::Tensor> ins{k2[1].inputs[0].external};
+        nn::Tensor out = eng.create_tensor(M, N);
+        CHECK(static_cast<bool>(eng.eval_expr_into(k2[1].spec, ins, M, N, out)),
+              "#M1: 命中 kernel 求值成功");
+        const nn::Matrix xm = matrix_of(eng, ins[0]);
+        const nn::Matrix om = matrix_of(eng, out);
+        bool ok = true;
+        for (std::size_t r = 0; r < M; ++r)
+            for (std::size_t c = 0; c < N; ++c)
+            {
+                const Scalar expect = xm.span()[(r % 4) * N + c] + Scalar{1};
+                if (std::fabs(om.span()[r * N + c] - expect) > 1e-5f) ok = false;
+            }
+        CHECK(ok, "#M1: 命中 kernel 的数值须按当前图 view param 计算");
+    }
+
+    // ③ 同结构、不同 transB（顶层 matmul 转置也不进结构 key）
+    auto g3 = build(Case{2, 1, 2, Scalar{1}});
+    CHECK(nn::graph_cache_key(*g3) == nn::graph_cache_key(*g1), "#M1: transB 不进结构 key");
+    const auto k3 = run_cached(*g3);
+    if (k3.size() == 2)
+    {
+        CHECK(k3[0].spec.matmul && k3[0].spec.matmul->transB == 1,
+              "#M1: 命中后 matmul transB 必须按当前图重推导");
+        CHECK(k3[0].canon.matmul && k3[0].canon.matmul->transB == 1,
+              "#M1: canonical 形态（批量组键用）也必须同源刷新");
+    }
+
+    // ④ 同结构、不同 const 值：池布局经 dedupe/renumber 后依赖值本身，
+    //    无法按下标回填 → 必须走不同 key（miss），绝不能复用陈旧常量。
+    auto g4 = build(Case{2, 0, 2, Scalar{5}});
+    CHECK(nn::graph_cache_key(*g4) != nn::graph_cache_key(*g1),
+          "#M1: const 值不同必须得到不同图 key（否则命中后静默用错常量）");
+    const auto k4 = run_cached(*g4);
+    if (k4.size() == 2)
+    {
+        CHECK(!k4[1].spec.consts.empty() && k4[1].spec.consts[0] == Scalar{5},
+              "#M1: const 值须为当前图的值");
+        std::vector<nn::Tensor> ins{k4[1].inputs[0].external};
+        nn::Tensor out = eng.create_tensor(M, N);
+        auto r4 = eng.eval_expr_into(k4[1].spec, ins, M, N, out);
+        if (!r4) std::printf("  [diag] #M1 const 用例: %s\n", r4.error().message.c_str());
+        CHECK(static_cast<bool>(r4), "#M1: const 用例求值成功");
+        const nn::Matrix xm = matrix_of(eng, ins[0]);
+        const nn::Matrix om = matrix_of(eng, out);
+        bool ok = true;
+        for (std::size_t r = 0; r < M; ++r)
+            for (std::size_t c = 0; c < N; ++c)
+            {
+                const Scalar expect = xm.span()[(r % 2) * N + c] + Scalar{5};
+                if (std::fabs(om.span()[r * N + c] - expect) > 1e-5f) ok = false;
+            }
+        CHECK(ok, "#M1: const 用例数值须用当前图的常量");
+    }
+
+    cache.clear();
+    std::printf("[OK] test_plan_cache_runtime_values\n");
+}
+
+// ── 测试 13：IR-D emitter 抽象（一份 canonical IR → 多后端） ───────────
 void test_emitter()
 {
     // 逐元素 spec：out = input0 * 2
@@ -814,6 +986,7 @@ int main()
     test_input_order();
     test_matmul_chain_fuse();
     test_matmul_pure_chain_fuse();
+    test_plan_cache_runtime_values();
     test_emitter();
 
     if (g_fail == 0)
