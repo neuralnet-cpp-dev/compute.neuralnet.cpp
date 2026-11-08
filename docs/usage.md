@@ -58,9 +58,10 @@ IR-C 录制（`begin_expr`/`end_expr`）、activation offload。能力**信息**
 `describe()` 的 `EngineInfo` 披露（禁止用于选路——选路是引擎内部的事）。
 
 层/模型/DSL 模板面（`dsl::compute` 等）在**主仓库** `neuralnet.cpp`（MIT 消费侧）；
-本仓库 `engine/include` 只保留引擎实现头，层/模型/优化器头一律引用主仓 `include/`
-（嵌入主仓构建时自动加入测试的 include 路径；独立 clone 下跳过依赖它们的用例，
-`.so` 本体仍可独立构建）。
+本仓库 `engine/engine/include` 只保留引擎实现头，层/模型/优化器头一律引用主仓 `include/`
+（嵌入主仓构建时自动加入测试的 include 路径——主仓头以引号包含 `"expr_dsl.hpp"`
+等引擎兄弟头，故测试目标同样带 `engine/engine/include/neuralnet.cpp`；独立 clone
+下跳过依赖主仓头的用例，`.so` 本体仍可独立构建，其 include 路径不含主仓）。
 
 ## 5. LGPL 可替换验证
 
@@ -84,5 +85,6 @@ NN_VULKAN_DEVICE=850M ctest --test-dir build -j1   # 10/10（GPU 权威设备）
 - 引擎级测试清单 / 覆盖 / 基线见 `README.md`「引擎级测试」节。
 - ⚠ 默认 Release 必须带 `-march=native`（`scan_bitwise_test` 逐位锚的 FMA 前提）；
   GPU 不可用或口径不满足的测试返回 77 = ctest SKIP（`SKIP_RETURN_CODE` 已配）。
-- `expr_fuse_test` 的录制段链由 `scan_exprs` 的 test_cover_pass 构建期登记进
-  `fused_registry.hpp`（闭合世界两端一致）。
+- `expr_fuse_test` 的录制段链定义在 `tests/expr_fuse_shapes.hpp`（单一事实源）。
+  本仓库无 AOT 登记链（`scan_exprs` 已随 P3/D4 下线）：录制段的复合 spec 未登记时
+  按 IR-C 规则逐成员降级派发，数值断言不变（融合算子由运行期 JIT 提供）。

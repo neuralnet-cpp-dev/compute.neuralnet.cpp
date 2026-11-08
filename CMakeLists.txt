@@ -273,9 +273,13 @@ set(NN_TESTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 function(nn_add_engine_test name)
     add_executable(${name} ${ARGN})
     # 引号 include（"core_domain.hpp" 等）需要 abstraction 的 neuralnet.cpp
-    # 子目录在 -I 路径（同主仓库 nn_core 教训）
+    # 子目录在 -I 路径（同主仓库 nn_core 教训）。引擎实现头同理：主仓的
+    # compute_layer_base.hpp / compute_optimizer.hpp 以引号包含 "expr_dsl.hpp"
+    # "int8_pack.hpp"，必须有 ${ENGINE_INCLUDE}/neuralnet.cpp 才能解析——
+    # 头副本下线后主仓头不再自带这些兄弟头，缺这一条独立构建即失败。
     target_include_directories(${name} PRIVATE
-        ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${NN_TESTS_DIR})
+        ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE}
+        ${ENGINE_INCLUDE}/neuralnet.cpp ${NN_TESTS_DIR})
     if(NN_HAVE_MAIN_HEADERS)
         target_include_directories(${name} PRIVATE ${NN_MAIN_INCLUDE})
     endif()
