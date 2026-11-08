@@ -2263,9 +2263,19 @@ public:
                     vecd[d] = Scalar{0};
 
                 // 块循环（键域）
+                //   tri_skip（上三角类掩码）：k0>qt 的整块键位全被屏蔽 → 跳过；
+                //   边界块钳到 qt+1-k0。跳过项恰为链内 -inf/0 屏蔽值，且空块必在
+                //   block0 之后（block0 恒含未屏蔽对角 j=qt → m 已为有限值），
+                //   故旧版空块语义 = fmax(m,lowest)=m、exp(0)=1、+0 全为逐位恒等。
+                const std::size_t qt = f.tri_skip ? ((fmm && m_per > 0) ? (r % m_per) : 0) : 0;
                 for (std::size_t k0 = 0; k0 < K; k0 += EXPR_FOLD_BLOCK)
                 {
-                    const std::size_t valid = std::min<std::size_t>(EXPR_FOLD_BLOCK, K - k0);
+                    std::size_t valid = std::min<std::size_t>(EXPR_FOLD_BLOCK, K - k0);
+                    if (f.tri_skip)
+                    {
+                        valid = std::min(valid, (k0 > qt) ? std::size_t{0} : (qt + 1 - k0));
+                        if (valid == 0) continue; // 整块跳过
+                    }
                     for (const auto& ins : f.body)
                     {
                         const ExprOp op = static_cast<ExprOp>(ins.op);
