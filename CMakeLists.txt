@@ -70,6 +70,17 @@ set(ABST_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/abstraction/include)
 set(ENGINE_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/engine/include)
 set(GENERATED_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
+# 消费侧头（层/模型/训练/数据集/分词器/优化器）单一真源在主仓 include/，
+# engine/engine/include 只保留引擎实现头，不再保存层/模型头副本。
+# 引擎测试按消费方形态编译（含 compute_layer.hpp / compute_optimizer.hpp），
+# 嵌入主仓构建时直接引用主仓 include；独立 clone（无主仓）时跳过这些用例。
+set(NN_MAIN_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+if(EXISTS ${NN_MAIN_INCLUDE}/neuralnet.cpp/compute_layer.hpp)
+    set(NN_HAVE_MAIN_HEADERS TRUE)
+else()
+    set(NN_HAVE_MAIN_HEADERS FALSE)
+endif()
+
 # ── libnn-cpu.so（LGPL）：CPU 引擎 + 原语，C++ 直出 ───────────────────────
 add_library(nn_cpu SHARED engine/src/cpu_engine_so.cpp)
 # Windows/MSVC：SHARED 库无导出符号不生成 .lib 导入库（链接方 LNK1104）。
@@ -265,6 +276,9 @@ function(nn_add_engine_test name)
     # 子目录在 -I 路径（同主仓库 nn_core 教训）
     target_include_directories(${name} PRIVATE
         ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${NN_TESTS_DIR})
+    if(NN_HAVE_MAIN_HEADERS)
+        target_include_directories(${name} PRIVATE ${NN_MAIN_INCLUDE})
+    endif()
     set_target_properties(${name} PROPERTIES
         BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR})
     # 77 = ctest SKIP 约定（GPU 不可用 / Release 口径不满足等）
@@ -279,17 +293,19 @@ if(TARGET nn_gpu)
     nn_add_engine_test(scan_bitwise_test tests/scan_bitwise_test.cpp)
     target_link_libraries(scan_bitwise_test PRIVATE nn_cpu nn_gpu)
 
-    nn_add_engine_test(gpu_test tests/gpu_test.cpp)
-    target_link_libraries(gpu_test PRIVATE nn_cpu nn_gpu)
+    if(NN_HAVE_MAIN_HEADERS)
+        nn_add_engine_test(gpu_test tests/gpu_test.cpp)
+        target_link_libraries(gpu_test PRIVATE nn_cpu nn_gpu)
+
+        nn_add_engine_test(gpt_offload_test tests/gpt_offload_test.cpp)
+        target_link_libraries(gpt_offload_test PRIVATE nn_gpu nn_cpu)
+
+        nn_add_engine_test(rapt_offload_test tests/rapt_offload_test.cpp)
+        target_link_libraries(rapt_offload_test PRIVATE nn_gpu nn_cpu)
+    endif()
 
     nn_add_engine_test(gpu_f16_test tests/gpu_f16_test.cpp)
     target_link_libraries(gpu_f16_test PRIVATE nn_cpu nn_gpu)
-
-    nn_add_engine_test(gpt_offload_test tests/gpt_offload_test.cpp)
-    target_link_libraries(gpt_offload_test PRIVATE nn_gpu nn_cpu)
-
-    nn_add_engine_test(rapt_offload_test tests/rapt_offload_test.cpp)
-    target_link_libraries(rapt_offload_test PRIVATE nn_gpu nn_cpu)
 
     nn_add_engine_test(expr_fuse_test tests/expr_fuse_test.cpp)
     target_link_libraries(expr_fuse_test PRIVATE nn_cpu nn_gpu)

@@ -58,7 +58,9 @@ IR-C 录制（`begin_expr`/`end_expr`）、activation offload。能力**信息**
 `describe()` 的 `EngineInfo` 披露（禁止用于选路——选路是引擎内部的事）。
 
 层/模型/DSL 模板面（`dsl::compute` 等）在**主仓库** `neuralnet.cpp`（MIT 消费侧）；
-本仓库的 `engine/include` 提供其副本供 `.so` 编译与测试使用。
+本仓库 `engine/include` 只保留引擎实现头，层/模型/优化器头一律引用主仓 `include/`
+（嵌入主仓构建时自动加入测试的 include 路径；独立 clone 下跳过依赖它们的用例，
+`.so` 本体仍可独立构建）。
 
 ## 5. LGPL 可替换验证
 
