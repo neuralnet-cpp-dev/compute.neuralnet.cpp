@@ -1466,9 +1466,8 @@ public:
     //
     // 折叠内联表达式 → expr_spec_key → 查构建期合成的融合 shader 注册表
     // （fused_registry.hpp，由 scan_exprs 收集 + gen_fused 合成）；命中则
-    // dispatch 单个融合 shader；未命中默认走运行期 JIT 现编（懒加载
-    // libnn-kernelgen.so → 生成 SPIR-V → 懒建 pipeline），NN_STRICT_CLOSED_WORLD=1
-    // 恢复硬报错（opt-in 看门狗）。
+    // dispatch 单个融合 shader；未命中走运行期 JIT 现编（懒加载
+    // libnn-kernelgen.so → 生成 SPIR-V → 懒建 pipeline）。
     //
     // 形状无关融合：RowMod/RotateHalf 的周期/块大小（如 RoPE 的 d_k）是
     // 运行时视图参数（不进 key），dispatch 时按实际 spec 填充 push constant
@@ -1564,19 +1563,12 @@ public:
     //
     // 派发 miss（内嵌注册表 + 后端 pipeline 均无）→ 引擎 JIT：懒加载
     // libnn-kernelgen.so → nnk_generate_spirv 现编 SPIR-V → 后端懒建 pipeline
-    // → 执行。内嵌注册表降级为"预热加速器"（避免 warmup 全 JIT），非派发硬约束；
-    // NN_STRICT_CLOSED_WORLD=1 保留为 opt-in 看门狗（硬报错）。
+    // → 执行。内嵌注册表降级为"预热加速器"（避免 warmup 全 JIT），非派发硬约束。
     // ══════════════════════════════════════════════════════════════════════
 
-    static bool jit_strict_()
-    {
-        static const bool strict = nn::dsl::env_flag("NN_STRICT_CLOSED_WORLD");
-        return strict;
-    }
-
     // ── JIT 两段前置：.nnk 缓存加载 与 生成器 dlopen（彼此解耦）────────────
-    // 缓存读取不需要 glslang——NN_STRICT_CLOSED_WORLD=1（D6：只用预生成
-    // 缓存、miss 即报错）与"预热命中跑"都不应 dlopen libnn-kernelgen.so。
+    // 缓存读取不需要 glslang——"预热命中跑"与 miss 后现编都先查 .nnk 缓存，
+    // 只有真正 miss 才 dlopen libnn-kernelgen.so。
     [[nodiscard]] Result<void> ensure_cache_() const
     {
         if (kernel_cache_) return {};
@@ -1733,9 +1725,6 @@ public:
 
     // 编译（或缓存命中）得到某 key 的 SPIR-V；miss → 生成器现编 → 内存缓存 insert
     // + 落盘。prec_sig=0（V0）或 EXPR_PREC_SIG_DISPATCH（`#x`）。
-    // D6 语义（NN_STRICT_CLOSED_WORLD=1）：**只用预生成的 .nnk 缓存**——
-    // 命中照常返回；miss 即报错，既不 dlopen 生成器也不现编（缓存即预生成物，
-    // 由 model_warmup / nn_warmup 产出 kernels.nnk 随发布分发）。
     [[nodiscard]] Result<std::vector<std::uint32_t>> jit_compile_(const std::string& key,
                                                                   const nn::ExprSpec& spec,
                                                                   std::uint32_t prec_sig) const
@@ -1744,10 +1733,6 @@ public:
         (void)unused;
         const std::string K = nn::fused::kernel_cache_key(key, prec_sig);
         if (const auto* spv = kernel_cache_->hit(K)) return *spv;
-        if (jit_strict_())
-            NN_FAIL("NN_STRICT_CLOSED_WORLD=1：只允许使用预生成的 .nnk 缓存（kernels.nnk），"
-                    "该 key 未命中——先经 model_warmup/nn_warmup 预热生成缓存；K=" +
-                    K);
         NN_TRY(unused2, ensure_generator_());
         (void)unused2;
         const auto spec_bytes = nn::fused::encode_expr_spec(spec);
@@ -1925,8 +1910,6 @@ public:
         // 引擎 dlopen libnn-kernelgen.so 现编 SPIR-V、懒建 pipeline、执行，并
         // 持久化进 .nnk 缓存。**绝不静默回退 CPU/边界 cast**。
         // psig==0（此刻输入已全 f32、P==F32）→ 只 JIT V0 结构键 `key`；输出 f32。
-        // strict（NN_STRICT_CLOSED_WORLD=1，D6 新语义 = 只用预生成 .nnk 缓存、
-        // miss 即报错）在 jit_compile_ 内生效，此处不再分支。
         auto jr = jit_run_(spec, key, inputs, rows, cols, P);
         NN_TRY_CHECK(jr);
         return *jr;

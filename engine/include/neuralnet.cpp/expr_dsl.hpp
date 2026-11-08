@@ -14,8 +14,7 @@
 //       成扁平 ExprSpec → 与预生成融合 shader 比对 → dispatch。
 //
 //  AOT 注册表约定：代码里用到的表达式集合 = 构建期 AOT 生成的 shader 集合
-//  （预热加速器）。运行时未命中默认走运行期 JIT 现编兜底；NN_STRICT_CLOSED_WORLD=1
-//  恢复硬报错（把"难以察觉的漂移"变成"可选的立即暴露"）。
+//  （预热加速器）。运行时未命中走运行期 JIT 现编兜底。
 //
 //  设计要点：
 //    - 算子复用 nn::ops（唯一的算子来源，op_id() 统一映射到 ExprOp）。
@@ -1547,7 +1546,7 @@ template <typename E>
 // 统一入口：engine.compute(expr, rows, cols[, P])
 //   CPU：编译期模板求值（SIMD 融合）。
 //   GPU：AOT 注册表 —— to_expr_spec 折叠 → engine.eval_expr 匹配预生成 shader；
-//        未命中默认运行期 JIT 现编（NN_STRICT_CLOSED_WORLD=1 恢复硬报错）。
+//        未命中走运行期 JIT 现编。
 //
 // P = **输出存储精度**（多精度，docs/development/05-mixed-precision.md §8.1）。
 //   · 默认 F32：未显式指定即按 f32 求值；Layer 按 §8.5 约定显式传 p_.compute / p_.stable。
