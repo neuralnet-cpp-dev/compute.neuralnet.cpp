@@ -2100,6 +2100,59 @@ public:
         const std::size_t m_per =
             (fmm && mm_batch > 0 && rows % mm_batch == 0) ? rows / mm_batch : rows;
 
+        // fold matmul 段：预计算整张 C(row, gk) = Σ_d opA·opB，复用分块 + 并行 +
+        //   向量化的 span 内核（原逐元素点积是全库最慢的 GEMM 形态，且同一
+        //   (row, gk) 会在每条引用它的指令上重复算）。
+        //   语义对齐 batched_matmul：A/B 按各自视图的头分组比（GQA）垂直切分，
+        //   转置标志按 MatmulSpec。span 内核是累加语义 ⇒ 输出需零初始化。
+        Matrix matmul_out;
+        std::span<const Scalar> mmc;
+        if (fmm)
+        {
+            const std::size_t inner = fmm->k;
+            const std::size_t n_out = K;
+            matmul_out = Matrix(rows, n_out);
+            auto mm_span = matmul_out.span();
+            for (std::size_t b = 0; b < mm_batch; ++b)
+            {
+                const std::size_t bA = b / gqa_ratio_of(spec, fmm->a_input);
+                const std::size_t bB = b / gqa_ratio_of(spec, fmm->b_input);
+                const auto& as = spans[fmm->a_input];
+                const auto& bs = spans[fmm->b_input];
+                const auto a_sub = std::span<const Scalar>(as.data() + bA * m_per * inner,
+                                                           m_per * inner);
+                const auto b_sub = std::span<const Scalar>(bs.data() + bB * inner * n_out,
+                                                           inner * n_out);
+                auto c_sub = std::span<Scalar>(mm_span.data() + b * m_per * n_out,
+                                               m_per * n_out);
+                if (!fmm->transA && !fmm->transB)
+                    Matrix::multiply_to_span(c_sub, m_per, n_out, a_sub, m_per, inner, b_sub,
+                                             inner, n_out);
+                else if (!fmm->transA && fmm->transB)
+                    Matrix::multiply_transposed_to_span(c_sub, m_per, n_out, a_sub, m_per,
+                                                        inner, b_sub, n_out, inner);
+                else if (fmm->transA && !fmm->transB)
+                    Matrix::transpose_multiply_to_span(c_sub, m_per, n_out, a_sub, inner,
+                                                       m_per, b_sub, inner, n_out);
+                else
+                {
+                    // 双转置（A^T·B^T）：无对应的 span 内核，保留标量累加
+                    const Scalar* a_base = as.data() + bA * inner * m_per;
+                    const Scalar* b_base = bs.data() + bB * n_out * inner;
+                    Scalar* c_base = mm_span.data() + b * m_per * n_out;
+                    for (std::size_t m = 0; m < m_per; ++m)
+                        for (std::size_t n = 0; n < n_out; ++n)
+                        {
+                            Scalar acc = 0;
+                            for (std::size_t d = 0; d < inner; ++d)
+                                acc += a_base[d * m_per + m] * b_base[n * inner + d];
+                            c_base[m * n_out + n] = acc;
+                        }
+                }
+            }
+            mmc = mm_span;
+        }
+
         // 输入视图读（列 = 全局收缩下标 gk；双域 fold 加 BatchMod/BatchCol 掩码钩子）
         const auto view_read = [&](std::size_t k, std::size_t r, std::size_t gk) -> Scalar
         {
@@ -2139,30 +2192,11 @@ public:
             std::vector<Scalar> vecd(f.vec_state_len, Scalar{0}); // 行向量态（累加初值 0）
             std::size_t cur_d = 0; // 向量域当前输出列（eval_op 的 VecState 读）
 
-            // fold matmul 段：网格 (row, gk) 上 C = Σ_d opA·opB（惰性求值——
-            //   CPU 正确性基准不追性能；GPU 侧由生成器块内预计算 tile）。
-            //   索引与既有 MatmulSpec / gen_reduce 的 mm 公式逐字一致。
+            // fold matmul 段：直接读预计算好的 C[row, gk]（分块内核已算完）
             const auto mm_at = [&](std::size_t r, std::size_t gk) -> Scalar
             {
                 if (!fmm) return Scalar{0};
-                const std::size_t mm_k = fmm->k;
-                const std::size_t b = static_cast<std::size_t>(r / m_per);
-                const std::size_t row_in = r - b * m_per;
-                // GQA：A/B 侧行块号按各自视图的头分组比取（HeadGroup 视图才有）
-                const std::size_t bA = b / gqa_ratio_of(spec, fmm->a_input);
-                const std::size_t bB = b / gqa_ratio_of(spec, fmm->b_input);
-                const ConstSpan& as = spans[fmm->a_input];
-                const ConstSpan& bs = spans[fmm->b_input];
-                Scalar acc = 0;
-                for (std::size_t d = 0; d < mm_k; ++d)
-                {
-                    const Scalar av = fmm->transA ? as[(bA * mm_k + d) * m_per + row_in]
-                                                  : as[(bA * m_per + row_in) * mm_k + d];
-                    const Scalar bv =
-                        fmm->transB ? bs[(bB * K + gk) * mm_k + d] : bs[(bB * mm_k + d) * K + gk];
-                    acc += av * bv;
-                }
-                return acc;
+                return mmc[r * K + gk];
             };
 
             // 操作数求值：kb = 块内下标（元素类临时槽），gk = 全局列（Input/Col 读）
