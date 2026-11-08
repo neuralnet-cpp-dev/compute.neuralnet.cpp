@@ -246,6 +246,60 @@ int run_matmul_chain(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
     return ok ? 0 : 1;
 }
 
+// ── 用例 3b（P10-②）：归约头 + 广播应用融合 ─────────────────────────────
+//   录制图：r = row_sum(x)（归约向量）→ y = x − row_broadcast(r)·0.25。
+//   归约 kernel 与唯一消费者的广播应用应拼成**单 kernel**（vector_out 翻转
+//   为广播网格，尾链读 s_red）。逐位对比“GPU 未融合参考”是硬验收；CPU 逐
+//   节点对照只测 CPU/GPU 舍入差。
+int run_rowreduce_broadcast(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
+{
+    const std::size_t R = 3, C = 4;
+    std::mt19937 rng(77);
+    const nn::Tensor x = make_cpu_tensor(cpu, R, C, rng);
+    const nn::Tensor xg = to_gpu(gpu, x);
+
+    // CPU 逐节点参考（求值：归约向量 → 广播应用）
+    auto c1 = nn::test_fuse::rsum_a(cpu, x, R, C);
+    if (!c1)
+    {
+        std::printf("[FAIL] CPU 归约求值失败: %s\n", c1.error().message.c_str());
+        return 1;
+    }
+    auto c2 = nn::test_fuse::rsum_b(cpu, x, *c1, R, C);
+    if (!c2)
+    {
+        std::printf("[FAIL] CPU 广播应用求值失败: %s\n", c2.error().message.c_str());
+        return 1;
+    }
+
+    // GPU 未融合参考（未录制 = 逐条 dispatch）
+    auto u1 = nn::test_fuse::rsum_a(gpu, xg, R, C);
+    if (!u1)
+    {
+        std::printf("[FAIL] GPU 归约求值失败: %s\n", u1.error().message.c_str());
+        return 1;
+    }
+    auto u2 = nn::test_fuse::rsum_b(gpu, xg, *u1, R, C);
+    if (!u2)
+    {
+        std::printf("[FAIL] GPU 广播应用求值失败: %s\n", u2.error().message.c_str());
+        return 1;
+    }
+
+    CHECK(static_cast<bool>(gpu.begin_expr()), "begin_expr 成功");
+    auto g1 = nn::test_fuse::rsum_a(gpu, xg, R, C);
+    auto g2 = nn::test_fuse::rsum_b(gpu, xg, *g1, R, C);
+    CHECK(static_cast<bool>(gpu.end_expr()), "end_expr 融合执行成功");
+    if (!g2) return 1;
+
+    const Scalar err_cpu = max_abs_diff(matrix_of(*c2), matrix_of(*g2));
+    const Scalar err_gpu = max_abs_diff(matrix_of(*u2), matrix_of(*g2));
+    const bool ok = err_cpu < 1e-5f && err_gpu < 1e-6f;
+    std::printf("[%s] 归约头+广播应用融合（row_sum → 广播）  cpu_err=%.2e gpu_diff=%.2e\n",
+                ok ? "PASS" : "FAIL", static_cast<double>(err_cpu), static_cast<double>(err_gpu));
+    return ok ? 0 : 1;
+}
+
 // ── 用例 4/5：未录制路径回归 + vec4 向量化路径 ─────────────────────────
 int run_non_recording(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
 {
@@ -582,6 +636,7 @@ int main()
     fail += run_chain3(*cpu_engine, *gpu_engine);
     fail += run_independent(*cpu_engine, *gpu_engine);
     fail += run_matmul_chain(*cpu_engine, *gpu_engine);
+    fail += run_rowreduce_broadcast(*cpu_engine, *gpu_engine);
     fail += run_non_recording(*cpu_engine, *gpu_engine);
     fail += run_adam_diamond(*cpu_engine, *gpu_engine);
     fail += run_batch_dispatch(*cpu_engine, *gpu_engine);

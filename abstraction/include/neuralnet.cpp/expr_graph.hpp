@@ -64,10 +64,104 @@ namespace nn
     return counter.fetch_add(1, std::memory_order_relaxed);
 }
 
+// ── 节点结构哈希（镜像 expr_spec_key 的字段口径，直接产出 u64）───────────
+// P11：图计划缓存只需要一个**数值** key 分量，不需要 16 位 hex 字符串。
+// expr_spec_key 内部先算出同一个 FNV-1a 值、再格式化进字符串；这里省掉
+// 字符串（录制期每节点一次），命中路径不再重建 key 串。
+// 字段口径必须与 expr_spec_key 一致：**结构进哈希、运行期值不进**
+// （view param、consts/rparams 值、matmul k/batch/trans、fold k 均排除）。
+// ⚠ 该哈希只用于**进程内**计划缓存索引（不是 shader 身份；shader 身份
+//   仍由 expr_spec_key 字符串承担）。口径若漂移只影响缓存命中率，不改数值。
+[[nodiscard]] inline std::uint64_t expr_spec_struct_hash(const ExprSpec& s) noexcept
+{
+    constexpr std::uint64_t kFnvOffset = 0xcbf29ce484222325ull; // FNV-1a 64 offset
+    constexpr std::uint64_t kFnvPrime = 0x100000001b3ull;
+    std::uint64_t h = kFnvOffset;
+    const auto feed = [&h](const void* p, std::size_t n)
+    {
+        const auto* b = static_cast<const std::uint8_t*>(p);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            h ^= static_cast<std::uint64_t>(b[i]);
+            h *= kFnvPrime;
+        }
+    };
+    const auto feed_u32 = [&](std::uint32_t v) { feed(&v, sizeof(v)); };
+    feed_u32(s.num_regs);
+    feed_u32(static_cast<std::uint32_t>(s.extras.size()));
+    for (const auto e : s.extras) feed(&e, 1);
+    feed_u32(static_cast<std::uint32_t>(s.instrs.size()));
+    for (const auto& in : s.instrs)
+    {
+        feed(&in.op, 1);
+        feed(&in.dst, 1);
+        feed(&in.a, sizeof(in.a));
+        feed(&in.b, sizeof(in.b));
+        feed(&in.c, sizeof(in.c));
+    }
+    feed_u32(static_cast<std::uint32_t>(s.views.size()));
+    for (const auto& v : s.views)
+    {
+        feed(&v.kind, 1);
+        feed(&v.negate_first_half, 1);
+        if (!expr_view_has_runtime_param(static_cast<ExprViewKind>(v.kind)))
+        {
+            feed_u32(v.param);
+            feed_u32(v.param2);
+        }
+    }
+    // 常量池 / RParam：只喂个数（runtime 值不进哈希，同 expr_spec_key）。
+    feed_u32(static_cast<std::uint32_t>(s.consts.size()));
+    feed_u32(static_cast<std::uint32_t>(s.rparams.size()));
+    if (s.matmul)
+    {
+        feed(&s.matmul->a_input, 1);
+        feed(&s.matmul->b_input, 1);
+    }
+    if (s.fold)
+    {
+        feed(&s.fold->num_state, 1);
+        feed_u32(static_cast<std::uint32_t>(s.fold->inits.size()));
+        for (const auto& v : s.fold->inits) feed(&v, sizeof(v));
+        const auto feed_seq = [&](const std::vector<ExprInstr>& seq)
+        {
+            feed_u32(static_cast<std::uint32_t>(seq.size()));
+            for (const auto& in : seq)
+            {
+                feed(&in.op, 1);
+                feed(&in.dst, 1);
+                feed(&in.a, sizeof(in.a));
+                feed(&in.b, sizeof(in.b));
+                feed(&in.c, sizeof(in.c));
+            }
+        };
+        feed_seq(s.fold->body);
+        feed_seq(s.fold->finalize);
+        if (s.fold->matmul)
+        {
+            feed(&s.fold->matmul->a_input, 1);
+            feed(&s.fold->matmul->b_input, 1);
+            feed(&s.fold->matmul->transA, 1);
+            feed(&s.fold->matmul->transB, 1);
+        }
+        if (s.fold->vecacc)
+        {
+            feed(&s.fold->vecacc->vec_state, 1);
+            feed(&s.fold->vecacc->weight_reg, 1);
+            feed(&s.fold->vecacc->b_input, 1);
+            feed(&s.fold->vecacc->scale_reg, 1);
+            feed(&s.fold->vecacc->has_scale, 1);
+        }
+        feed(&s.fold->tri_skip, 1);
+    }
+    return h;
+}
+
 // ── 图 IR 节点 ────────────────────────────────────────────────────────────
 struct ExprGraphNode
 {
     ExprSpec spec;          // canonical IR（录制时已 canonicalize）
+    std::uint64_t spec_hash = 0;  // P11：spec 的结构哈希（见 expr_spec_struct_hash）
     std::size_t rows = 0;      // 输出形状（统一网格 (rows, cols)）
     std::size_t cols = 0;
     bool vector_out = false;  // 输出为归约向量（(rows,1)/(1,cols)）
@@ -112,6 +206,7 @@ struct ExprGraph
         const int idx = static_cast<int>(nodes.size());
         ExprGraphNode nd;
         nd.spec = spec;
+        nd.spec_hash = expr_spec_struct_hash(spec);   // P11：录制期一次，命中路径不再造 key 串
         nd.rows = rows;
         nd.cols = cols;
         nd.vector_out = vector_out;
@@ -157,7 +252,12 @@ struct FusedKernelInput
 
 struct FusedKernel
 {
-    ExprSpec spec;             // 复合 spec（canonical）
+    ExprSpec spec;             // 复合 spec（拼接形态；comp kernel 未必 canonical）
+    // P4：canonical 形态与结构 key 由计划缓存**算一次**（plan_from_kernel），
+    // 派发期直接复用——不再每 kernel 每 step 重复 canonicalize + expr_spec_key。
+    // rparams 是运行时值，实例化时按当前图重填（见 instantiate_plan_into）。
+    ExprSpec canon;
+    std::string spec_key;
     std::vector<FusedKernelInput> inputs;  // 与 spec.views 一一对应
     std::size_t rows = 0;
     std::size_t cols = 0;
@@ -328,30 +428,51 @@ namespace fused
             return false;
         }
 
-        // 1) 前置：均逐元素（无归约）、非归约输出、形状相同、精度相同
-        if (cur.vector_out || B.vector_out) return false;
+        // 1) 前置：形状相同、精度相同；B 不得是归约向量输出
+        if (B.vector_out) return false;
         if (cur.prec != B.prec) return false;   // 恢复时新增：混精度不拼
         // 1a) matmul 段（S5）：matmul 是"前置段"（唯一、位于链首）——
         //   - B 含 matmul → 不能拼入当前 kernel（matmul 必须位于链首）→ 新 kernel
         //   - A 含 matmul → 允许拼接 B：fused 保留 A.matmul，B 的指令拼在
         //     A 的尾链之后（A 纯 matmul 时 B 对 A 输出的引用替换为 Matmul 操作数）
         if (Bs.matmul) return false;
-        if (expr_spec_reduce_axis(A) != -1) return false;
-        if (expr_spec_reduce_axis(Bs) != -1) return false;
+        // P10-③：fold 头禁止拼接——fold spec 契约要求顶层 instrs 为空（见
+        // validate_expr_spec / expr_fold_test），"fold 后逐元素收尾"在当前
+        // IR 里无法表达；必须先经 fold emitter 扩展，故此处显式拒绝，
+        // 让 fold kernel 与其消费者各自独立派发（兜底 JIT，不再误入拼接）。
+        if (cur.spec.fold || Bs.fold) return false;
+        // P10-②：归约头 + 广播应用（LayerNorm/CE 形态）。
+        //   - 首次拼接：A 是 vector_out 归约 kernel（输出 (rows,1)/(1,cols)），
+        //     B 是其唯一消费者的逐元素广播应用 → fused 保留 A 的归约指令，
+        //     **vector_out 翻转为广播网格**（reduce shader 的 vector_out=0 路径，
+        //     归约结果留在 s_red，尾链按元素执行）。
+        //   - 已融合的归约 kernel（vector_out=false 且 reduce_axis 已存在）可继续
+        //     拼逐元素尾链（尾链读上一个寄存器）。
+        //   - 轴混合 / B 再引入归约 → 拒绝（归约轴必须单一）。
+        const int a_axis = expr_spec_reduce_axis(A);
+        const int b_axis = expr_spec_reduce_axis(Bs);
+        if (a_axis == -2 || b_axis != -1) return false;
+        const bool reduce_head = cur.vector_out;   // A 尚未融合，仍输出归约向量
+        if (reduce_head && (a_axis < 0 || A.instrs.empty())) return false;
         if (cur.rows != B.rows || cur.cols != B.cols) return false;
 
-        // 2) tail 无其他消费者，且被 B 以 Linear 视图消费
+        // 2) tail 无其他消费者；B 引用 tail 的视图必须可寄存器替换：
+        //    常规链 = Linear；归约头首次拼接 = 与归约轴匹配的广播视图
+        //    （RowReduce → RowBroadcast / ColReduce → ColBroadcast）。
         if (consumers[static_cast<std::size_t>(tail)].size() != 1 ||
             consumers[static_cast<std::size_t>(tail)][0] != bi)
             return false;
+        const ExprViewKind expected_tail_view =
+            reduce_head ? (a_axis == 0 ? ExprViewKind::RowBroadcast : ExprViewKind::ColBroadcast)
+                        : ExprViewKind::Linear;
         std::vector<int> tail_slots;   // B 中引用 tail 的输入槽
         std::vector<int> other_slots;  // B 中其他输入槽
         for (std::size_t k = 0; k < Bs.views.size(); ++k)
         {
             if (B.dep_of_input[k] == tail)
             {
-                if (static_cast<ExprViewKind>(Bs.views[k].kind) != ExprViewKind::Linear)
-                    return false;  // 仅支持 Linear 引用（寄存器直接替换）
+                if (static_cast<ExprViewKind>(Bs.views[k].kind) != expected_tail_view)
+                    return false;  // 仅支持直接替换（Linear / 匹配轴的广播）
                 tail_slots.push_back(static_cast<int>(k));
             }
             else
@@ -366,6 +487,10 @@ namespace fused
         // Matmul 操作数（读取前置 matmul 段输出），否则替换为 A 的输出寄存器。
         const bool a_pure_matmul = A.matmul && A.instrs.empty();
         const std::size_t out_reg_A = a_pure_matmul ? 0 : A.instrs.back().dst;
+        // 归约头：A 的输出向量值住在 s_red（Reduce 操作数），不是普通寄存器；
+        // 若 A 末指令是逐元素收尾（非归约），则输出值就是该寄存器。
+        const bool tail_from_reduce =
+            reduce_head && expr_op_is_reduce(static_cast<ExprOp>(A.instrs.back().op));
 
         // 3a) 寄存器偏移溢出防护：B 的指令 dst 经 +A.num_regs 重映射后必须 < 256
         // （ExprInstr.dst 为 uint8_t）。超限则放弃融合（保守，正确性优先）。
@@ -415,6 +540,9 @@ namespace fused
                     if (it != tail_slots.end())
                     {
                         if (a_pure_matmul) return expr::matmul_op();  // 引用前置 matmul 段输出
+                        // 归约头：读归约结果（s_red），而非普通寄存器
+                        if (tail_from_reduce)
+                            return expr::reduce(static_cast<std::uint8_t>(out_reg_A));
                         return expr::reg(static_cast<std::uint8_t>(out_reg_A));
                     }
                     return expr::input(static_cast<std::uint8_t>(b_view_map[k]));
@@ -466,6 +594,9 @@ namespace fused
         cur.cols = B.cols;
         cur.prec = B.prec;
         cur.tail = bi;
+        // P10-②：归约头拼上广播应用后，输出网格从归约向量翻转为广播全网格
+        // （reduce shader 的 vector_out=0 路径；结果写回 B 的目标张量）。
+        if (reduce_head) cur.vector_out = false;
         cur.members.push_back(bi);
         return true;
     };
@@ -697,6 +828,18 @@ namespace fused
             continue;
         }
 
+        // ② P10：归约头 + 广播应用（LayerNorm/CE 形态）——归约向量 kernel 的
+        //    唯一消费者是逐元素广播应用时拼成单 kernel（vector_out 翻转为广播
+        //    网格）。不命中（多消费者 / 非匹配广播 / 形状或精度不符）→ 保持
+        //    两个独立 kernel，各自按现有路径派发（JIT 兜底不变）。
+        if (!kernels.empty() && kernels.back().vector_out && !k_is_comp.back() &&
+            try_append(kernels.back(), static_cast<int>(i)))
+        {
+            k_members.back().push_back(static_cast<int>(i));
+            k_out_reg.back().clear();   // P1 单输出（广播应用）
+            continue;
+        }
+
         if (p2_eligible(i))
         {
             const int root = uf_find(static_cast<int>(i));
@@ -741,7 +884,9 @@ namespace fused
 // 缓存的 kernel 计划（不含运行时张量）
 struct FusedKernelPlan
 {
-    ExprSpec spec;             // 复合 spec（canonical）
+    ExprSpec spec;             // 复合 spec（拼接形态）
+    ExprSpec canon;            // P4：canonical 形态（运行期值随实例化重填）
+    std::string spec_key;      // P4：canon 的结构 key（计划创建时算一次）
     std::vector<int> input_node;       // 每输入槽：来源节点 idx（>=0）或 -1（外部）
     std::vector<int> input_ext_node;   // 外部时：来源原图节点 idx
     std::vector<int> input_ext_slot;   // 外部时：来源节点输入槽 index
@@ -752,7 +897,10 @@ struct FusedKernelPlan
     std::vector<int> members;
 };
 
-// 整图结构 key（FNV-1a）：覆盖节点 spec key、形状、vector_out、精度、依赖拓扑。
+// 整图结构 key（FNV-1a）：覆盖节点 spec 结构哈希、形状、vector_out、精度、依赖拓扑。
+// P11：不再逐节点 `expr_spec_key`（那会每 step 每节点堆分配一个 16 位 hex 串）；
+// 节点结构哈希在录制期（add_node）算好存进 ExprGraphNode，这里是纯数值混合。
+// dst 分组簿记用 thread_local 容器 clear 复用（稳态零分配）。
 [[nodiscard]] inline std::uint64_t graph_cache_key(const ExprGraph& g)
 {
     constexpr std::uint64_t kFnvOffset = 14695981039346656037ull;
@@ -766,19 +914,12 @@ struct FusedKernelPlan
             h *= kFnvPrime;
         }
     };
-    const auto mix_str = [&](const std::string& s)
-    {
-        for (const unsigned char c : s)
-        {
-            h ^= static_cast<std::uint8_t>(c);
-            h *= kFnvPrime;
-        }
-    };
     mix_u64(static_cast<std::uint64_t>(g.nodes.size()));
     // RV-03：写目标按**共享结构**进 key —— 同 dst 的节点归同一个组号（按首次出现
     // 顺序编号 1,2,…；0 = 新占位存储）。直接用指针值会让"每步新建的目标张量"
     // （Muon 的临时累加器等）每步产生新 key，白白丢掉 P2-12 的图级计划缓存。
-    std::unordered_map<std::uintptr_t, int> dst_group;
+    static thread_local std::unordered_map<std::uintptr_t, int> dst_group;
+    dst_group.clear();
     for (const auto& n : g.nodes)
     {
         mix_u64(static_cast<std::uint64_t>(n.rows));
@@ -798,7 +939,7 @@ struct FusedKernelPlan
             }
             mix_u64(static_cast<std::uint64_t>(grp));
         }
-        mix_str(expr_spec_key(n.spec));
+        mix_u64(n.spec_hash);   // P11：录制期已算好的结构哈希（替代 expr_spec_key 字符串）
         mix_u64(static_cast<std::uint64_t>(n.dep_of_input.size()));
         for (const int d : n.dep_of_input)
             mix_u64(static_cast<std::uint64_t>(d));
@@ -811,6 +952,12 @@ struct FusedKernelPlan
 {
     FusedKernelPlan p;
     p.spec = k.spec;
+    // P4：canonical 形态 + 结构 key 在这里算**一次**并随计划缓存。
+    // fold spec 的 canonicalize 是恒等（原样保留），与 run_graph_kernel_into_
+    // 的选路同源；p2 复合 spec 的 key 必须建立在 canonical 形态上（与运行期
+    // 一致）。运行期 rparams 值不进 key，实例化时替换为当前值。
+    p.canon = k.spec.fold ? k.spec : nn::canonicalize_expr_spec(k.spec);
+    p.spec_key = nn::expr_spec_key(p.canon);
     p.rows = k.rows;
     p.cols = k.cols;
     p.vector_out = k.vector_out;
@@ -830,20 +977,23 @@ struct FusedKernelPlan
 }
 
 // 从计划实例化 kernel，绑定当前图的运行时张量（node 输出 / 外部输入）。
-[[nodiscard]] inline FusedKernel instantiate_plan(const FusedKernelPlan& p, const ExprGraph& g)
+// P11：原位填充既有 kernel（`k` 的向量容量跨 step 复用，命中路径不再每
+// kernel 重新分配）。`k` 的旧内容被覆盖，容量保留。
+inline void instantiate_plan_into(const FusedKernelPlan& p, const ExprGraph& g, FusedKernel& k)
 {
-    FusedKernel k;
     k.spec = p.spec;
+    k.canon = p.canon;          // P4：canonical 形态复用（不重新 canonicalize）
+    k.spec_key = p.spec_key;    // P4：结构 key 复用（不重新格式化）
     k.rows = p.rows;
     k.cols = p.cols;
     k.vector_out = p.vector_out;
     k.prec = p.prec;
     k.tail = p.tail;
     k.members = p.members;
-    k.inputs.reserve(p.input_node.size());
+    k.inputs.resize(p.input_node.size());
     for (std::size_t i = 0; i < p.input_node.size(); ++i)
     {
-        FusedKernelInput in;
+        FusedKernelInput& in = k.inputs[i];
         in.node = p.input_node[i];
         if (in.node < 0)
         {
@@ -854,7 +1004,12 @@ struct FusedKernelPlan
                                     .input_tensors[static_cast<std::size_t>(in.ext_slot)]
                               : Tensor{};
         }
-        k.inputs.push_back(std::move(in));
+        else
+        {
+            in.ext_node = -1;
+            in.ext_slot = -1;
+            in.external = Tensor{};
+        }
     }
     // ⚠ rparams 是**每步变化的运行时值**（Adam 的 inv_bc1/inv_bc2 等）：
     // 计划缓存只复用结构，值必须按成员序从当前图节点重拼（拼接规则 =
@@ -862,15 +1017,20 @@ struct FusedKernelPlan
     // 原样透传、顺序稳定）。否则缓存命中的 kernel 永远用第 1 步的超参
     // （P2 实测：GPU 字节锚偏移的真凶）。consts 是结构字面量、不随步变，
     // 随计划缓存安全。
+    k.spec.rparams.clear();
+    for (const int m : k.members)
     {
-        std::vector<Scalar> rp;
-        for (const int m : k.members)
-        {
-            const auto& nd = g.nodes[static_cast<std::size_t>(m)];
-            rp.insert(rp.end(), nd.spec.rparams.begin(), nd.spec.rparams.end());
-        }
-        k.spec.rparams = std::move(rp);
+        const auto& nd = g.nodes[static_cast<std::size_t>(m)];
+        k.spec.rparams.insert(k.spec.rparams.end(), nd.spec.rparams.begin(), nd.spec.rparams.end());
     }
+    // P4：canonical 形态共用同一份当前 rparams（结构相同、只是值随步变）。
+    k.canon.rparams = k.spec.rparams;
+}
+
+[[nodiscard]] inline FusedKernel instantiate_plan(const FusedKernelPlan& p, const ExprGraph& g)
+{
+    FusedKernel k;
+    instantiate_plan_into(p, g, k);
     return k;
 }
 

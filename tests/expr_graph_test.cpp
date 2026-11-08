@@ -6,7 +6,7 @@
 //   1. 链融合正确性：A→B 融合成单 kernel 后求值 == 逐节点求值
 //   2. 多节点链融合（3 节点）
 //   3. 融合边界：非链（无消费者 / 多消费者 / 非 Linear 引用）不融合
-//   4. 归约节点作为融合边界（不参与链式拼接）
+//   4. 归约头 + 广播应用融合（P10-②）；轴不匹配时仍为融合边界
 //   5. 上限压力：拼接后超 EXPR_MAX_* 则保守放弃融合
 //   6. 确定性：同一图多次融合结果完全一致（含 key）
 //   7. 不变量：融合 kernel 通过 validate；views/输入顺序确定
@@ -137,7 +137,37 @@ nn::ExprSpec make_binary(nn::ExprOp op)
     return s;
 }
 
-// 构造归约表达式：out = row_sum(input0)（归约边界）
+// 构造柱归约表达式：out = col_sum(input0)（归约边界，(1,cols) 输出）
+nn::ExprSpec make_col_sum()
+{
+    nn::ExprSpec s;
+    s.views.push_back(nn::expr::linear());
+    nn::ExprInstr in;
+    in.op = static_cast<std::uint8_t>(nn::ExprOp::ColSum);
+    in.dst = 0;
+    in.a = nn::expr::input(0);
+    s.instrs.push_back(in);
+    s.num_regs = 1;
+    return s;
+}
+
+// 构造广播应用：out = row_broadcast(input0) <op> const
+nn::ExprSpec make_row_broadcast_const(nn::ExprOp op, Scalar c)
+{
+    nn::ExprSpec s;
+    s.views.push_back(nn::expr::row_broadcast());
+    s.consts.push_back(c);
+    nn::ExprInstr in;
+    in.op = static_cast<std::uint8_t>(op);
+    in.dst = 0;
+    in.a = nn::expr::input(0);
+    in.b = nn::expr::cst(0);
+    s.instrs.push_back(in);
+    s.num_regs = 1;
+    return s;
+}
+
+// 构造归约表达式：out = row_sum(input0)（归约边界，(rows,1) 输出）
 nn::ExprSpec make_row_sum()
 {
     nn::ExprSpec s;
@@ -379,8 +409,46 @@ void test_multi_consumer()
     std::printf("[OK] test_multi_consumer (kernels=%zu)\n", kernels.size());
 }
 
-// ── 测试 5：归约节点作为融合边界 ───────────────────────────────────────
-void test_reduce_boundary()
+// ── 测试 5（P10-②）：归约头 + 广播应用融合 ─────────────────────────────
+// A: y = row_sum(x)（归约向量）；B: z = y + 1（RowBroadcast 消费 y）。
+// 归约 kernel 的唯一消费者是匹配轴的广播应用 → 拼成单 kernel，vector_out
+// 翻转为广播网格；数值 == 逐节点（归约 → 广播）参考。
+void test_reduce_broadcast_fuse()
+{
+    auto eng_owner = nn::create_cpu_engine();
+    nn::ComputeEngine& eng = *eng_owner;
+    const std::size_t rows = 3, cols = 4;
+    nn::ExprGraph g;
+    nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
+    const nn::ExprSpec sum = make_row_sum();
+    const nn::ExprSpec add = make_row_broadcast_const(nn::ExprOp::Add, Scalar{1});
+
+    const int nA = g.add_node(sum, std::vector<nn::Tensor>{x}, rows, cols, true);
+    nn::Tensor yt = make_placeholder(eng, rows, 1, g.tag_of_node[static_cast<std::size_t>(nA)]);
+    (void)g.add_node(add, std::vector<nn::Tensor>{yt}, rows, cols, false);
+
+    auto kernels = fuse_expr_graph(g);
+    CHECK(kernels.size() == 1, "归约头 + 匹配轴广播应用应融合为单 kernel");
+    if (kernels.size() != 1) return;
+    CHECK(kernels[0].members.size() == 2, "kernel 应包含归约 + 消费节点");
+    CHECK(!kernels[0].vector_out, "融合后输出翻转为广播全网格");
+    CHECK(kernels[0].spec.instrs.size() == 2, "归约指令 + 广播应用尾链");
+
+    std::vector<nn::Tensor> kinputs;
+    for (auto& in : kernels[0].inputs)
+        kinputs.push_back(in.external);
+    auto fused_r = eng.eval_expr(kernels[0].spec, kinputs, rows, cols);
+    auto y_ref = eng.eval_expr_reduce(sum, std::vector<nn::Tensor>{x}, rows, cols);
+    if (!fused_r || !y_ref) return;
+    auto y_full = eng.eval_expr(add, std::vector<nn::Tensor>{*y_ref}, rows, cols);
+    if (!y_full) return;
+    CHECK(max_abs_diff(matrix_of(eng, *fused_r), matrix_of(eng, *y_full)) < 1e-6f,
+          "融合 kernel == 逐节点（归约 → 广播）");
+    std::printf("[OK] test_reduce_broadcast_fuse (kernels=%zu)\n", kernels.size());
+}
+
+// ── 测试 5b：归约轴不匹配 → 仍作为融合边界（兜底独立派发） ──────────────
+void test_reduce_axis_mismatch_boundary()
 {
     auto eng_owner = nn::create_cpu_engine();
     nn::ComputeEngine& eng = *eng_owner;
@@ -388,25 +456,15 @@ void test_reduce_boundary()
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
 
-    // A: y = row_sum(x)（归约，输出 (rows,1)）；B: z = y + 1（消费 y，但 B 的
-    //   输入 y 形状是 (rows,1)，经 RowBroadcast 视图）→ 不融合（A 是归约）
-    const int nA = g.add_node(make_row_sum(), std::vector<nn::Tensor>{x}, rows, cols, true);
-    nn::Tensor yt = make_placeholder(eng, rows, 1, g.tag_of_node[static_cast<std::size_t>(nA)]);
-    nn::ExprSpec sb;
-    sb.views.push_back(nn::expr::row_broadcast());  // (rows,1) 按行广播
-    nn::ExprInstr in;
-    in.op = static_cast<std::uint8_t>(nn::ExprOp::Add);
-    in.dst = 0;
-    in.a = nn::expr::input(0);
-    in.b = nn::expr::cst(0);
-    sb.consts.push_back(Scalar{1});
-    sb.instrs.push_back(in);
-    sb.num_regs = 1;
-    (void)g.add_node(sb, std::vector<nn::Tensor>{yt}, rows, cols, false);
+    // 列归约（输出 (1,cols)）却被 RowBroadcast 消费 → 轴不匹配，拒绝拼接
+    const int nA = g.add_node(make_col_sum(), std::vector<nn::Tensor>{x}, rows, cols, true);
+    nn::Tensor yt = make_placeholder(eng, 1, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
+    (void)g.add_node(make_row_broadcast_const(nn::ExprOp::Add, Scalar{1}),
+                     std::vector<nn::Tensor>{yt}, rows, cols, false);
 
     auto kernels = fuse_expr_graph(g);
-    CHECK(kernels.size() == 2, "归约节点应作为融合边界（不拼接）");
-    std::printf("[OK] test_reduce_boundary (kernels=%zu)\n", kernels.size());
+    CHECK(kernels.size() == 2, "归约轴不匹配时保持独立 kernel（走 JIT/单节点路径）");
+    std::printf("[OK] test_reduce_axis_mismatch_boundary (kernels=%zu)\n", kernels.size());
 }
 
 // ── 测试 6：上限压力（拼接后超 EXPR_MAX_INSTRS 则放弃融合） ───────────
@@ -748,7 +806,8 @@ int main()
     test_chain3_fuse();
     test_independent();
     test_multi_consumer();
-    test_reduce_boundary();
+    test_reduce_broadcast_fuse();
+    test_reduce_axis_mismatch_boundary();
     test_limit_pressure();
     test_determinism();
     test_dep_recognition();

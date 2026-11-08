@@ -111,7 +111,6 @@ private:
     };
     mutable std::shared_ptr<nn::fused::KernelCache> kernel_cache_;
     mutable JitGenerator jit_;
-    mutable bool jit_init_tried_ = false;
 
     explicit GpuEngine(std::shared_ptr<GpuBackend> backend)
         : ComputeEngine(backend ? backend->identity() : 0), backend_(std::move(backend))
@@ -1612,10 +1611,13 @@ public:
     }
 
     // 生成器 .so 懒加载（仅"缓存 miss 且非 strict"才走到；失败 NN_FAIL 带 dlerror）。
+    // 失败**不留"已尝试"痕迹**：只有 handle + 三个符号全部就绪才提交 jit_，
+    // 下次调用会重新尝试（调用方修正 NN_KERNELGEN_PATH / 部署环境后可再 warmup）。
+    // 旧实现先置 tried=true 再 dlopen：失败一次后二次调用会静默"成功"，随后
+    // 解引用空 generate 指针（#M7 状态残留）。
     [[nodiscard]] Result<void> ensure_generator_() const
     {
-        if (jit_init_tried_) return {};
-        jit_init_tried_ = true;
+        if (jit_.loaded()) return {};
         // dlopen libnn-kernelgen.so（NN_KERNELGEN_PATH 覆盖 → 系统库搜索）；
         // Windows 平台产物为 nn-kernelgen.dll（40HX 实测 LoadLibrary 按 .so 名
         // 查找报 win32 error 126）
@@ -1642,12 +1644,21 @@ public:
                     std::string(dlerror()));
         auto sym = [h](const char* n) { return dlsym(h, n); };
 #endif
-        jit_.handle = h;
-        jit_.generate = reinterpret_cast<decltype(jit_.generate)>(sym("nnk_generate_spirv"));
-        jit_.free = reinterpret_cast<decltype(jit_.free)>(sym("nnk_free_spirv"));
-        jit_.version = reinterpret_cast<decltype(jit_.version)>(sym("nnk_generator_version"));
-        if (!jit_.generate || !jit_.free || !jit_.version)
+        JitGenerator next;
+        next.handle = h;
+        next.generate = reinterpret_cast<decltype(next.generate)>(sym("nnk_generate_spirv"));
+        next.free = reinterpret_cast<decltype(next.free)>(sym("nnk_free_spirv"));
+        next.version = reinterpret_cast<decltype(next.version)>(sym("nnk_generator_version"));
+        if (!next.generate || !next.free || !next.version)
+        {
+#ifdef _WIN32
+            FreeLibrary(h);
+#else
+            ::dlclose(h);
+#endif
             NN_FAIL("libnn-kernelgen.so 符号不完整（缺 nnk_generate_spirv/free/version）");
+        }
+        jit_ = next;
         return {};
     }
 
@@ -2200,8 +2211,20 @@ public:
             NN_FAIL("eval_expr_multi_into: 仅支持纯逐元素 spec");
         const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
         const std::string key = nn::expr_spec_key(spec);
+        return eval_expr_multi_into_canon_(spec, key, inputs, rows, cols, outs);
+    }
+
+    // P4：已 canonical 的入口——融合图计划缓存已带 canon spec 与 key，
+    // 直接复用（不再每 dispatch canonicalize + expr_spec_key）。
+    [[nodiscard]] Result<void> eval_expr_multi_into_canon_(const ExprSpec& spec,
+                                                           const std::string& key,
+                                                           std::span<const Tensor> inputs,
+                                                           std::size_t rows, std::size_t cols,
+                                                           std::span<Tensor> outs)
+    {
 #ifndef NN_FUSED_REGISTRY_EMBEDDED
-        // 无注册表模式（NN_EXPR_SCAN 收集器 TU）：融合分支整体不编译
+        // 无注册表模式（NN_EXPR_SCAN 收集器 TU）：融合分支整体不编译；
+        // miss→JIT 兜底仍使用 spec/key。
         (void)inputs;
         (void)rows;
         (void)cols;
@@ -2283,15 +2306,19 @@ private:
         // P2-12 图级缓存跨 step 复用：训练每 step 图结构重复，命中缓存则跳过
         // 融合分析 + 拼接 canonicalize + validate（缓存只复用结构决策，运行时
         // 按 plan 绑定 node_outputs 与外部张量；不改数值、不破确定性）。
+        // P11：kernel 容器 thread_local 复用——命中路径按 plan 原位填充
+        // （instantiate_plan_into），稳态不再每 step 为每个 kernel 重新分配
+        // vector；执行序重排改为**就地 swap**（同样保留各 kernel 的容量）。
         auto& gcache = fused::graph_plan_cache();
         const std::uint64_t gkey = graph_cache_key(g);
-        std::vector<FusedKernel> kernels;
+        static thread_local std::vector<FusedKernel> kernels_scratch;
+        std::vector<FusedKernel>& kernels = kernels_scratch;
         const auto cit = gcache.find(gkey);
         if (cit != gcache.end())
         {
-            kernels.reserve(cit->second.size());
-            for (const auto& p : cit->second)
-                kernels.push_back(instantiate_plan(p, g));
+            kernels.resize(cit->second.size());
+            for (std::size_t i = 0; i < cit->second.size(); ++i)
+                instantiate_plan_into(cit->second[i], g, kernels[i]);
         }
         else
         {
@@ -2300,6 +2327,10 @@ private:
             plans.reserve(kernels.size());
             for (const auto& k : kernels)
                 plans.push_back(plan_from_kernel(k));
+            // P4：本轮（miss 步）也要带 canonical spec/key 派发——按计划原位
+            // 回填一次（仅 miss 步发生；后续命中由上面的 instantiate 路径覆盖）。
+            for (std::size_t i = 0; i < kernels.size(); ++i)
+                instantiate_plan_into(plans[i], g, kernels[i]);
             if (gcache.size() >= fused::GRAPH_PLAN_CACHE_MAX) gcache.clear();
             gcache.emplace(gkey, std::move(plans));
         }
@@ -2315,9 +2346,11 @@ private:
                     if (m >= 0 && static_cast<std::size_t>(m) < kernel_of.size())
                         kernel_of[static_cast<std::size_t>(m)] = static_cast<int>(ki);
             std::vector<std::uint8_t> done(kernels.size(), 0);
-            std::vector<FusedKernel> ordered;
-            ordered.reserve(kernels.size());
-            while (ordered.size() < kernels.size())
+            // P11：不再把 kernel move 进临时 ordered 向量（那会丢弃每个 kernel
+            // 的容器容量）；先求"原下标 → 执行位次"的置换，再就地 swap 应用。
+            std::vector<std::size_t> order(kernels.size(), 0);
+            std::size_t next_pos = 0;
+            while (next_pos < kernels.size())
             {
                 bool progressed = false;
                 for (std::size_t ki = 0; ki < kernels.size(); ++ki)
@@ -2343,7 +2376,7 @@ private:
                     if (ready)
                     {
                         done[ki] = 1;
-                        ordered.push_back(std::move(kernels[ki]));
+                        order[ki] = next_pos++;
                         progressed = true;
                         break;   // 重新从头扫 = 稳定（列表序优先）
                     }
@@ -2354,11 +2387,17 @@ private:
                         if (!done[ki])
                         {
                             done[ki] = 1;
-                            ordered.push_back(std::move(kernels[ki]));
+                            order[ki] = next_pos++;
                         }
                 }
             }
-            kernels = std::move(ordered);
+            // 就地应用置换（swap 只交换内容，保留各 kernel 的向量容量供下一步复用）
+            for (std::size_t i = 0; i < kernels.size(); ++i)
+                while (order[i] != i)
+                {
+                    std::swap(kernels[i], kernels[order[i]]);
+                    std::swap(order[i], order[order[i]]);
+                }
         }
 
         // RV-03 兜底：顺序隐患（同目标写序 / WAR）必须在**实际执行序**下成立。
@@ -2398,7 +2437,7 @@ private:
             bool degraded = false;   // 复合降级 = 逐成员派发
             bool batchable = false;  // P3 批量资格（含 `key#b` 已登记）
             std::string bkey;               // 组键（结构 key + 参数值序列）
-            ExprSpec bspec;              // canonical spec（批量派发参数来源）
+            const ExprSpec* bspec = nullptr; // P4：指向 kernel 已缓存的 canonical spec（不拷贝）
             ExprPrecSig b_sig = 0;          // 组内统一精度签名（0 = 全 f32）
             std::string b_prefix;           // 批量变体前缀（不含 `#b`）
         };
@@ -2463,10 +2502,11 @@ private:
                 d.in_tok.push_back(tensor_storage_token_(t));
             // P3 批量资格：纯逐元素（含 extras 复合）+ 全 f32 GPU + 不降级 +
             // `key#b` 已登记（无 BDA 时注册期即跳过 → 天然不可批量）。
-            // bspec 与 run_graph_kernel_into_ 的选路同源（fold 原样、其余
-            // canonicalize）。
-            const ExprSpec bspec = k.spec.fold ? k.spec : nn::canonicalize_expr_spec(k.spec);
-            d.bspec = bspec;
+            // P4：bspec 直接指向 kernel 计划缓存的 canonical 形态与 key 同源，
+            // 不再每 kernel 每 step 重新 canonicalize（运行期 rparams 已由
+            // instantiate_plan_into 按当前图重填）。
+            const ExprSpec& bspec = k.canon;
+            d.bspec = &bspec;
             if (!d.degraded && !k.vector_out && nn::expr_spec_batchable(bspec) && batch_enabled &&
                 (k.rows == 0 || k.cols <= UINT32_MAX / k.rows))
             {
@@ -2609,7 +2649,7 @@ private:
                         bi.cols = static_cast<std::uint32_t>(kernels[m].cols);
                         insts.push_back(std::move(bi));
                     }
-                    const ExprSpec& s = items[gr.members.front()].bspec;
+                    const ExprSpec& s = *items[gr.members.front()].bspec;
                     auto br = backend_->run_fused_gpu_batch(
                         items[gr.members.front()].b_prefix + nn::EXPR_BATCH_SUFFIX, insts, s.consts,
                         nn::expr_spec_runtime_view_params(s), s.rparams);
@@ -2620,9 +2660,9 @@ private:
             }
             // ── 通用降级可观测（NN_IRC_TRACE=1）：逐元素候选但未成组 ──────
             if (::nn::detail::env_flag_raw("NN_IRC_TRACE") && !d.degraded && !k.vector_out &&
-                nn::expr_spec_batchable(d.bspec))
+                nn::expr_spec_batchable(*d.bspec))
                 std::fprintf(stderr, "[ir-c][batch-degrade] %s → 逐 kernel 派发（%s）\n",
-                             nn::expr_spec_key(d.bspec).c_str(),
+                             nn::expr_spec_key(*d.bspec).c_str(),
                              !batch_enabled ? "NN_IRC_NO_BATCH"
                              : !d.batchable ? "key#b 未登记/无 BDA"
                                             : "同签名未集齐 2 实例（依赖/上限）");
@@ -2659,7 +2699,10 @@ private:
             // （低频、可观测"某段悄悄没融合"，AGENTS §7 口径）。
             if (k.spec.extras.empty())
             {
-                auto r = run_graph_kernel_into_(k.spec, d.ins, k.rows, k.cols, k.vector_out, d.out);
+                // P4：canonical spec + 结构 key 由计划缓存带入，派发不再重复
+                // canonicalize / expr_spec_key（命中路径零构造）。
+                auto r = run_graph_kernel_into_(k.spec, d.ins, k.rows, k.cols, k.vector_out, d.out,
+                                                &k.canon, &k.spec_key);
                 NN_TRY_CHECK(r);
             }
             else
@@ -2671,7 +2714,7 @@ private:
                 outs.push_back(d.out);
                 for (const Tensor& t : d.extras)
                     outs.push_back(t);
-                auto r = eval_expr_multi_into(k.spec, d.ins, k.rows, k.cols, outs);
+                auto r = eval_expr_multi_into_canon_(k.canon, k.spec_key, d.ins, k.rows, k.cols, outs);
                 NN_TRY_CHECK(r);
             }
         }
@@ -2695,14 +2738,38 @@ private:
     // （vector_out）/ 精度变体（`#a`/`#x`/V0）——与 eval_expr_impl /
     // eval_expr_into_impl 的选路同源，output_override 精度视图同
     // eval_expr_into_impl（f16 目标必须经 f16_view 包 f16 buffer）。
+    // P4：`canon_hint` / `key_hint` 非空时表示调用方已持有 canonical spec 与
+    // 结构 key（图计划缓存算一次），跳过本函数的 canonicalize / expr_spec_key。
     [[nodiscard]] Result<void> run_graph_kernel_into_(const ExprSpec& raw_spec,
                                                       std::span<const Tensor> inputs,
                                                       std::size_t rows, std::size_t cols,
-                                                      bool vector_out, Tensor& out)
+                                                      bool vector_out, Tensor& out,
+                                                      const ExprSpec* canon_hint = nullptr,
+                                                      const std::string* key_hint = nullptr)
     {
         const bool is_fold = raw_spec.fold.has_value();
-        const ExprSpec spec = is_fold ? raw_spec : nn::canonicalize_expr_spec(raw_spec);
-        const std::string key = nn::expr_spec_key(spec);
+        // P4：命中 plan 缓存的 kernel 已带 canonical spec 与结构 key —— 直接复用，
+        // 不再每 dispatch 重复 canonicalize + expr_spec_key 字符串格式化。
+        std::optional<ExprSpec> canon_own;
+        const ExprSpec* spec_p = canon_hint;
+        if (spec_p == nullptr)
+        {
+            if (is_fold) spec_p = &raw_spec;
+            else
+            {
+                canon_own = nn::canonicalize_expr_spec(raw_spec);
+                spec_p = &*canon_own;
+            }
+        }
+        const ExprSpec& spec = *spec_p;
+        std::string key_own;
+        const std::string* key_p = key_hint;
+        if (key_p == nullptr)
+        {
+            key_own = nn::expr_spec_key(spec);
+            key_p = &key_own;
+        }
+        const std::string& key = *key_p;
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, out.precision());
         // ── psig≠0（任一 f16 参与）→ 边界 cast（F2 语义，有据设计）──────────
         // 输入抬 f32 → 递归走 V0（JIT 只现编 V0 f32 算术 kernel）→ cast_into
@@ -2719,7 +2786,8 @@ private:
             if (vector_out)
             {
                 auto tmp = create_tensor(out.rows(), out.cols(), Precision::F32);
-                auto r0 = run_graph_kernel_into_(raw_spec, *in32, rows, cols, vector_out, tmp);
+                auto r0 = run_graph_kernel_into_(raw_spec, *in32, rows, cols, vector_out, tmp,
+                                                 canon_hint, key_hint);
                 NN_TRY_CHECK(r0);
                 return cast_into(tmp, out);
             }

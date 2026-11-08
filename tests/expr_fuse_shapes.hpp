@@ -88,4 +88,17 @@ template <typename Eng>
 template <typename Eng> [[nodiscard]] auto adam_d_into(Eng& eng, Tensor& p, const Tensor& d)
 { return dsl::compute_into(eng, dsl::leaf(p) + dsl::leaf(d), p); }
 
+// ── 链 5（P10-② 归约头 + 广播应用）──────────────────────────────────────
+//   r = row_sum(x)（归约向量 (R,1)）；y = x − row_broadcast(r)·0.25
+//   录制图里是两个节点：归约边界 + 唯一消费者的广播应用。期望融合成单
+//   kernel（reduce shader 的 vector_out=0 广播路径，尾链读 s_red）。
+template <typename Eng>
+[[nodiscard]] auto rsum_a(Eng& eng, const Tensor& x, std::size_t R, std::size_t C)
+{ return dsl::compute_reduce(eng, dsl::row_reduce_sum(dsl::leaf(x)), R, C); }
+
+template <typename Eng>
+[[nodiscard]] auto rsum_b(Eng& eng, const Tensor& x, const Tensor& r, std::size_t R,
+                          std::size_t C)
+{ return dsl::compute(eng, dsl::leaf(x) - dsl::row_broadcast(r) * Scalar{0.25f}, R, C); }
+
 } // namespace nn::test_fuse
