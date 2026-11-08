@@ -1590,7 +1590,12 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         // + 每块 spart/smm 协作归约。尺寸/映射随 EXPR_FOLD_BLOCK 参数化：
         //   jm = tid & (BLOCK-1)、grp = tid >> log2(BLOCK)（组数 = 256/BLOCK）、
         //   d 步进 = 256/BLOCK。
-        L << "shared float Ash[" << FOLD_MAX_MMK << "];\n";
+        // #P9 窄变体：容量档按**本 spec 的运行时 mm_k** 选（≤64→256B /
+        //   ≤128→512B / ≤256→1KB / 否则基线 4KB）。键后缀 #m<cap> 由选路点
+        //   （compute_gpu_engine 的 fold JIT 入口）加；mm_k 本身仍走 PC →
+        //   同结构不同 d_k 在**同档内**共用 shader。基线档不产后缀 →
+        //   与历史 GLSL/key 逐字一致。
+        L << "shared float Ash[" << expr_spec_fold_mmk_cap(spec) << "];\n";
         L << "shared float spart[" << EXPR_FOLD_BLOCK << "][" << (256u / EXPR_FOLD_BLOCK) << "];\n";
         L << "shared float smm[" << EXPR_FOLD_BLOCK << "];\n";
     }
@@ -1792,17 +1797,63 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         L << "        barrier();   // smm 就绪（链/归约的 Matmul 操作数读它）\n";
     }
     std::vector<ExprInstr> chain;
-    const auto flush_chain = [&]()
+    // ── 链出口活跃性（#P3：死存储消除）──────────────────────────────────
+    // last_use[r] = 该元素寄存器在全函数里**最晚被读**的位置（f.body 指令
+    //   下标；kTailUse = 链后段/vecacc/finalize 的统一"尾部"位置）。
+    //   flush_chain 只在 last_use[r] ≥ 本链链尾下标时存回 sreg——链内写后
+    //   不再被任何后续段/归约读的中间值（掩码链典型 10 写 9 死）不再产生
+    //   shared 写流量。数值恒等：被删的槽在所有读点都已无人读，旧版也只是
+    //   写一次后从不被读。
+    // ⚠ vecacc.weight_reg / scale_reg **不在 f.body 里**（vecacc 段在块循环
+    //   后直接读 sreg[weight][j]）：漏计会把权重链的最后一次写判成死存储、
+    //   删掉存回 → vecacc 读到上块/未初始化槽 → **静默错值**。故二者按
+    //   kTailUse 计入。finalize 同口径（validate 保证它不读元素寄存器，仍
+    //   保守计入，防后续放开）。
+    const long long kTailUse = static_cast<long long>(f.body.size());
+    std::vector<long long> last_use(spec.num_regs, -1);
+    const auto note_use = [&](const ExprOperand& op, long long pos)
+    {
+        if (op.idx >= spec.num_regs || !is_elem[op.idx]) return;
+        const auto k = static_cast<ExprOperandKind>(op.kind);
+        if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout ||
+            k == ExprOperandKind::Reduce)
+        {
+            if (pos > last_use[op.idx]) last_use[op.idx] = pos;
+        }
+    };
+    for (std::size_t bi = 0; bi < f.body.size(); ++bi)
+    {
+        const ExprInstr& ins = f.body[bi];
+        const ExprOp op = static_cast<ExprOp>(ins.op);
+        const std::size_t nops = expr_op_is_reduce(op) ? 1 : expr_instr_num_operands(op);
+        const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+        for (std::size_t oi = 0; oi < nops; ++oi)
+            note_use(*ops[oi], static_cast<long long>(bi));
+    }
+    if (f.vecacc)
+    {
+        const VecAccSpec& va = *f.vecacc;
+        for (const std::uint8_t rr : {va.weight_reg, va.scale_reg})
+            if (rr < spec.num_regs && is_elem[rr]) last_use[rr] = kTailUse;
+    }
+    for (const auto& ins : f.finalize)
+    {
+        const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(ins.op));
+        const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+        for (std::size_t oi = 0; oi < nops; ++oi) note_use(*ops[oi], kTailUse);
+    }
+    const auto flush_chain = [&](std::size_t end_pos)
     {
         if (chain.empty()) return;
-        // 元素 j 循环：**按读集载入、按写集存回**（不再是全元素寄存器对称
+        // 元素 j 循环：**按读集载入、按活跃性存回**（不再是全元素寄存器对称
         //   round-trip）。动机：注意力 chain1 实测 9 次 sreg 载入全为死加载
         //   （全部覆写前载入 / 本段未用）、chain2 为 9 中 8 死——纯浪费
         //   shared 读吞吐与发射。语义不变：① 首次访问为读的元素寄存器照旧
-        //   载入（def-before-use 仍由 validate 静态拒）；② 链内被写的照旧
-        //   存回；③ 未触达的不声明也不碰 → 出口处 shared 状态与旧版逐位一致
-        //   （旧版"读到未初始化 shared 仅在 validate 漏网时发生"的情形现在
-        //    连读都不发生，两者随后都被覆盖，无行为差）。
+        //   载入（def-before-use 仍由 validate 静态拒）；② **链尾之后仍被读**
+        //   （last_use ≥ end_pos，含 vecacc/finalize 尾部）的才存回；③ 未
+        //   触达的不声明也不碰 → 出口处 shared 状态与旧版逐位一致（旧版
+        //   "读到未初始化 shared 仅在 validate 漏网时发生"的情形现在连读都
+        //   不发生，两者随后都被覆盖，无行为差）。
         //   操作数按 kind 收集：Reg/Fanout/Reduce 在 'E' 上下文渲染为 r{n}
         //   本地变量（其余渲染为 smm/视图/常量/网格/o[]，无需声明）；
         //   未用的 b/c 默认 (Reg,0) 而寄存器 0 恒为行标量态 → 不会误判元素。
@@ -1836,17 +1887,19 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
             L << emit_assign(ins, dst, 'E', "j");
         }
         for (std::uint32_t r = 0; r < spec.num_regs; ++r)
-            if (wr[r]) L << "          sreg[" << eidx[r] << "][j] = r" << r << ";\n";
+            if (wr[r] && last_use[r] >= static_cast<long long>(end_pos))
+                L << "          sreg[" << eidx[r] << "][j] = r" << r << ";\n";
         L << "        }\n";
         L << "        barrier();\n";
         chain.clear();
     };
-    for (const auto& ins : f.body)
+    for (std::size_t bi = 0; bi < f.body.size(); ++bi)
     {
+        const ExprInstr& ins = f.body[bi];
         const ExprOp op = static_cast<ExprOp>(ins.op);
         if (expr_op_is_reduce(op))
         {
-            flush_chain();
+            flush_chain(bi);
             const bool is_max = (op == ExprOp::RowMax || op == ExprOp::ColMax);
             const auto skind = static_cast<ExprOperandKind>(ins.a.kind);
             const bool elem_src =
@@ -1921,12 +1974,12 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
         }
         else
         {
-            flush_chain();
+            flush_chain(bi);
             // 标量行（每线程副本；源全行标量——validate 保证不读元素）
             L << emit_assign(ins, "r" + std::to_string(ins.dst), 'S', "j");
         }
     }
-    flush_chain();
+    flush_chain(f.body.size());
 
     // ── vecacc：O *= scale；O += Σ_j w(j)·b(j, d) ──
     // P2-2 双路径（vector_out 是 push constant → 运行期均匀分支；veclen 不进

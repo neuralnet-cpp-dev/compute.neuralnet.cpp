@@ -976,6 +976,43 @@ inline constexpr std::size_t FOLD_MAX_STATE = 8;
 inline constexpr std::size_t FOLD_MAX_VEC = 1024; // 行向量态长度上限（=输出列数）
 inline constexpr std::uint32_t FOLD_MAX_MMK = 1024; // fold mm 段内层 k 上限
 // （A 操作数行预载 shared Ash[1024] 的编译期尺寸——d_k 超限在 validate 静态拒）
+// ── fold mm 段 Ash 容量档（#P9 窄变体）───────────────────────────────────
+// mm_k 是**形状参数**（push constant，结构 key 不含它，见 MatmulSpec 注释），
+// 但 A 操作数预载 shared 的容量必须是编译期常量：恒 1024 档 = 4KB，典型
+// d_k（64/128/256）只需 0.25~1KB。按运行期 mm_k 落档选生成宽度，做法与
+// scan_prefix 的 d32 变体同一套——**选路点按运行期形状选变体身份**，形状值
+// 本身仍走 push constant；变体身份以键后缀 `#m<cap>` 进入 JIT 缓存/pipeline
+// 名（1024 档无后缀，与历史 key/缓存逐字一致）。
+inline constexpr std::uint32_t FOLD_MMK_CAP_SMALL = 64;
+inline constexpr std::uint32_t FOLD_MMK_CAP_MID = 128;
+inline constexpr std::uint32_t FOLD_MMK_CAP_LARGE = 256;
+
+// mm_k → 最小可容纳的容量档（>256 落基线 1024；validate 已静态拒 >1024）
+[[nodiscard]] inline constexpr std::uint32_t fold_mmk_cap_for(std::uint32_t mm_k) noexcept
+{
+    if (mm_k <= FOLD_MMK_CAP_SMALL) return FOLD_MMK_CAP_SMALL;
+    if (mm_k <= FOLD_MMK_CAP_MID) return FOLD_MMK_CAP_MID;
+    if (mm_k <= FOLD_MMK_CAP_LARGE) return FOLD_MMK_CAP_LARGE;
+    return FOLD_MAX_MMK;
+}
+
+// 该 spec 的 fold Ash 容量档（非 fold / 无 mm 段 → 不产 Ash，返回基线值）
+[[nodiscard]] inline std::uint32_t expr_spec_fold_mmk_cap(const ExprSpec& s) noexcept
+{
+    if (!s.fold || !s.fold->matmul) return FOLD_MAX_MMK;
+    return fold_mmk_cap_for(s.fold->matmul->k);
+}
+
+// fold 窄变体键：加 `#m<cap>` 后缀（基线 1024 不加，保持历史键/缓存逐字
+// 一致）。仅 fold 且带 mm 段（有 Ash 预载）才分档；其余 spec 原样返回。
+[[nodiscard]] inline std::string expr_spec_fold_variant_key(const ExprSpec& s,
+                                                            const std::string& base)
+{
+    if (!s.fold || !s.fold->matmul) return base;
+    const std::uint32_t cap = fold_mmk_cap_for(s.fold->matmul->k);
+    if (cap == FOLD_MAX_MMK) return base;
+    return base + "#m" + std::to_string(cap);
+}
 // fold 块大小：CPU 执行器与 GPU 生成器**共用**的常量（不进 key——分块是
 // 实现细节，但两侧必须同值以对齐分块边界与 max 类逐位；sum 类 GPU subgroup
 // 蝶形结合序异于 CPU 串行 → 对拍仍走小容差（1e-4~1e-6），并非全逐位）。

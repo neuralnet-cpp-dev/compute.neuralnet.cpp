@@ -1775,17 +1775,21 @@ public:
                                           std::span<const Tensor> inputs, std::size_t rows,
                                           std::size_t cols, Precision P)
     {
-        auto spv_r = jit_compile_(key, spec, /*prec_sig=*/0);
+        // #P9 选路点：fold mm 段按运行期 mm_k 选 Ash 容量档（与 scan_prefix
+        //   的 d32 变体同套——形状值仍走 PC，变体身份进 JIT 缓存/pipeline
+        //   名）。1024 档无后缀 → 非 fold / 大 d_k 的键与历史逐字一致。
+        const std::string vkey = nn::expr_spec_fold_variant_key(spec, key);
+        auto spv_r = jit_compile_(vkey, spec, /*prec_sig=*/0);
         NN_TRY_CHECK(spv_r);
         auto fi_r = fused_buffers_(inputs);
         NN_TRY_CHECK(fi_r);
         std::vector<const GpuBuffer*>& gpu_inputs = fi_r->bufs;
         const nn::FusedKernelMeta meta = nn::fused_kernel_meta_of(spec);
         // 后端懒建 pipeline（幂等；设备能力不足 → 报错，绝无静默回退）
-        NN_TRY_CHECK(backend_->ensure_fused_kernel(key, *spv_r, meta, spec));
+        NN_TRY_CHECK(backend_->ensure_fused_kernel(vkey, *spv_r, meta, spec));
         const auto vp = nn::expr_spec_runtime_view_params(spec);
         auto out = backend_->run_fused_gpu(
-            key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/false, vp, spec.rparams,
+            vkey, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/false, vp, spec.rparams,
             /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
             nn::expr_spec_runtime_matmul_batch(spec), nn::expr_spec_runtime_matmul_trans(spec),
             nn::expr_spec_runtime_fold_k(spec), /*out_f16=*/false, /*prec_sig=*/0);
@@ -2775,9 +2779,12 @@ private:
         // 直接命中、无需边界 cast。管线名 = .nnk 缓存键（含签名后缀），
         // 与 V0 管线（纯 key）互不冲突。strict 语义在 jit_compile_ 内生效（D6）。
         {
-            auto spv_r = jit_compile_(key, spec, psig);
+            // #P9 选路点（同 jit_run_）：fold mm 段按运行期 mm_k 选 Ash 容量档，
+            //   变体身份 = 键后缀 #m<cap>，同时进 .nnk 缓存键与 pipeline 名。
+            const std::string vkey = nn::expr_spec_fold_variant_key(spec, key);
+            auto spv_r = jit_compile_(vkey, spec, psig);
             NN_TRY_CHECK(spv_r);
-            const std::string pname = nn::fused::kernel_cache_key(key, psig);
+            const std::string pname = nn::fused::kernel_cache_key(vkey, psig);
             auto fi_r = fused_buffers_(inputs);
             NN_TRY_CHECK(fi_r);
             auto out_gpu = import(out);
