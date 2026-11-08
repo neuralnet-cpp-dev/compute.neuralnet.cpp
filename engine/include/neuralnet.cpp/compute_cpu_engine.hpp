@@ -2116,167 +2116,204 @@ public:
             return spans[k][r * K + gk];
         };
 
-        std::vector<Scalar> reg(spec.num_regs, Scalar{0}); // 状态 + 标量类临时
-        std::vector<std::vector<Scalar>> elem(spec.num_regs); // 元素类临时（BLOCK 槽）
-        for (std::uint32_t r = 0; r < spec.num_regs; ++r)
-            if (is_elem[r]) elem[r].resize(EXPR_FOLD_BLOCK);
-        std::vector<Scalar> red(spec.num_regs, Scalar{0}); // 块归约 dst（行标量）
-        std::vector<Scalar> vecd(f.vec_state_len, Scalar{0}); // 行向量态（累加初值 0）
-        std::size_t cur_d = 0; // 向量域当前输出列（eval_op 的 VecState 读）
-
-        // fold matmul 段：网格 (row, gk) 上 C = Σ_d opA·opB（惰性求值——
-        //   CPU 正确性基准不追性能；GPU 侧由生成器块内预计算 tile）。
-        //   索引与既有 MatmulSpec / gen_reduce 的 mm 公式逐字一致。
-        const auto mm_at = [&](std::size_t r, std::size_t gk) -> Scalar
-        {
-            if (!fmm) return Scalar{0};
-            const std::size_t mm_k = fmm->k;
-            const std::size_t b = static_cast<std::size_t>(r / m_per);
-            const std::size_t row_in = r - b * m_per;
-            // GQA：A/B 侧行块号按各自视图的头分组比取（HeadGroup 视图才有）
-            const std::size_t bA = b / gqa_ratio_of(spec, fmm->a_input);
-            const std::size_t bB = b / gqa_ratio_of(spec, fmm->b_input);
-            const ConstSpan& as = spans[fmm->a_input];
-            const ConstSpan& bs = spans[fmm->b_input];
-            Scalar acc = 0;
-            for (std::size_t d = 0; d < mm_k; ++d)
-            {
-                const Scalar av = fmm->transA ? as[(bA * mm_k + d) * m_per + row_in]
-                                              : as[(bA * m_per + row_in) * mm_k + d];
-                const Scalar bv =
-                    fmm->transB ? bs[(bB * K + gk) * mm_k + d] : bs[(bB * mm_k + d) * K + gk];
-                acc += av * bv;
-            }
-            return acc;
-        };
-
-        // 操作数求值：kb = 块内下标（元素类临时槽），gk = 全局列（Input/Col 读）
-        const auto eval_op = [&](const ExprOperand& op, std::size_t r, std::size_t kb,
-                                 std::size_t gk) -> Scalar
-        {
-            switch (op.kind)
-            {
-            default:
-            case static_cast<uint8_t>(ExprOperandKind::Reg):
-            case static_cast<uint8_t>(ExprOperandKind::Fanout):
-                return is_elem[op.idx] ? elem[op.idx][kb] : reg[op.idx];
-            case static_cast<uint8_t>(ExprOperandKind::Const):
-                return spec.consts[op.idx];
-            case static_cast<uint8_t>(ExprOperandKind::RParam):
-                return spec.rparams[op.idx];
-            case static_cast<uint8_t>(ExprOperandKind::Reduce):
-                return red[op.idx];
-            case static_cast<uint8_t>(ExprOperandKind::Input):
-                return view_read(op.idx, r, gk);
-            case static_cast<uint8_t>(ExprOperandKind::Matmul):
-                return mm_at(r, gk);
-            case static_cast<uint8_t>(ExprOperandKind::Row):
-                return fmm ? static_cast<Scalar>(r % m_per) : Scalar{0};
-            case static_cast<uint8_t>(ExprOperandKind::Col):
-                return static_cast<Scalar>(gk);
-            case static_cast<uint8_t>(ExprOperandKind::Batch):
-                return fmm ? static_cast<Scalar>(r / m_per) : Scalar{0};
-            case static_cast<uint8_t>(ExprOperandKind::VecState):
-                // 单槽语义（validate 保证 idx==0）：按向量域当前输出列读
-                return (cur_d < vecd.size()) ? vecd[cur_d] : Scalar{0};
-            }
-        };
-        // 非归约指令求值（标量语义唯一来源 = expr_op_table 的 CPU 函数指针对；
-        //  va 已取自 a、vb 取自 b；Select 由 eval_full 单独处理，归约不进本函数）
-        const auto exec_alu = [](ExprOp op, Scalar va, Scalar vb) -> Scalar
-        { return detail::expr_alu_scalar(op, va, vb, Scalar{0}); };
-        // Select：三元（fold body 允许，validate 未禁——按主链语义）
-        const auto eval_full = [&](const ExprInstr& ins, std::size_t r, std::size_t kb,
-                                   std::size_t gk) -> Scalar
-        {
-            const ExprOp op = static_cast<ExprOp>(ins.op);
-            const Scalar va = eval_op(ins.a, r, kb, gk);
-            if (op == ExprOp::Select)
-            {
-                const Scalar vt = eval_op(ins.b, r, kb, gk);
-                const Scalar ve = eval_op(ins.c, r, kb, gk);
-                return (va != Scalar{0}) ? vt : ve;
-            }
-            const std::size_t nops = expr_instr_num_operands(op);
-            const Scalar vb = (nops >= 2) ? eval_op(ins.b, r, kb, gk) : Scalar{0};
-            return exec_alu(op, va, vb);
-        };
-
         Span out = output.cpu_matrix().span();
-        for (std::size_t r = 0; r < rows; ++r)
+        // 行间完全独立（状态 / 元素临时 / 归约槽 / 行向量态都在行首复位），
+        // 逐位一致 ⇒ 行是天然的并行单元。按行段分片、每片自建 scratch，
+        // 分片边界只由 rows/n_chunks 决定（与调度无关）；门控按 rows*K
+        // （fold body 每元素含多条指令，比裸逐元素重一个量级）。
+        constexpr std::size_t kFoldParallelMinWork = 65536;
+        constexpr std::size_t kFoldRowsPerChunk = 8;
+        std::size_t n_chunks = 1;
+        if (rows >= 2 && K > 0 && rows * K >= kFoldParallelMinWork)
         {
-            // 状态初值 + 临时/归约槽/行向量态复位（每行独立——vecd 等槽若跨行
-            //   残留会累积，err 随行数滚雪球）
-            for (std::uint8_t s = 0; s < f.num_state; ++s)
-                reg[s] = f.inits[s];
-            for (std::size_t d = 0; d < spec.num_regs; ++d)
-                red[d] = Scalar{0};
-            for (std::size_t d = 0; d < vecd.size(); ++d)
-                vecd[d] = Scalar{0};
+            n_chunks = std::min(nn::global_thread_pool().size(), rows / kFoldRowsPerChunk);
+            if (n_chunks < 1) n_chunks = 1;
+        }
+        const auto run_rows = [&](std::size_t r_begin, std::size_t r_end)
+        {
+            std::vector<Scalar> reg(spec.num_regs, Scalar{0}); // 状态 + 标量类临时
+            std::vector<std::vector<Scalar>> elem(spec.num_regs); // 元素类临时（BLOCK 槽）
+            for (std::uint32_t r = 0; r < spec.num_regs; ++r)
+                if (is_elem[r]) elem[r].resize(EXPR_FOLD_BLOCK);
+            std::vector<Scalar> red(spec.num_regs, Scalar{0}); // 块归约 dst（行标量）
+            std::vector<Scalar> vecd(f.vec_state_len, Scalar{0}); // 行向量态（累加初值 0）
+            std::size_t cur_d = 0; // 向量域当前输出列（eval_op 的 VecState 读）
 
-            // 块循环（键域）
-            for (std::size_t k0 = 0; k0 < K; k0 += EXPR_FOLD_BLOCK)
+            // fold matmul 段：网格 (row, gk) 上 C = Σ_d opA·opB（惰性求值——
+            //   CPU 正确性基准不追性能；GPU 侧由生成器块内预计算 tile）。
+            //   索引与既有 MatmulSpec / gen_reduce 的 mm 公式逐字一致。
+            const auto mm_at = [&](std::size_t r, std::size_t gk) -> Scalar
             {
-                const std::size_t valid = std::min<std::size_t>(EXPR_FOLD_BLOCK, K - k0);
-                for (const auto& ins : f.body)
+                if (!fmm) return Scalar{0};
+                const std::size_t mm_k = fmm->k;
+                const std::size_t b = static_cast<std::size_t>(r / m_per);
+                const std::size_t row_in = r - b * m_per;
+                // GQA：A/B 侧行块号按各自视图的头分组比取（HeadGroup 视图才有）
+                const std::size_t bA = b / gqa_ratio_of(spec, fmm->a_input);
+                const std::size_t bB = b / gqa_ratio_of(spec, fmm->b_input);
+                const ConstSpan& as = spans[fmm->a_input];
+                const ConstSpan& bs = spans[fmm->b_input];
+                Scalar acc = 0;
+                for (std::size_t d = 0; d < mm_k; ++d)
                 {
-                    const ExprOp op = static_cast<ExprOp>(ins.op);
-                    if (expr_op_is_reduce(op))
+                    const Scalar av = fmm->transA ? as[(bA * mm_k + d) * m_per + row_in]
+                                                  : as[(bA * m_per + row_in) * mm_k + d];
+                    const Scalar bv =
+                        fmm->transB ? bs[(bB * K + gk) * mm_k + d] : bs[(bB * mm_k + d) * K + gk];
+                    acc += av * bv;
+                }
+                return acc;
+            };
+
+            // 操作数求值：kb = 块内下标（元素类临时槽），gk = 全局列（Input/Col 读）
+            const auto eval_op = [&](const ExprOperand& op, std::size_t r, std::size_t kb,
+                                     std::size_t gk) -> Scalar
+            {
+                switch (op.kind)
+                {
+                default:
+                case static_cast<uint8_t>(ExprOperandKind::Reg):
+                case static_cast<uint8_t>(ExprOperandKind::Fanout):
+                    return is_elem[op.idx] ? elem[op.idx][kb] : reg[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::Const):
+                    return spec.consts[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::RParam):
+                    return spec.rparams[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::Reduce):
+                    return red[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::Input):
+                    return view_read(op.idx, r, gk);
+                case static_cast<uint8_t>(ExprOperandKind::Matmul):
+                    return mm_at(r, gk);
+                case static_cast<uint8_t>(ExprOperandKind::Row):
+                    return fmm ? static_cast<Scalar>(r % m_per) : Scalar{0};
+                case static_cast<uint8_t>(ExprOperandKind::Col):
+                    return static_cast<Scalar>(gk);
+                case static_cast<uint8_t>(ExprOperandKind::Batch):
+                    return fmm ? static_cast<Scalar>(r / m_per) : Scalar{0};
+                case static_cast<uint8_t>(ExprOperandKind::VecState):
+                    // 单槽语义（validate 保证 idx==0）：按向量域当前输出列读
+                    return (cur_d < vecd.size()) ? vecd[cur_d] : Scalar{0};
+                }
+            };
+            // 非归约指令求值（标量语义唯一来源 = expr_op_table 的 CPU 函数指针对；
+            //  va 已取自 a、vb 取自 b；Select 由 eval_full 单独处理，归约不进本函数）
+            const auto exec_alu = [](ExprOp op, Scalar va, Scalar vb) -> Scalar
+            { return detail::expr_alu_scalar(op, va, vb, Scalar{0}); };
+            // Select：三元（fold body 允许，validate 未禁——按主链语义）
+            const auto eval_full = [&](const ExprInstr& ins, std::size_t r, std::size_t kb,
+                                       std::size_t gk) -> Scalar
+            {
+                const ExprOp op = static_cast<ExprOp>(ins.op);
+                const Scalar va = eval_op(ins.a, r, kb, gk);
+                if (op == ExprOp::Select)
+                {
+                    const Scalar vt = eval_op(ins.b, r, kb, gk);
+                    const Scalar ve = eval_op(ins.c, r, kb, gk);
+                    return (va != Scalar{0}) ? vt : ve;
+                }
+                const std::size_t nops = expr_instr_num_operands(op);
+                const Scalar vb = (nops >= 2) ? eval_op(ins.b, r, kb, gk) : Scalar{0};
+                return exec_alu(op, va, vb);
+            };
+
+            for (std::size_t r = r_begin; r < r_end; ++r)
+            {
+                // 状态初值 + 临时/归约槽/行向量态复位（每行独立——vecd 等槽若跨行
+                //   残留会累积，err 随行数滚雪球）
+                for (std::uint8_t s = 0; s < f.num_state; ++s)
+                    reg[s] = f.inits[s];
+                for (std::size_t d = 0; d < spec.num_regs; ++d)
+                    red[d] = Scalar{0};
+                for (std::size_t d = 0; d < vecd.size(); ++d)
+                    vecd[d] = Scalar{0};
+
+                // 块循环（键域）
+                for (std::size_t k0 = 0; k0 < K; k0 += EXPR_FOLD_BLOCK)
+                {
+                    const std::size_t valid = std::min<std::size_t>(EXPR_FOLD_BLOCK, K - k0);
+                    for (const auto& ins : f.body)
                     {
-                        const bool is_max = (op == ExprOp::RowMax || op == ExprOp::ColMax);
-                        Scalar acc = is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+                        const ExprOp op = static_cast<ExprOp>(ins.op);
+                        if (expr_op_is_reduce(op))
+                        {
+                            const bool is_max = (op == ExprOp::RowMax || op == ExprOp::ColMax);
+                            Scalar acc = is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+                            for (std::size_t kb = 0; kb < valid; ++kb)
+                            {
+                                const Scalar v = eval_op(ins.a, r, kb, k0 + kb);
+                                acc = is_max ? std::fmax(acc, v) : (acc + v);
+                            }
+                            red[ins.dst] = acc;
+                        }
+                        else if (!is_elem[ins.dst])
+                        {
+                            // 标量/状态指令：源全行标量（validate 保证）→ 每块一次
+                            reg[ins.dst] = eval_full(ins, r, 0, 0);
+                        }
+                        else
+                        {
+                            for (std::size_t kb = 0; kb < valid; ++kb)
+                                elem[ins.dst][kb] = eval_full(ins, r, kb, k0 + kb);
+                        }
+                    }
+                    // vecacc（块尾）：行向量态 rescale + 双线性块累加
+                    //   vec[d] *= scale（行标量广播）；vec[d] += Σ_j w(row,j)·b(j,d)
+                    if (f.vecacc)
+                    {
+                        const VecAccSpec& va = *f.vecacc;
+                        const Scalar sc = va.has_scale ? reg[va.scale_reg] : Scalar{1};
+                        if (va.has_scale)
+                            for (std::size_t d = 0; d < f.vec_state_len; ++d)
+                                vecd[d] *= sc;
+                        const ConstSpan& bs = spans[va.b_input];
+                        // GQA：V_t 的行块号按其视图的头分组比取
+                        const std::size_t b_of_row =
+                            fmm ? (static_cast<std::size_t>(r / m_per) /
+                                   gqa_ratio_of(spec, va.b_input))
+                                : 0;
                         for (std::size_t kb = 0; kb < valid; ++kb)
                         {
-                            const Scalar v = eval_op(ins.a, r, kb, k0 + kb);
-                            acc = is_max ? std::fmax(acc, v) : (acc + v);
+                            const Scalar w = is_elem[va.weight_reg] ? elem[va.weight_reg][kb]
+                                                                   : reg[va.weight_reg];
+                            const std::size_t jr = b_of_row * K + (k0 + kb); // 全局键行
+                            for (std::size_t d = 0; d < f.vec_state_len; ++d)
+                                vecd[d] += w * bs[jr * f.vec_state_len + d];
                         }
-                        red[ins.dst] = acc;
-                    }
-                    else if (!is_elem[ins.dst])
-                    {
-                        // 标量/状态指令：源全行标量（validate 保证）→ 每块一次
-                        reg[ins.dst] = eval_full(ins, r, 0, 0);
-                    }
-                    else
-                    {
-                        for (std::size_t kb = 0; kb < valid; ++kb)
-                            elem[ins.dst][kb] = eval_full(ins, r, kb, k0 + kb);
                     }
                 }
-                // vecacc（块尾）：行向量态 rescale + 双线性块累加
-                //   vec[d] *= scale（行标量广播）；vec[d] += Σ_j w(row,j)·b(j,d)
-                if (f.vecacc)
-                {
-                    const VecAccSpec& va = *f.vecacc;
-                    const Scalar sc = va.has_scale ? reg[va.scale_reg] : Scalar{1};
-                    if (va.has_scale)
-                        for (std::size_t d = 0; d < f.vec_state_len; ++d)
-                            vecd[d] *= sc;
-                    const ConstSpan& bs = spans[va.b_input];
-                    // GQA：V_t 的行块号按其视图的头分组比取
-                    const std::size_t b_of_row =
-                        fmm ? (static_cast<std::size_t>(r / m_per) / gqa_ratio_of(spec, va.b_input))
-                            : 0;
-                    for (std::size_t kb = 0; kb < valid; ++kb)
-                    {
-                        const Scalar w =
-                            is_elem[va.weight_reg] ? elem[va.weight_reg][kb] : reg[va.weight_reg];
-                        const std::size_t jr = b_of_row * K + (k0 + kb); // 全局键行
-                        for (std::size_t d = 0; d < f.vec_state_len; ++d)
-                            vecd[d] += w * bs[jr * f.vec_state_len + d];
-                    }
-                }
-            }
 
-            // finalize（向量域）：逐输出列求值（cur_d 驱动 VecState 读），
-            //   out_cols=1（标量 fold）时退化为原单列行为
-            for (std::size_t d = 0; d < out_cols; ++d)
-            {
-                cur_d = d;
-                for (const auto& ins : f.finalize)
-                    reg[ins.dst] = eval_full(ins, r, 0, 0);
-                out[r * out_cols + d] = reg[f.finalize.back().dst];
+                // finalize（向量域）：逐输出列求值（cur_d 驱动 VecState 读），
+                //   out_cols=1（标量 fold）时退化为原单列行为
+                for (std::size_t d = 0; d < out_cols; ++d)
+                {
+                    cur_d = d;
+                    for (const auto& ins : f.finalize)
+                        reg[ins.dst] = eval_full(ins, r, 0, 0);
+                    out[r * out_cols + d] = reg[f.finalize.back().dst];
+                }
             }
+        };
+        if (n_chunks <= 1)
+        {
+            run_rows(0, rows);
+        }
+        else
+        {
+            using RowRange = std::pair<std::size_t, std::size_t>;
+            std::vector<RowRange> ranges;
+            ranges.reserve(n_chunks);
+            const std::size_t base = rows / n_chunks;
+            const std::size_t rem = rows % n_chunks;
+            std::size_t off = 0;
+            for (std::size_t c = 0; c < n_chunks; ++c)
+            {
+                const std::size_t len = base + (c < rem ? 1 : 0);
+                ranges.emplace_back(off, off + len);
+                off += len;
+            }
+            nn::parallel_for_blocks(ranges.begin(), ranges.end(),
+                                    [&](const RowRange& rg) { run_rows(rg.first, rg.second); });
         }
         return {};
     }
