@@ -421,7 +421,9 @@ public:
         if (N < MK_RB)
         {
             const std::size_t nb = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            nn::parallel_for_samples(nb,
+            // 工作量门控：每样本一块 64 行 × N 列 × K 次乘加。窄 N 下这块
+            // 工作量常低于并行区固定开销，样本数不能单独作为并行依据。
+            nn::parallel_for_samples(nb, BLOCK_SIZE * N * K,
                                      [a, b, r, M, N, K, b_cols](std::size_t ib) noexcept
                                      {
                                          const std::size_t i0 = ib * BLOCK_SIZE;
@@ -518,7 +520,8 @@ public:
         if (N < MK_RB)
         {
             const std::size_t nb = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            nn::parallel_for_samples(nb,
+            // 工作量门控口径同上：每样本 64 行 × N 列 × K 次乘加
+            nn::parallel_for_samples(nb, BLOCK_SIZE * N * K,
                                      [a, bt, r, M, N, K](std::size_t ib) noexcept
                                      {
                                          const std::size_t i0 = ib * BLOCK_SIZE;
@@ -610,7 +613,8 @@ public:
         if (N < MK_RB)
         {
             const std::size_t nb = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            nn::parallel_for_samples(nb,
+            // 工作量门控口径同上：每样本 64 行 × N 列 × K 次乘加
+            nn::parallel_for_samples(nb, BLOCK_SIZE * N * K,
                                      [a, b, r, M, N, K, a_cols, b_cols](std::size_t ib) noexcept
                                      {
                                          const std::size_t i0 = ib * BLOCK_SIZE;

@@ -124,7 +124,30 @@ template <typename Iterator, typename Func>
 inline void parallel_for_blocks(Iterator first, Iterator last, Func&& func)
 { global_thread_pool().parallel_for_blocks(first, last, std::forward<Func>(func)); }
 
-// parallel_for_samples（样本级并行）
+// ── parallel_for_samples（样本级并行）────────────────────────────────────
+// 样本是"完整子任务"（一次前向/整段编码），每样本工作量未知，故提供两个口径：
+//   · 带 work_per_sample 的版本：total_work = num_samples × work_per_sample
+//     （单位 = 等效标量元素数）低于 PARALLEL_THRESHOLD 即串行回落，
+//     与 for_each / transform 的门控口径一致。
+//   · 不带工作量估算的版本：由调用方保证每样本为重量级任务（如整段文本
+//     编码、一次前向），仅在样本数 ≤ 1 时串行。
+// 动机（#P12）：小算子密集路径（窄 N GEMV 等）每"样本"只有一块 64×K
+// 乘加，仅按样本数进池会让 2–8 片的小并行区反复唤醒 worker；实测
+// p50 数百 µs、p99 毫秒级（计算本身仅十几 µs）→ 毫秒级抖动。
+template <typename Func>
+inline void parallel_for_samples(std::size_t num_samples, std::size_t work_per_sample,
+                                 Func&& func)
+{
+    // 串行回落：用 (THRESHOLD-1) 整除比较，避免 num_samples × work_per_sample 溢出
+    if (num_samples <= 1 || work_per_sample <= (PARALLEL_THRESHOLD - 1) / num_samples)
+    {
+        for (std::size_t i = 0; i < num_samples; ++i)
+            func(i);
+        return;
+    }
+    global_thread_pool().parallel_for_samples(num_samples, std::forward<Func>(func));
+}
+
 template <typename Func> inline void parallel_for_samples(std::size_t num_samples, Func&& func)
 {
     if (num_samples <= 1)

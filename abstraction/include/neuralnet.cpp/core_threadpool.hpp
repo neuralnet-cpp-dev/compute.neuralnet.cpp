@@ -1,13 +1,15 @@
 #pragma once
 
 #include <vector>
-#include <queue>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <functional>
 #include <future>
 #include <atomic>
+#include <cstddef>    // for std::max_align_t
+#include <new>        // for placement new（任务就地构造）
+#include <utility>    // for std::move / std::forward
 #include <algorithm>  // for std::transform (serial fallback)
 #include <numeric>    // for std::transform_reduce (serial fallback)
 #include <iterator>   // for std::distance
@@ -25,14 +27,152 @@
 
 namespace nn
 {
+namespace detail
+{
+// ── 轻量任务对象：类型擦除可调用体，捕获体就地存放（#P12）──────────────
+// 动机：std::function 的小对象缓冲约 16 字节，而分块 lambda 的捕获
+// （this + 迭代器 + &func + &latch …）普遍 40–64 字节 → **每个分块**
+// 一次堆分配。这里把捕获体直接放进任务对象（96 字节行内存储），
+// 只有超出行内容量/对齐的罕见捕获才退化为一次堆分配。
+// 语义与 std::function<void()> 等价：拷贝语义不开放（队列只用移动）。
+class PoolTask
+{
+public:
+    static constexpr std::size_t kInlineCapacity = 96;
+
+    PoolTask() noexcept = default;
+    ~PoolTask() { reset(); }
+
+    PoolTask(const PoolTask&) = delete;
+    PoolTask& operator=(const PoolTask&) = delete;
+
+    PoolTask(PoolTask&& other) noexcept { adopt(other); }
+    PoolTask& operator=(PoolTask&& other) noexcept
+    {
+        if (this != &other)
+        {
+            reset();
+            adopt(other);
+        }
+        return *this;
+    }
+
+    // 非 explicit：供 vector::emplace_back(lambda) 就地构造（零移动）
+    template <typename F,
+              typename = std::enable_if_t<!std::is_same_v<std::remove_cvref_t<F>, PoolTask>>>
+    PoolTask(F&& f)
+    {
+        using Fn = std::remove_cvref_t<F>;
+        static_assert(std::is_invocable_v<Fn&>, "ThreadPool 任务必须是可无参调用的对象");
+        invoke_ = &invoke_impl<Fn>;
+        if constexpr (sizeof(Fn) <= kInlineCapacity && alignof(Fn) <= alignof(std::max_align_t))
+        {
+            ::new (static_cast<void*>(storage_)) Fn(std::forward<F>(f));
+            ctx_ = storage_;
+            destroy_ = &destroy_impl<Fn>;
+            relocate_ = &relocate_impl<Fn>;
+        }
+        else
+        {
+            ctx_ = static_cast<void*>(new Fn(std::forward<F>(f)));
+            destroy_ = &delete_impl<Fn>;  // 堆回退：析构即 delete
+        }
+    }
+
+    void operator()() { invoke_(ctx_); }
+    explicit operator bool() const noexcept { return invoke_ != nullptr; }
+
+private:
+    template <typename Fn> static void invoke_impl(void* p) { (*static_cast<Fn*>(p))(); }
+    template <typename Fn> static void destroy_impl(void* p) { static_cast<Fn*>(p)->~Fn(); }
+    template <typename Fn> static void delete_impl(void* p) { delete static_cast<Fn*>(p); }
+    template <typename Fn> static void relocate_impl(void* dst, void* src)
+    {
+        Fn* from = static_cast<Fn*>(src);
+        ::new (dst) Fn(std::move(*from));
+        from->~Fn();
+    }
+
+    void reset() noexcept
+    {
+        if (destroy_ != nullptr) destroy_(ctx_);
+        invoke_ = nullptr;
+        destroy_ = nullptr;
+        relocate_ = nullptr;
+        ctx_ = nullptr;
+    }
+
+    void adopt(PoolTask& other) noexcept
+    {
+        invoke_ = other.invoke_;
+        destroy_ = other.destroy_;
+        relocate_ = other.relocate_;
+        if (other.ctx_ == other.storage_)  // 行内捕获体：搬移构造后析构源
+        {
+            relocate_(storage_, other.storage_);
+            ctx_ = storage_;
+        }
+        else
+        {
+            ctx_ = other.ctx_;  // 堆捕获体：转移所有权
+        }
+        other.invoke_ = nullptr;
+        other.destroy_ = nullptr;
+        other.relocate_ = nullptr;
+        other.ctx_ = nullptr;
+    }
+
+    alignas(std::max_align_t) unsigned char storage_[kInlineCapacity];
+    void* ctx_ = nullptr;
+    void (*invoke_)(void*) = nullptr;
+    void (*destroy_)(void*) = nullptr;
+    void (*relocate_)(void*, void*) = nullptr;  // 仅行内路径需要
+};
+}  // namespace detail
+
 // ── 简易线程池（latch 零分配设计）──────────────────────────────────────
 // 提交模型：1 次批量入队 + 1 个原子计数器 + 调用者参与处理，
 //   每分块零次 shared_ptr<packaged_task> 堆分配、零次 future 同步开销。
+//   任务用 detail::PoolTask（捕获体就地存放）+ 环形队列（见下方队列注释），
+//   每分块入队/出队不产生堆分配。
 class ThreadPool
 {
 private:
     std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
+
+    // ── 任务队列：环形数组（摊还分配，稳态零分配）──────────────────
+    // 不用 std::queue：MSVC STL 的 deque 对 >8 字节元素是 1 元素/块——
+    // 每次 push 仍是一块堆分配。这里用容量按 2 倍增长的 vector + 队首
+    // 下标（消费过半即就地压缩），扩容摊还 O(1)。
+    std::vector<detail::PoolTask> tasks_;
+    std::size_t queue_head_ = 0;  // 队首下标（其前的槽均已消费）
+
+    // ── 队列基本操作（调用方必须已持 queue_mutex_）──────────────────
+    [[nodiscard]] bool queue_empty_() const noexcept
+    { return queue_head_ >= tasks_.size(); }
+
+    // 出队一个任务。前提：持锁且 !queue_empty_()。
+    // 返回值持有捕获体（行内或堆），执行完由 PoolTask 析构回收。
+    [[nodiscard]] detail::PoolTask pop_task_()
+    {
+        detail::PoolTask task = std::move(tasks_[queue_head_]);
+        ++queue_head_;
+        if (queue_head_ == tasks_.size())
+        {
+            tasks_.clear();
+            queue_head_ = 0;
+        }
+        else if (queue_head_ >= 64 && queue_head_ * 2 >= tasks_.size())
+        {
+            // 就地压缩：存活任务搬到前部（move 赋值，堆捕获体也随之转移）
+            const std::size_t live = tasks_.size() - queue_head_;
+            std::move(tasks_.begin() + static_cast<std::ptrdiff_t>(queue_head_), tasks_.end(),
+                      tasks_.begin());
+            tasks_.resize(live);
+            queue_head_ = 0;
+        }
+        return task;
+    }
 
     std::mutex queue_mutex_;
     std::condition_variable condition_;
@@ -56,18 +196,17 @@ public:
                     tl_worker_index = i;
                     for (;;)
                     {
-                        std::function<void()> task;
+                        detail::PoolTask task;
                         {
                             std::unique_lock lock(queue_mutex_);
                             condition_.wait(lock,
                                             [this]
                                             {
                                                 return stop_.load(std::memory_order_acquire) ||
-                                                       !tasks_.empty();
+                                                       !queue_empty_();
                                             });
-                            if (stop_.load(std::memory_order_acquire) && tasks_.empty()) return;
-                            task = std::move(tasks_.front());
-                            tasks_.pop();
+                            if (stop_.load(std::memory_order_acquire) && queue_empty_()) return;
+                            task = pop_task_();
                         }
                         task();
                     }
@@ -139,14 +278,10 @@ private:
         // 阶段 2：work-stealing + cv 等待
         while (latch.load(std::memory_order_acquire) > 0)
         {
-            std::function<void()> task;
+            detail::PoolTask task;
             {
                 std::unique_lock lock(queue_mutex_);
-                if (!tasks_.empty())
-                {
-                    task = std::move(tasks_.front());
-                    tasks_.pop();
-                }
+                if (!queue_empty_()) task = pop_task_();
             }
             if (task)
             {
@@ -213,7 +348,7 @@ public:
                 std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                 off += len;
 
-                tasks_.emplace(
+                tasks_.emplace_back(
                     [this, beg, end, &func, &latch]()
                     {
                         for (auto it = beg; it != end; ++it)
@@ -276,7 +411,7 @@ public:
                 std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                 off += len;
 
-                tasks_.emplace(
+                tasks_.emplace_back(
                     [this, beg, end, &func, &latch]()
                     {
                         for (auto it = beg; it != end; ++it)
@@ -334,7 +469,7 @@ public:
                 std::ranges::advance(end, static_cast<std::ptrdiff_t>(len));
                 off += len;
 
-                tasks_.emplace(
+                tasks_.emplace_back(
                     [this, beg, end, &func, &latch]()
                     {
                         for (auto it = beg; it != end; ++it)
@@ -386,7 +521,7 @@ public:
                 const std::size_t end = off + len;
                 off += len;
 
-                tasks_.emplace(
+                tasks_.emplace_back(
                     [this, start, end, &func, &latch]()
                     {
                         for (std::size_t i = start; i < end; ++i)
@@ -441,7 +576,7 @@ public:
                 std::ranges::advance(in_end, static_cast<std::ptrdiff_t>(len));
                 off += len;
 
-                tasks_.emplace(
+                tasks_.emplace_back(
                     [this, in_beg, in_end, out_beg, &op, &latch]()
                     {
                         auto in = in_beg;
@@ -504,7 +639,7 @@ public:
                 std::ranges::advance(i1_end, static_cast<std::ptrdiff_t>(len));
                 off += len;
 
-                tasks_.emplace(
+                tasks_.emplace_back(
                     [this, i1, i1_end, i2, o, &op, &latch]()
                     {
                         auto it1 = i1;
@@ -608,7 +743,7 @@ public:
                 if (c == 0)
                 {
                     // 块 0：以 init 为种子（init 在整个归约恰好计入一次）
-                    tasks_.emplace(
+                    tasks_.emplace_back(
                         [this, beg, end, &reduce_op, &transform_op, &partials, &latch, init]()
                         {
                             T local = init;
@@ -621,7 +756,7 @@ public:
                 else
                 {
                     // 块 c>0：以块内首元素为种子（len ≥ MIN_CHUNK ≥ 1 保证非空）
-                    tasks_.emplace(
+                    tasks_.emplace_back(
                         [this, beg, end, &reduce_op, &transform_op, &partials, &latch, c]()
                         {
                             auto it = beg;
@@ -702,7 +837,7 @@ public:
                 if (c == 0)
                 {
                     // 块 0：以 init 为种子（init 在整个归约恰好计入一次）
-                    tasks_.emplace(
+                    tasks_.emplace_back(
                         [this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, init]()
                         {
                             T local = init;
@@ -717,7 +852,7 @@ public:
                 else
                 {
                     // 块 c>0：以块内首元素为种子（len ≥ MIN_CHUNK ≥ 1 保证非空）
-                    tasks_.emplace(
+                    tasks_.emplace_back(
                         [this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c]()
                         {
                             auto it1 = i1;
