@@ -2379,7 +2379,9 @@ private:
         std::vector<DispatchItem> items(kernels.size());
         // P3 逃生阀：NN_IRC_NO_BATCH=1 关闭批量派发（A/B 对照用；每次调用读取，
         // 测试可在同进程切换）。逐 kernel 原路径不受影响（数值不变）。
-        const bool batch_enabled = !nn::dsl::env_flag("NN_IRC_NO_BATCH");
+        // 行为开关走裸读（env_flag_raw）——探针门控的 env_flag 在默认构建下恒 false，
+        // 会让该逃生阀静默失效。
+        const bool batch_enabled = !::nn::detail::env_flag_raw("NN_IRC_NO_BATCH");
         for (std::size_t ki = 0; ki < kernels.size(); ++ki)
         {
             FusedKernel& k = kernels[ki];
@@ -2551,7 +2553,7 @@ private:
                 if (gr.members.front() != ki) continue;   // 已随本组首成员一次性派发
                 if (gr.members.size() >= 2)
                 {
-                    if (nn::dsl::env_flag("NN_IRC_TRACE"))
+                    if (::nn::detail::env_flag_raw("NN_IRC_TRACE"))
                         std::fprintf(stderr, "[ir-c][batch] %zu 实例 → 1 派发 %s\n",
                                      gr.members.size(), gr.key.c_str());
                     std::vector<FusedBatchInst> insts;
@@ -2591,7 +2593,7 @@ private:
                 // 单成员组 = 常规逐 kernel（单 kernel 现有语义不变）
             }
             // ── 通用降级可观测（NN_IRC_TRACE=1）：逐元素候选但未成组 ──────
-            if (nn::dsl::env_flag("NN_IRC_TRACE") && !d.degraded && !k.vector_out &&
+            if (::nn::detail::env_flag_raw("NN_IRC_TRACE") && !d.degraded && !k.vector_out &&
                 nn::expr_spec_batchable(d.bspec))
                 std::fprintf(stderr, "[ir-c][batch-degrade] %s → 逐 kernel 派发（%s）\n",
                              nn::expr_spec_key(d.bspec).c_str(),
@@ -2612,7 +2614,8 @@ private:
             {
                 // 通用诊断（NN_IRC_TRACE=1；与 NN_PREC_TRACE 同哲学：降级不是
                 // 错误，但必须可观测——否则"某段悄悄没融合"无从归因）。
-                if (std::getenv("NN_IRC_TRACE") != nullptr)
+                // C3 裁决：NN_IRC_TRACE 是非探针门行为开关（AGENTS §7）→ 裸读。
+                if (::nn::detail::env_flag_raw("NN_IRC_TRACE"))
                     std::fprintf(stderr,
                                  "[ir-c][degrade] 复合 kernel(%zu 成员, extras=%zu)"
                                  " 未登记 → 逐成员派发\n",

@@ -45,6 +45,7 @@
 
 #include "compute_tensor.hpp"
 #include "core_domain.hpp"
+#include "core_env.hpp"   // RV-09：环境变量读取唯一入口
 #include <neuralnet.cpp/precision.hpp>
 #include "expr_spec.hpp"
 #include "expr_opt.hpp"
@@ -316,7 +317,9 @@ namespace fused
         //   降级可观测：NN_IRC_TRACE=1 时打印（与 [ir-c][degrade] 同哲学）。
         if (g.nodes[static_cast<std::size_t>(tail)].dst_id != 0)
         {
-            if (std::getenv("NN_IRC_TRACE") != nullptr)
+            // NN_IRC_TRACE 按 C3 裁决为**非探针门行为开关**（AGENTS §7）：
+            // 走 env_flag_raw，默认构建下 `NN_IRC_TRACE=1` 同样生效。
+            if (::nn::detail::env_flag_raw("NN_IRC_TRACE"))
                 std::fprintf(stderr,
                              "[ir-c][fuse-decline] into 节点输出（node %d, key %s）"
                              "拒绝拼接为非尾 → 独立 kernel 落盘\n",
