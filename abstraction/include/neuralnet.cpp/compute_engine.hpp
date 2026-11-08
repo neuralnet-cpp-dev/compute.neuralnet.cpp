@@ -1138,6 +1138,17 @@ public:
         return trit_pack_impl(w, scale);
     }
 
+    // 目标传递版（T1_58 显存修复 #L2）：打包结果写进**既有容器** dst（不分配）。
+    // 打包容器是 BitLinear 的跨步持久成员；若每步都新建再替换，新缓冲落在
+    // 瞬态池里被持久成员钉住、旧缓冲进延迟销毁队列 → 瞬态池随步数爬升。
+    [[nodiscard]] Result<void> trit_pack_into(const Tensor& w, const Tensor& scale, Tensor& dst)
+    {
+        NN_TRY(ec, bind_check_({&w, &scale}));
+        NN_TRY(ec2, bind_check_({&dst}));
+        WriteEpochGuard wg{dst};
+        return trit_pack_into_impl(w, scale, dst);
+    }
+
     [[nodiscard]] Result<Tensor> matmul_q(const Tensor& packed, const Tensor& scale,
                                           const Tensor& B, Precision P = Precision::F32)
     { return matmul_q_dispatch_(packed, scale, B, /*transA=*/false, /*out_rows=*/0, P); }
@@ -1450,6 +1461,27 @@ public:
         return eval_expr_reduce_impl(spec, inputs, rows, cols, P);
     }
 
+    // ── 归约向量的目标传递版（T1_58 显存修复 #L2）──────────────────────
+    // 语义同 eval_expr_reduce，但结果**写进 out 的既有存储**（不分配新张量）。
+    // 用于 τ 这类跨步存活的持久派生缓冲：init 期分配一次、每步原地重算，
+    // 避免"新缓冲进瞬态池 + 旧缓冲延迟销毁"的逐 step 累积。
+    // 输出精度 = out 的存储精度（in-place 语义，§8.3）；不支持录制段。
+    [[nodiscard]] Result<void> eval_expr_reduce_into(const ExprSpec& spec,
+                                                     std::span<const Tensor> inputs,
+                                                     std::size_t rows, std::size_t cols,
+                                                     Tensor& out)
+    {
+        NN_PROF_OP("eval_expr_reduce_into");
+        NN_TRY(ec, bind_check_(inputs));
+        NN_TRY(ec2, bind_check_({&out}));
+        if (!spec.extras.empty())
+            NN_FAIL("eval_expr_reduce_into: 多输出 spec（P2 extras）请走 eval_expr_multi_into");
+        if (fused::is_recording())
+            NN_FAIL("eval_expr_reduce_into: 不支持在 begin_expr/end_expr 录制段内使用");
+        WriteEpochGuard wg{out};
+        return eval_expr_reduce_into_impl(spec, inputs, rows, cols, out);
+    }
+
     // ── 目标传递（destination-passing）：结果写入已有张量 ────────────────
     // 语义同 eval_expr，但输出**直接写进 out**（不分配新张量），用于表达
     // "原地更新"语义：dst = f(dst, ...)（梯度累加 / 参数更新 / 就地缩放 /
@@ -1614,6 +1646,14 @@ protected:
         (void)scale;
         NN_FAIL("trit_pack: 该引擎未实现三值打包");
     }
+    [[nodiscard]] virtual Result<void> trit_pack_into_impl(const Tensor& w, const Tensor& scale,
+                                                            Tensor& dst)
+    {
+        (void)w;
+        (void)scale;
+        (void)dst;
+        NN_FAIL("trit_pack_into: 该引擎未实现三值打包");
+    }
     [[nodiscard]] virtual Result<Tensor> matmul_q_impl(const Tensor& packed, const Tensor& scale,
                                                        const Tensor& B, bool transA,
                                                        std::size_t out_rows, Precision P)
@@ -1741,6 +1781,20 @@ protected:
         (void)cols;
         (void)P;
         NN_FAIL("eval_expr_reduce: 该引擎不支持归约向量输出");
+    }
+
+    // 归约向量的原地版；默认实现返回错误（未支持的引擎），CPU/GPU 覆盖。
+    [[nodiscard]] virtual Result<void> eval_expr_reduce_into_impl(const ExprSpec& spec,
+                                                                  std::span<const Tensor> inputs,
+                                                                  std::size_t rows, std::size_t cols,
+                                                                  Tensor& out)
+    {
+        (void)spec;
+        (void)inputs;
+        (void)rows;
+        (void)cols;
+        (void)out;
+        NN_FAIL("eval_expr_reduce_into: 该引擎不支持归约向量原地输出");
     }
 
     // 默认实现返回错误（未支持的引擎）；CPU/GPU 覆盖为真原地实现。

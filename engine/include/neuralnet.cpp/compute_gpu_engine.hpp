@@ -781,22 +781,36 @@ public:
     // `matmul_q_impl` / `trit_pack_impl` 在此 fail-fast；对外事实见 describe()）。
     [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w, const Tensor& scale) override
     {
-        if (!(backend_->has(PipelineId::trit_pack) && backend_->has(PipelineId::matmul_q)))
-            NN_FAIL("trit_pack: 该设备未创建三值打包 pipeline（docs 21 §5 P2）");
-        if (!w.is_gpu() || !scale.is_gpu()) NN_FAIL("trit_pack: GPU 张量必需");
-        if (w.precision() != Precision::F32 || scale.precision() != Precision::F32)
-            NN_FAIL("trit_pack: 需要 f32 权重 + f32 尺度");
-        if (scale.rows() != w.rows() || scale.cols() != 1)
-            NN_FAIL("trit_pack: τ 形状必须是 (rows,1)");
-        const std::size_t rows = w.rows(), k = w.cols();
-        const std::size_t wpr = nn::trit_pack::words_per_row(k);
+        const std::size_t rows = w.rows();
+        const std::size_t wpr = nn::trit_pack::words_per_row(w.cols());
         auto out = GpuTensor::create_empty(rows, wpr, *backend_);
         NN_TRY_CHECK(out);
-        NN_TRY(r, backend_->trit_pack_gpu(w.gpu_tensor().buffer(), scale.gpu_tensor().buffer(),
-                                          out->buffer(), static_cast<std::uint32_t>(rows),
-                                          static_cast<std::uint32_t>(k),
-                                          static_cast<std::uint32_t>(wpr)));
-        return Tensor::from_gpu(std::move(*out));
+        Tensor dst = Tensor::from_gpu(std::move(*out));
+        NN_TRY_CHECK(trit_pack_into_impl(w, scale, dst));
+        return dst;
+    }
+
+    // 目标传递版（T1_58 显存修复 #L2）：打包结果写进既有容器，不分配新缓冲。
+    [[nodiscard]] Result<void> trit_pack_into_impl(const Tensor& w, const Tensor& scale,
+                                                   Tensor& dst) override
+    {
+        if (!(backend_->has(PipelineId::trit_pack) && backend_->has(PipelineId::matmul_q)))
+            NN_FAIL("trit_pack_into: 该设备未创建三值打包 pipeline（docs 21 §5 P2）");
+        if (!w.is_gpu() || !scale.is_gpu() || !dst.is_gpu())
+            NN_FAIL("trit_pack_into: GPU 张量必需");
+        if (w.precision() != Precision::F32 || scale.precision() != Precision::F32 ||
+            dst.precision() != Precision::F32)
+            NN_FAIL("trit_pack_into: 需要 f32 权重/尺度/容器");
+        if (scale.rows() != w.rows() || scale.cols() != 1)
+            NN_FAIL("trit_pack_into: τ 形状必须是 (rows,1)");
+        const std::size_t rows = w.rows(), k = w.cols();
+        const std::size_t wpr = nn::trit_pack::words_per_row(k);
+        if (dst.rows() != rows || dst.cols() != wpr)
+            NN_FAIL("trit_pack_into: 容器形状不匹配");
+        return backend_->trit_pack_gpu(w.gpu_tensor().buffer(), scale.gpu_tensor().buffer(),
+                                       dst.gpu_tensor().buffer(), static_cast<std::uint32_t>(rows),
+                                       static_cast<std::uint32_t>(k),
+                                       static_cast<std::uint32_t>(wpr));
     }
 
     [[nodiscard]] Result<Tensor> matmul_q_impl(const Tensor& packed, const Tensor& scale,
@@ -1939,6 +1953,31 @@ public:
                                                        std::span<const Tensor> inputs,
                                                        std::size_t rows, std::size_t cols,
                                                        Precision P = Precision::F32) override
+    { return eval_expr_reduce_run_(raw_spec, inputs, rows, cols, P, nullptr); }
+
+    // 归约向量的目标传递版（T1_58 显存修复 #L2）：结果写进 out 的既有存储。
+    // 仅 f32 dst 支持零分配直写；其他精度 → 参考求值 + cast_into 写回原存储。
+    // 形状由 run_fused_gpu 的 output_override 校验（(rows,1)/(1,cols)）。
+    [[nodiscard]] Result<void> eval_expr_reduce_into_impl(const ExprSpec& raw_spec,
+                                                          std::span<const Tensor> inputs,
+                                                          std::size_t rows, std::size_t cols,
+                                                          Tensor& out) override
+    {
+        if (out.precision() != Precision::F32)
+        {
+            NN_TRY(t, eval_expr_reduce_impl(raw_spec, inputs, rows, cols, Precision::F32));
+            return cast_into(*t, out);
+        }
+        NN_TRY_CHECK(eval_expr_reduce_run_(raw_spec, inputs, rows, cols, Precision::F32,
+                                           &out.gpu_tensor()));
+        return {};
+    }
+
+    // 共用实现：output_override != nullptr ⇒ 结果写进其既有存储（不分配）。
+    [[nodiscard]] Result<Tensor> eval_expr_reduce_run_(const ExprSpec& raw_spec,
+                                                       std::span<const Tensor> inputs,
+                                                       std::size_t rows, std::size_t cols,
+                                                       Precision P, GpuTensor* output_override)
     {
         // 无注册表模式：融合分支不编译 → rows/cols 仅在
         // NN_FUSED_REGISTRY_EMBEDDED 内被使用 → 消 unused-parameter。
@@ -1988,7 +2027,7 @@ public:
             const bool out_f16 = nn::expr_variant_out_f16(fs->prec_sig, psig);
             auto out = backend_->run_fused_gpu(
                 fs->key, gpu_inputs, spec.consts, rows, cols, /*vector_out=*/true, vp, spec.rparams,
-                /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
+                output_override, nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec), nn::expr_spec_runtime_matmul_trans(spec),
                 std::nullopt, out_f16, psig);
             NN_TRY_CHECK(out);
@@ -2026,7 +2065,7 @@ public:
             const auto vp = nn::expr_spec_runtime_view_params(spec);
             auto out = backend_->run_fused_gpu(
                 key, fi_r->bufs, spec.consts, rows, cols, /*vector_out=*/true, vp, spec.rparams,
-                /*output_override=*/nullptr, nn::expr_spec_runtime_matmul_k(spec),
+                output_override, nn::expr_spec_runtime_matmul_k(spec),
                 nn::expr_spec_runtime_matmul_batch(spec),
                 nn::expr_spec_runtime_matmul_trans(spec),
                 /*fold_k=*/std::nullopt, /*out_f16=*/false, /*prec_sig=*/0);

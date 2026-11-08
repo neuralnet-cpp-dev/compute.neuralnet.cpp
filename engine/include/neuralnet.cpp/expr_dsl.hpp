@@ -1500,6 +1500,29 @@ template <typename C, ExprOp Rop>
                                                  std::size_t cols)
 { return copy_reduce_vector(r.v_, ReduceRef<C, Rop>::reduces_rows, rows, cols); }
 
+// 目标传递版：把归约向量写进**既有** Matrix（不分配）。形状不匹配返回 false。
+[[nodiscard]] inline bool copy_reduce_vector_into(const Scalar* v, bool reduces_rows,
+                                                  std::size_t rows, std::size_t cols, Matrix& out)
+{
+    const std::size_t orows = reduces_rows ? rows : 1;
+    const std::size_t ocols = reduces_rows ? 1 : cols;
+    if (out.rows() != orows || out.cols() != ocols) return false;
+    const std::size_t len = reduces_rows ? rows : cols;
+    for (std::size_t k = 0; k < len; ++k)
+        out.span()[k] = v[k];
+    return true;
+}
+
+template <ExprViewKind K>
+[[nodiscard]] inline bool reduce_vector_into(const ReduceViewRef<K>& r, std::size_t rows,
+                                             std::size_t cols, Matrix& out)
+{ return copy_reduce_vector_into(r.v_, ReduceViewRef<K>::reduces_rows, rows, cols, out); }
+
+template <typename C, ExprOp Rop>
+[[nodiscard]] inline bool reduce_vector_into(const ReduceRef<C, Rop>& r, std::size_t rows,
+                                             std::size_t cols, Matrix& out)
+{ return copy_reduce_vector_into(r.v_, ReduceRef<C, Rop>::reduces_rows, rows, cols, out); }
+
 // ══════════════════════════════════════════════════════════════════════════
 // CPU：编译期模板直接求值（编译器内联 + SIMD 融合，等价手写循环）
 // ══════════════════════════════════════════════════════════════════════════
@@ -1763,6 +1786,40 @@ template <typename E>
 
 template <typename E> [[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e)
 { return compute_reduce(eng, e, Precision::F32); }
+
+// ── 目标传递版：compute_reduce_into ────────────────────────────────────────
+// 结果写进 dst 的**既有存储**（不分配、不替换张量对象）。用于 τ 这类跨步
+// 存活的持久派生缓冲：init 期分配一次、每步原地重算，消除"新缓冲落瞬态池
+// + 旧缓冲延迟销毁"的逐 step 累积（T1_58 显存修复 #L2）。
+// dst 存储精度不可变（in-place，§8.3）；非 f32 / 非 CPU 目标走引擎参考
+// 求值 + cast_into 写回。
+template <typename E>
+[[nodiscard]] Result<void> compute_reduce_into(ComputeEngine& eng, const E& e, std::size_t rows,
+                                               std::size_t cols, Tensor& dst)
+{
+    NN_PROF_OP("dsl::compute_reduce_into");
+    if (eng.device() == Device::CPU)
+    {
+        // 根节点是纯归约 → 归约向量已在 cpu_prepare 中算好，直接拷进 dst。
+        if constexpr (nn::dsl::cpu_reduce_root_v<E> && nn::dsl::cpu_preparable_v<E>)
+        {
+            if (auto r = cpu_prepare(e, eng, rows, cols); r)
+            {
+                if (dst.precision() == Precision::F32 && dst.is_cpu())
+                {
+                    if (!nn::dsl::reduce_vector_into(e, rows, cols,
+                                                     TensorAccess::cpu_matrix(dst)))
+                        NN_FAIL("dsl::compute_reduce_into: dst 形状与归约向量不匹配");
+                    TensorAccess::mark_written(dst);
+                    return {};
+                }
+            }
+        }
+    }
+    auto [spec, inputs] = to_expr_spec(e);
+    NN_TRY(v, validate_expr_spec(spec, inputs.size()));
+    return eng.eval_expr_reduce_into(spec, inputs, rows, cols, dst);
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // start_expr / end_expr — 跨行书写同一表达式的语法糖（IR-C 恢复自旧实现）

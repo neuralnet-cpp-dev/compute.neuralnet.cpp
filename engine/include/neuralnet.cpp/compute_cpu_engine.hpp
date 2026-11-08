@@ -665,18 +665,31 @@ public:
     // 让内层循环反复移位。
     [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w, const Tensor& scale) override
     {
-        if (!w.is_cpu() || !scale.is_cpu()) NN_FAIL("trit_pack: tensors are not CPU");
-        if (w.precision() != Precision::F32 || scale.precision() != Precision::F32)
-            NN_FAIL("trit_pack: 需要 f32 权重 + f32 尺度");
+        const std::size_t words = nn::trit_pack::words_per_row(w.cols());
+        // 输出被完整写满（逐行 pack_row）→ 未初始化构造
+        Tensor out = Tensor::cpu(w.rows(), words);
+        NN_TRY_CHECK(trit_pack_into_impl(w, scale, out));
+        return out;
+    }
+
+    // 目标传递版：打包结果写进既有容器（不分配新张量；T1_58 显存修复 #L2）
+    [[nodiscard]] Result<void> trit_pack_into_impl(const Tensor& w, const Tensor& scale,
+                                                   Tensor& dst) override
+    {
+        if (!w.is_cpu() || !scale.is_cpu() || !dst.is_cpu())
+            NN_FAIL("trit_pack_into: tensors are not CPU");
+        if (w.precision() != Precision::F32 || scale.precision() != Precision::F32 ||
+            dst.precision() != Precision::F32)
+            NN_FAIL("trit_pack_into: 需要 f32 权重/尺度/容器");
         if (scale.rows() != w.rows() || scale.cols() != 1)
-            NN_FAIL("trit_pack: τ 形状必须是 (rows,1)");
+            NN_FAIL("trit_pack_into: τ 形状必须是 (rows,1)");
         const std::size_t rows = w.rows(), k = w.cols();
         const std::size_t words = nn::trit_pack::words_per_row(k);
-        // 输出被完整写满（逐行 pack_row）→ 未初始化构造
-        Tensor out = Tensor::cpu(rows, words);
+        if (dst.rows() != rows || dst.cols() != words)
+            NN_FAIL("trit_pack_into: 容器形状不匹配");
         const Matrix& wm = w.cpu_matrix();
         const Matrix& sm = scale.cpu_matrix();
-        Matrix& om = out.cpu_matrix();
+        Matrix& om = dst.cpu_matrix();
         const auto w_span = wm.span();
         auto o_span = om.span();
         std::vector<std::uint32_t> buf(words);
@@ -688,7 +701,7 @@ public:
             for (std::size_t i = 0; i < words; ++i)
                 o_span[r * words + i] = std::bit_cast<float>(buf[i]);
         }
-        return out;
+        return {};
     }
 
     [[nodiscard]] Result<Tensor> matmul_q_impl(const Tensor& packed, const Tensor& scale,
@@ -1862,6 +1875,34 @@ public:
         auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true, out);
         NN_TRY_CHECK(r);
         return out;
+    }
+
+    // 归约向量的目标传递版（T1_58 显存修复 #L2）：写进 dst 既有存储，不分配。
+    // 输出精度 = dst 存储精度（in-place，§8.3）；非 f32 dst 抬 f32 求值后
+    // cast_into 写回（§7.3）。
+    [[nodiscard]] Result<void> eval_expr_reduce_into_impl(const ExprSpec& spec,
+                                                          std::span<const Tensor> inputs,
+                                                          std::size_t rows, std::size_t cols,
+                                                          Tensor& dst) override
+    {
+        scan_record_variant_(spec, inputs, dst.precision());
+        if (dst.precision() != Precision::F32 || !all_f32(inputs))
+        {
+            trace_variant_(spec, inputs, dst.precision());
+            if (prec_trace_enabled_()) trace_miss_(spec, inputs, dst.precision());
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            auto tmp = eval_expr_reduce_impl(spec, *in32, rows, cols, Precision::F32);
+            NN_TRY_CHECK(tmp);
+            return cast_into(*tmp, dst);
+        }
+        trace_variant_(spec, inputs, Precision::F32);
+        const bool vec_is_row = (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) == 0);
+        const std::size_t orows = vec_is_row ? rows : 1;
+        const std::size_t ocols = vec_is_row ? 1 : cols;
+        if (dst.rows() != orows || dst.cols() != ocols)
+            NN_FAIL("eval_expr_reduce_into: dst shape mismatch");
+        return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true, dst);
     }
 
     // ── 目标传递（destination-passing）：结果直接写入已有张量 ─────────────
