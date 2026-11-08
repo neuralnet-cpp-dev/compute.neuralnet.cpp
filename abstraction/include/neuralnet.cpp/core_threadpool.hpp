@@ -7,6 +7,7 @@
 #include <functional>
 #include <future>
 #include <atomic>
+#include <exception>  // std::exception_ptr（任务异常记录，见 RegionState）
 #include <cstddef>    // for std::max_align_t
 #include <new>        // for placement new（任务就地构造）
 #include <utility>    // for std::move / std::forward
@@ -128,6 +129,40 @@ private:
     void (*destroy_)(void*) = nullptr;
     void (*relocate_)(void*, void*) = nullptr;  // 仅行内路径需要
 };
+
+// ── 并行区共享状态：分块完成计数 + 首个异常记录（#C1）──────────────────
+// 放在发起并行区的调用方栈上：队列任务只引用它；只要 latch 先归零再离开
+// 并行函数，引用就不会悬垂（异常路径同样由 finish_chunk 保证归零）。
+struct RegionState
+{
+    explicit RegionState(int n_chunks) noexcept : latch(n_chunks) {}
+
+    std::atomic<int> latch;
+    std::atomic<bool> failed{false};
+    std::exception_ptr error;  // 仅首个异常；异常构建下才会被写入
+};
+
+// ── 异常闸门：调用可调用体，异常一律吞下并转交 on_error（绝不外泄）──────
+// -fno-exceptions 构建（全仓默认）下任务体不可能抛（bad_alloc 直接
+// terminate），该分支编译为空壳，行为与改动前逐位一致；-fexceptions 构建
+// 下任务体的异常若穿过工作线程会触发 std::terminate，因此必须在此截断。
+template <typename Fn, typename OnError>
+inline void invoke_nothrow(Fn&& fn, OnError&& on_error) noexcept
+{
+#if defined(__cpp_exceptions)
+    try
+    {
+        fn();
+    }
+    catch (...)
+    {
+        on_error(std::current_exception());
+    }
+#else
+    fn();
+    (void)on_error;
+#endif
+}
 }  // namespace detail
 
 // ── 简易线程池（latch 零分配设计）──────────────────────────────────────
@@ -177,6 +212,10 @@ private:
     std::mutex queue_mutex_;
     std::condition_variable condition_;
     std::atomic<bool> stop_{false};
+
+    // 累计被吞掉的任务体异常数（诊断用；异常本身会在发起并行区的调用线程
+    // 重抛，见 rethrow_if_failed —— 这里只是"至少记录一次"的持久观测点）
+    std::atomic<std::size_t> task_exceptions_{0};
 
 public:
     // ── worker 线程索引（每个 worker 在构造时绑定唯一 ID） ──────
@@ -251,6 +290,57 @@ private:
             std::lock_guard lock(queue_mutex_);
             condition_.notify_all();
         }
+    }
+
+    // ── 分块异常闸门（#C1）──────────────────────────────────────────
+    // 每个分块——工作线程上的队列任务与调用者自己那段——都必须经由此处：
+    //   ① latch 递减走 RAII：任务体抛异常时同样归零，等待方不会永久挂住；
+    //   ② 异常在此截断并记录首个：绝不穿过工作线程（否则 std::terminate）；
+    //   ③ 记录后继续执行其它分块，区域结束时由调用线程统一重抛。
+    template <typename Body> void run_chunk(detail::RegionState& st, Body&& body) noexcept
+    {
+        struct LatchGuard
+        {
+            ThreadPool* pool;
+            std::atomic<int>* latch;
+            ~LatchGuard() { pool->finish_chunk(*latch); }
+        } guard{this, &st.latch};
+
+        detail::invoke_nothrow(std::forward<Body>(body),
+                               [this, &st](std::exception_ptr e) noexcept
+                               { record_chunk_error(st, std::move(e)); });
+    }
+
+    // 记录分块异常：只在失败路径调用（成功路径零原子写）。首个异常胜出，
+    // 其余只计数；错误槽由区域状态持有，随并行函数返回而销毁。
+    void record_chunk_error(detail::RegionState& st, std::exception_ptr e) noexcept
+    {
+        task_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lock(queue_mutex_);
+        if (!st.failed.load(std::memory_order_relaxed))
+        {
+            st.failed.store(true, std::memory_order_relaxed);
+            st.error = std::move(e);
+        }
+    }
+
+    // ── 区域收尾：把任务层记录的异常在调用线程重抛（#C1）──────────────
+    // 必须在 wait_for_latch 之后调用：此时所有分块均已结束，队列中不再有
+    // 指向本栈帧（func / 区间 / 状态）的任务，展开不会留下悬垂引用。
+    // 传递方式 = 标记为失败而非静默继续：与串行路径语义一致（串行时
+    // 任务体的异常直接抛给调用方），调用方无需关心本次是否走了并行。
+    void rethrow_if_failed(detail::RegionState& st)
+    {
+        if (!st.failed.load(std::memory_order_acquire)) return;
+#if defined(__cpp_exceptions)
+        std::exception_ptr e;
+        {
+            std::lock_guard lock(queue_mutex_);
+            e = std::move(st.error);
+            st.error = nullptr;
+        }
+        if (e) std::rethrow_exception(e);
+#endif
     }
 
     // ── work-stealing 等待：调用者不空转，帮忙处理队列任务 ─────────
@@ -331,13 +421,15 @@ public:
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
 
-        // 原子计数器：初始值 = n_chunks
-        std::atomic<int> latch{static_cast<int>(n_chunks)};
+        // 原子计数器 + 首个异常记录（异常路径见 run_chunk）
+        detail::RegionState st{static_cast<int>(n_chunks)};
 
         // 将前 n_chunks-1 个分块批量入队（仅一次加锁）；
         // 每入队一个任务 notify_one，避免高核机器上唤醒全部 worker
         {
             std::lock_guard lock(queue_mutex_);
+            // 预留容量：入队中途扩容失败会留下"latch 永远等不到"的残局
+            tasks_.reserve(tasks_.size() + (n_chunks - 1));
             std::size_t off = 0;
             for (std::size_t c = 0; c < n_chunks - 1; ++c)
             {
@@ -349,11 +441,14 @@ public:
                 off += len;
 
                 tasks_.emplace_back(
-                    [this, beg, end, &func, &latch]()
+                    [this, beg, end, &func, &st]()
                     {
-                        for (auto it = beg; it != end; ++it)
-                            func(*it);
-                        finish_chunk(latch);
+                        run_chunk(st,
+                                  [&]
+                                  {
+                                      for (auto it = beg; it != end; ++it)
+                                          func(*it);
+                                  });
                     });
                 condition_.notify_one();
             }
@@ -366,13 +461,17 @@ public:
             const std::size_t off = total - len;
             auto beg = first;
             std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
-            for (auto it = beg; it != last; ++it)
-                func(*it);
-            finish_chunk(latch);
+            run_chunk(st,
+                      [&]
+                      {
+                          for (auto it = beg; it != last; ++it)
+                              func(*it);
+                      });
         }
 
         // work-stealing 等待：调用者帮忙处理队列任务而非空转
-        wait_for_latch(latch);
+        wait_for_latch(st.latch);
+        rethrow_if_failed(st);
     }
 
     // ── 带 worker 索引的并行 for_each ────────────────────────────
@@ -397,10 +496,11 @@ public:
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
 
-        std::atomic<int> latch{static_cast<int>(n_chunks)};
+        detail::RegionState st{static_cast<int>(n_chunks)};
 
         {
             std::lock_guard lock(queue_mutex_);
+            tasks_.reserve(tasks_.size() + (n_chunks - 1));
             std::size_t off = 0;
             for (std::size_t c = 0; c < n_chunks - 1; ++c)
             {
@@ -412,11 +512,14 @@ public:
                 off += len;
 
                 tasks_.emplace_back(
-                    [this, beg, end, &func, &latch]()
+                    [this, beg, end, &func, &st]()
                     {
-                        for (auto it = beg; it != end; ++it)
-                            func(*it, tl_worker_index);
-                        finish_chunk(latch);
+                        run_chunk(st,
+                                  [&]
+                                  {
+                                      for (auto it = beg; it != end; ++it)
+                                          func(*it, tl_worker_index);
+                                  });
                     });
                 condition_.notify_one();
             }
@@ -429,12 +532,16 @@ public:
             const std::size_t off = total - len;
             auto beg = first;
             std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
-            for (auto it = beg; it != last; ++it)
-                func(*it, workers_.size());
-            finish_chunk(latch);
+            run_chunk(st,
+                      [&]
+                      {
+                          for (auto it = beg; it != last; ++it)
+                              func(*it, workers_.size());
+                      });
         }
 
-        wait_for_latch(latch);
+        wait_for_latch(st.latch);
+        rethrow_if_failed(st);
     }
 
     // ── 块级并行 for_each（供矩阵乘法/转置的分块循环使用）─────────
@@ -455,10 +562,11 @@ public:
         const auto n_chunks = std::min(workers_.size(), total);
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
-        std::atomic<int> latch{static_cast<int>(n_chunks)};
+        detail::RegionState st{static_cast<int>(n_chunks)};
 
         {
             std::lock_guard lock(queue_mutex_);
+            tasks_.reserve(tasks_.size() + (n_chunks - 1));
             std::size_t off = 0;
             for (std::size_t c = 0; c < n_chunks - 1; ++c)
             {
@@ -470,11 +578,14 @@ public:
                 off += len;
 
                 tasks_.emplace_back(
-                    [this, beg, end, &func, &latch]()
+                    [this, beg, end, &func, &st]()
                     {
-                        for (auto it = beg; it != end; ++it)
-                            func(*it);
-                        finish_chunk(latch);
+                        run_chunk(st,
+                                  [&]
+                                  {
+                                      for (auto it = beg; it != end; ++it)
+                                          func(*it);
+                                  });
                     });
                 condition_.notify_one();
             }
@@ -485,12 +596,16 @@ public:
             const std::size_t off = total - (base + (c < rem ? 1 : 0));
             auto beg = first;
             std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
-            for (auto it = beg; it != last; ++it)
-                func(*it);
-            finish_chunk(latch);
+            run_chunk(st,
+                      [&]
+                      {
+                          for (auto it = beg; it != last; ++it)
+                              func(*it);
+                      });
         }
 
-        wait_for_latch(latch);
+        wait_for_latch(st.latch);
+        rethrow_if_failed(st);
     }
 
     // ── 并行 for_samples（独立样本级并行）───────────────────────────
@@ -509,10 +624,11 @@ public:
         const auto n_chunks = std::min(workers_.size(), num_samples);
         const std::size_t base = num_samples / n_chunks;
         const std::size_t rem = num_samples % n_chunks;
-        std::atomic<int> latch{static_cast<int>(n_chunks)};
+        detail::RegionState st{static_cast<int>(n_chunks)};
 
         {
             std::lock_guard lock(queue_mutex_);
+            tasks_.reserve(tasks_.size() + (n_chunks - 1));
             std::size_t off = 0;
             for (std::size_t c = 0; c < n_chunks - 1; ++c)
             {
@@ -522,11 +638,14 @@ public:
                 off += len;
 
                 tasks_.emplace_back(
-                    [this, start, end, &func, &latch]()
+                    [this, start, end, &func, &st]()
                     {
-                        for (std::size_t i = start; i < end; ++i)
-                            func(i);
-                        finish_chunk(latch);
+                        run_chunk(st,
+                                  [&]
+                                  {
+                                      for (std::size_t i = start; i < end; ++i)
+                                          func(i);
+                                  });
                     });
                 condition_.notify_one();
             }
@@ -536,12 +655,16 @@ public:
         {
             const std::size_t c = n_chunks - 1;
             const std::size_t start = num_samples - (base + (c < rem ? 1 : 0));
-            for (std::size_t i = start; i < num_samples; ++i)
-                func(i);
-            finish_chunk(latch);
+            run_chunk(st,
+                      [&]
+                      {
+                          for (std::size_t i = start; i < num_samples; ++i)
+                              func(i);
+                      });
         }
 
-        wait_for_latch(latch);
+        wait_for_latch(st.latch);
+        rethrow_if_failed(st);
     }
 
     // ── 并行 transform（一元）───────────────────────────────────────
@@ -560,10 +683,11 @@ public:
 
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
-        std::atomic<int> latch{static_cast<int>(n_chunks)};
+        detail::RegionState st{static_cast<int>(n_chunks)};
 
         {
             std::lock_guard lock(queue_mutex_);
+            tasks_.reserve(tasks_.size() + (n_chunks - 1));
             std::size_t off = 0;
             for (std::size_t c = 0; c < n_chunks - 1; ++c)
             {
@@ -577,13 +701,16 @@ public:
                 off += len;
 
                 tasks_.emplace_back(
-                    [this, in_beg, in_end, out_beg, &op, &latch]()
+                    [this, in_beg, in_end, out_beg, &op, &st]()
                     {
-                        auto in = in_beg;
-                        auto out = out_beg;
-                        for (; in != in_end; ++in, ++out)
-                            *out = op(*in);
-                        finish_chunk(latch);
+                        run_chunk(st,
+                                  [&]
+                                  {
+                                      auto in = in_beg;
+                                      auto out = out_beg;
+                                      for (; in != in_end; ++in, ++out)
+                                          *out = op(*in);
+                                  });
                     });
                 condition_.notify_one();
             }
@@ -596,12 +723,16 @@ public:
             auto out_beg = d_first;
             std::ranges::advance(in_beg, static_cast<std::ptrdiff_t>(off));
             std::ranges::advance(out_beg, static_cast<std::ptrdiff_t>(off));
-            for (; in_beg != last; ++in_beg, ++out_beg)
-                *out_beg = op(*in_beg);
-            finish_chunk(latch);
+            run_chunk(st,
+                      [&]
+                      {
+                          for (; in_beg != last; ++in_beg, ++out_beg)
+                              *out_beg = op(*in_beg);
+                      });
         }
 
-        wait_for_latch(latch);
+        wait_for_latch(st.latch);
+        rethrow_if_failed(st);
     }
 
     // ── 并行 transform（二元）───────────────────────────────────────
@@ -621,10 +752,11 @@ public:
 
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
-        std::atomic<int> latch{static_cast<int>(n_chunks)};
+        detail::RegionState st{static_cast<int>(n_chunks)};
 
         {
             std::lock_guard lock(queue_mutex_);
+            tasks_.reserve(tasks_.size() + (n_chunks - 1));
             std::size_t off = 0;
             for (std::size_t c = 0; c < n_chunks - 1; ++c)
             {
@@ -640,14 +772,17 @@ public:
                 off += len;
 
                 tasks_.emplace_back(
-                    [this, i1, i1_end, i2, o, &op, &latch]()
+                    [this, i1, i1_end, i2, o, &op, &st]()
                     {
-                        auto it1 = i1;
-                        auto it2 = i2;
-                        auto out = o;
-                        for (; it1 != i1_end; ++it1, ++it2, ++out)
-                            *out = op(*it1, *it2);
-                        finish_chunk(latch);
+                        run_chunk(st,
+                                  [&]
+                                  {
+                                      auto it1 = i1;
+                                      auto it2 = i2;
+                                      auto out = o;
+                                      for (; it1 != i1_end; ++it1, ++it2, ++out)
+                                          *out = op(*it1, *it2);
+                                  });
                     });
                 condition_.notify_one();
             }
@@ -662,12 +797,16 @@ public:
             std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
             std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
             std::ranges::advance(o, static_cast<std::ptrdiff_t>(off));
-            for (; i1 != last1; ++i1, ++i2, ++o)
-                *o = op(*i1, *i2);
-            finish_chunk(latch);
+            run_chunk(st,
+                      [&]
+                      {
+                          for (; i1 != last1; ++i1, ++i2, ++o)
+                              *o = op(*i1, *i2);
+                      });
         }
 
-        wait_for_latch(latch);
+        wait_for_latch(st.latch);
+        rethrow_if_failed(st);
     }
 
     // ── 归约分块（确定性契约，铁律 8）──────────────────────────────────
@@ -723,13 +862,14 @@ public:
 
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
-        std::atomic<int> latch{static_cast<int>(n_chunks)};
+        detail::RegionState st{static_cast<int>(n_chunks)};
 
         // 部分和按固定块下标存放（与调度无关 → 确定性）
         std::vector<T> partials(n_chunks);
 
         {
             std::lock_guard lock(queue_mutex_);
+            tasks_.reserve(tasks_.size() + (n_chunks - 1));
             std::size_t off = 0;
             for (std::size_t c = 0; c < n_chunks - 1; ++c)
             {
@@ -744,27 +884,33 @@ public:
                 {
                     // 块 0：以 init 为种子（init 在整个归约恰好计入一次）
                     tasks_.emplace_back(
-                        [this, beg, end, &reduce_op, &transform_op, &partials, &latch, init]()
+                        [this, beg, end, &reduce_op, &transform_op, &partials, &st, init]()
                         {
-                            T local = init;
-                            for (auto it = beg; it != end; ++it)
-                                local = reduce_op(local, transform_op(*it));
-                            partials[0] = std::move(local);
-                            finish_chunk(latch);
+                            run_chunk(st,
+                                      [&]
+                                      {
+                                          T local = init;
+                                          for (auto it = beg; it != end; ++it)
+                                              local = reduce_op(local, transform_op(*it));
+                                          partials[0] = std::move(local);
+                                      });
                         });
                 }
                 else
                 {
                     // 块 c>0：以块内首元素为种子（len ≥ MIN_CHUNK ≥ 1 保证非空）
                     tasks_.emplace_back(
-                        [this, beg, end, &reduce_op, &transform_op, &partials, &latch, c]()
+                        [this, beg, end, &reduce_op, &transform_op, &partials, &st, c]()
                         {
-                            auto it = beg;
-                            T local = transform_op(*it);
-                            for (++it; it != end; ++it)
-                                local = reduce_op(local, transform_op(*it));
-                            partials[c] = std::move(local);
-                            finish_chunk(latch);
+                            run_chunk(st,
+                                      [&]
+                                      {
+                                          auto it = beg;
+                                          T local = transform_op(*it);
+                                          for (++it; it != end; ++it)
+                                              local = reduce_op(local, transform_op(*it));
+                                          partials[c] = std::move(local);
+                                      });
                         });
                 }
                 condition_.notify_one();
@@ -777,15 +923,20 @@ public:
             const std::size_t off = total - (base + (c < rem ? 1 : 0));
             auto beg = first;
             std::ranges::advance(beg, static_cast<std::ptrdiff_t>(off));
-            auto it = beg;
-            T local = transform_op(*it);
-            for (++it; it != last; ++it)
-                local = reduce_op(local, transform_op(*it));
-            partials[c] = std::move(local);
-            finish_chunk(latch);
+            run_chunk(st,
+                      [&]
+                      {
+                          auto it = beg;
+                          T local = transform_op(*it);
+                          for (++it; it != last; ++it)
+                              local = reduce_op(local, transform_op(*it));
+                          partials[c] = std::move(local);
+                      });
         }
 
-        wait_for_latch(latch);
+        wait_for_latch(st.latch);
+        // 失败的分块不会写自己的 partials 槽；必须先重抛，绝不合并半成品
+        rethrow_if_failed(st);
 
         T result = std::move(partials[0]);
         for (std::size_t c = 1; c < n_chunks; ++c)
@@ -816,12 +967,13 @@ public:
 
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
-        std::atomic<int> latch{static_cast<int>(n_chunks)};
+        detail::RegionState st{static_cast<int>(n_chunks)};
         // 部分和按固定块下标存放（边界 = f(total)，与调度无关）
         std::vector<T> partials(n_chunks);
 
         {
             std::lock_guard lock(queue_mutex_);
+            tasks_.reserve(tasks_.size() + (n_chunks - 1));
             std::size_t off = 0;
             for (std::size_t c = 0; c < n_chunks - 1; ++c)
             {
@@ -838,30 +990,36 @@ public:
                 {
                     // 块 0：以 init 为种子（init 在整个归约恰好计入一次）
                     tasks_.emplace_back(
-                        [this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, init]()
+                        [this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &st, init]()
                         {
-                            T local = init;
-                            auto it1 = i1;
-                            auto it2 = i2;
-                            for (; it1 != i1_end; ++it1, ++it2)
-                                local = reduce_op(local, transform_op(*it1, *it2));
-                            partials[0] = std::move(local);
-                            finish_chunk(latch);
+                            run_chunk(st,
+                                      [&]
+                                      {
+                                          T local = init;
+                                          auto it1 = i1;
+                                          auto it2 = i2;
+                                          for (; it1 != i1_end; ++it1, ++it2)
+                                              local = reduce_op(local, transform_op(*it1, *it2));
+                                          partials[0] = std::move(local);
+                                      });
                         });
                 }
                 else
                 {
                     // 块 c>0：以块内首元素为种子（len ≥ MIN_CHUNK ≥ 1 保证非空）
                     tasks_.emplace_back(
-                        [this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &latch, c]()
+                        [this, i1, i1_end, i2, &reduce_op, &transform_op, &partials, &st, c]()
                         {
-                            auto it1 = i1;
-                            auto it2 = i2;
-                            T local = transform_op(*it1, *it2);
-                            for (++it1, ++it2; it1 != i1_end; ++it1, ++it2)
-                                local = reduce_op(local, transform_op(*it1, *it2));
-                            partials[c] = std::move(local);
-                            finish_chunk(latch);
+                            run_chunk(st,
+                                      [&]
+                                      {
+                                          auto it1 = i1;
+                                          auto it2 = i2;
+                                          T local = transform_op(*it1, *it2);
+                                          for (++it1, ++it2; it1 != i1_end; ++it1, ++it2)
+                                              local = reduce_op(local, transform_op(*it1, *it2));
+                                          partials[c] = std::move(local);
+                                      });
                         });
                 }
                 condition_.notify_one();
@@ -876,14 +1034,18 @@ public:
             auto i2 = first2;
             std::ranges::advance(i1, static_cast<std::ptrdiff_t>(off));
             std::ranges::advance(i2, static_cast<std::ptrdiff_t>(off));
-            T local = transform_op(*i1, *i2);
-            for (++i1, ++i2; i1 != last1; ++i1, ++i2)
-                local = reduce_op(local, transform_op(*i1, *i2));
-            partials[c] = std::move(local);
-            finish_chunk(latch);
+            run_chunk(st,
+                      [&]
+                      {
+                          T local = transform_op(*i1, *i2);
+                          for (++i1, ++i2; i1 != last1; ++i1, ++i2)
+                              local = reduce_op(local, transform_op(*i1, *i2));
+                          partials[c] = std::move(local);
+                      });
         }
 
-        wait_for_latch(latch);
+        wait_for_latch(st.latch);
+        rethrow_if_failed(st);
 
         T result = std::move(partials[0]);
         for (std::size_t c = 1; c < n_chunks; ++c)
@@ -915,6 +1077,12 @@ public:
     ThreadPool& operator=(ThreadPool&&) = delete;
 
     [[nodiscard]] std::size_t size() const noexcept { return workers_.size(); }
+
+    // 累计被截断并记录的任务体异常数（#C1 诊断口）。
+    // 异常本身会在发起并行区的调用线程重抛，控制流无需依赖该计数；
+    // 它用于"至少记录一次、不静默吞掉"的观测（日志/探针/断言）。
+    [[nodiscard]] std::size_t task_exception_count() const noexcept
+    { return task_exceptions_.load(std::memory_order_relaxed); }
 
     // 返回当前线程的 worker 索引（0..size()-1）。
     // 非 worker 线程默认返回 0；当调用者线程在 wait_for_latch 中帮忙

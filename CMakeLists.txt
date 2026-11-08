@@ -293,6 +293,15 @@ endfunction()
 nn_add_engine_test(expr_graph_test tests/expr_graph_test.cpp)
 target_link_libraries(expr_graph_test PRIVATE nn_cpu)
 
+# ── 线程池任务异常闸门（审查报告-2026-11-09 #C1）────────────────────────
+# 任务体抛异常只在异常构建下可复现：目录级 -fno-exceptions 下 bad_alloc 直接
+# terminate、根本没有可捕获的异常。故本目标反向覆盖为 -fexceptions（MSVC 默认
+# 开异常，无需处理），专门验证 latch 必归零与异常在调用线程重抛。
+nn_add_engine_test(threadpool_exception_test tests/threadpool_exception_test.cpp)
+if(NOT MSVC)
+    target_compile_options(threadpool_exception_test PRIVATE -fexceptions)
+endif()
+
 if(TARGET nn_gpu)
     nn_add_engine_test(scan_bitwise_test tests/scan_bitwise_test.cpp)
     target_link_libraries(scan_bitwise_test PRIVATE nn_cpu nn_gpu)
