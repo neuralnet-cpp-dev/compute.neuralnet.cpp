@@ -453,7 +453,9 @@ public:
                 const std::size_t k_len = k_end - k_start;
                 const std::size_t j_len = j_end - j_start;
                 // B 打包成 k-major：b_pack[kk * j_len + j]（固定 kk 时 j 连续）
-                std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_pack{};
+                // 只写 [0, k_len * j_len)：所有读点都落在该前缀内，未写区间从不被读，
+                // 故不做 16KB 值初始化（省掉每块的整块清零流量，输出逐位不变）。
+                std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_pack;
                 for (std::size_t kk = 0; kk < k_len; ++kk)
                     for (std::size_t j = 0; j < j_len; ++j)
                         b_pack[kk * j_len + j] = b[(k_start + kk) * b_cols + (j_start + j)];
@@ -547,7 +549,8 @@ public:
                 const std::size_t j_len = j_end - j_start;
                 // B^T 打包成 k-major（固定 kk 时 j 连续）：
                 //   b_pack[kk * j_len + j] = bt[(j_start + j) * K + (k_start + kk)]
-                std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_pack{};
+                // 只写 [0, k_len * j_len)；所有读点都落在该前缀内，不做 16KB 值初始化。
+                std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_pack;
                 for (std::size_t kk = 0; kk < k_len; ++kk)
                     for (std::size_t j = 0; j < j_len; ++j)
                         b_pack[kk * j_len + j] = bt[(j_start + j) * K + (k_start + kk)];
@@ -643,8 +646,9 @@ public:
                 for (std::size_t ii = 0; ii < i_len; ++ii)
                     for (std::size_t kk = 0; kk < k_len; ++kk)
                         a_pack[ii * k_len + kk] = a[(k_start + kk) * a_cols + (i_start + ii)];
-                // B 打包成 k-major（固定 kk 时 j 连续）
-                std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_pack{};
+                // B 打包成 k-major（固定 kk 时 j 连续）；只写 [0, k_len * j_len)，
+                // 所有读点都落在该前缀内，不做 16KB 值初始化。
+                std::array<element, BLOCK_SIZE * BLOCK_SIZE> b_pack;
                 for (std::size_t kk = 0; kk < k_len; ++kk)
                     for (std::size_t j = 0; j < j_len; ++j)
                         b_pack[kk * j_len + j] = b[(k_start + kk) * b_cols + (j_start + j)];

@@ -159,6 +159,13 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::create_empty(std::size_t rows, std::
     //   （实测 (65,17) f16 目标 idx1104 恒缺失；新分配的零内存把它掩盖成
     //   "新进程首跑正确"，池复用后残留旧值 → 静默错值/NaN）。f32/f64 天然
     //   4 B 对齐、零行为变化。
+    // ⚠ 二次放大溢出防线：rows*cols 由 check_shape_ 拦下，但再乘 sizeof(elem<P>)
+    //   仍可能回绕（元素数接近 size_t 上限时）→ 按回绕后的字节数分配即越界。
+    //   判据 cnt*sizeof ≤ SIZE_MAX-3（对齐最多再加 3）。
+    constexpr std::size_t k_elem_bytes = sizeof(elem<P>);
+    constexpr std::size_t k_max_size = ~std::size_t{0};
+    if (rows != 0 && cols > (k_max_size - 3) / k_elem_bytes / rows)
+        NN_FAIL("GpuTensorT::create_empty: 字节数溢出（rows*cols*sizeof(elem) 超过 size_t 上限）");
     const std::size_t byte_count = (rows * cols * sizeof(elem<P>) + 3u) & ~std::size_t{3};
     // TRANSFER_DST_BIT: 允许 vkCmdFillBuffer (zero) 和 vkCmdCopyBuffer (insert_rows) 写入
     // TRANSFER_SRC_BIT: 允许 vkCmdCopyBuffer (clone/slice_rows) 读取
@@ -175,6 +182,10 @@ GpuTensorT<P>::create_host_visible_empty(std::size_t rows, std::size_t cols, Gpu
 {
     // Host Visible 存储（activation offload）：数据驻留主机可见内存（§6.6）。
     // 仅用于 vkCmdCopyBuffer 中转（TRANSFER_DST/SRC）。
+    constexpr std::size_t k_elem_bytes = sizeof(elem<P>);
+    constexpr std::size_t k_max_size = ~std::size_t{0};
+    if (rows != 0 && cols > (k_max_size - 3) / k_elem_bytes / rows)
+        NN_FAIL("GpuTensorT::create_host_visible_empty: 字节数溢出（rows*cols*sizeof(elem) 超过 size_t 上限）");
     const std::size_t byte_count = (rows * cols * sizeof(elem<P>) + 3u) & ~std::size_t{3};  // 4 B 对齐（同上）
     auto buf_res =
         GpuBuffer::create_host_visible(reinterpret_cast<std::uint64_t>(backend.device().device()), backend.alloc_pool(), byte_count,

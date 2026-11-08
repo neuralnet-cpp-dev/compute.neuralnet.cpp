@@ -72,6 +72,8 @@ inline void pack_row(const std::int8_t* q, std::size_t n, std::uint32_t* out) no
 }
 
 // 单点解码（signed int8）：words 指向该行首字
+// ⚠ 无行宽参数、不做越界检查：调用方必须保证 idx < 该行元素数 n，
+//   且 words 指向该行首字（idx 越界会读到相邻行的字）。
 [[nodiscard]] inline std::int8_t at(const std::uint32_t* words, std::size_t idx) noexcept
 {
     const std::uint32_t word = words[idx / kPerWord];

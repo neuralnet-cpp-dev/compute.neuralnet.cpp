@@ -950,6 +950,8 @@ run_fused_gpu(const std::string& shader_name,
     const VulkanPipeline& in_pipe =
         f16_in ? pipelines_.get(PipelineId::reduce_f16) : pipelines_.get(PipelineId::reduce);
 
+    if (input.rows() > 0xFFFFFFFFu || input.cols() > 0xFFFFFFFFu)
+        NN_FAIL("reduce_gpu: 形状超出 uint32_t（rows/cols 会在下面截断，dispatch 参数将错）");
     const uint32_t rows = static_cast<uint32_t>(input.rows());
     const uint32_t cols = static_cast<uint32_t>(input.cols());
 

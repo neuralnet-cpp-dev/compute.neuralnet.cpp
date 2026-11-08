@@ -12,6 +12,11 @@
 //   - 单次 PCIe 传输量通常 << 64MB（最大 token_emb 上传约 5MB），region
 //     不必按整机预算放大
 //   - 内存预算上限保留 max_host_visible / 16，避免在小显存机器上过度分配
+//
+// 线程模型（#M6 约定）：**host 侧单线程使用**——`Region::in_flight` 等状态是
+// 非原子 bool，`acquire()` / `upload()` / `download()` / `drain_in_flight()` 之间
+// 不可并发调用（current_ 的原子性只用于跨组件的序号推进）。GPU 侧的完成同步
+// 由 fence / 时间线信号量保证，与 host 线程模型无关。
 // ─────────────────────────────────────────────────────────────────────────
 
 #pragma once

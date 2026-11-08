@@ -60,8 +60,8 @@ inline constexpr std::size_t PARALLEL_THRESHOLD = 524288;
 // "探针" = 会在**热路径**采样/打印/下载/扫描的诊断代码：层内逐中间量扫描
 //（`nn_dbg_scan` / `NN_F16_DEBUG`）、精度变体与边界 cast 归因
 //（`NN_PREC_TRACE` / `note_temp_`）、训练循环的非有限值追踪（`NN_NAN_TRACE`）、
-// 显存阶段采样（`NN_MEM_STATS`），以及探针可执行目标（`mem_probe` /
-// `f16_cpu_probe` / `gpu_stability_probe`）。
+// 显存阶段采样（`NN_MEM_STATS`），以及本仓探针可执行目标（`f16_cpu_probe` /
+// `gpu_stability_probe`；显存分项探针 `mem_probe` 已随引擎 .so 化迁新仓库）。
 // 关闭（默认）时它们**不参与编译**：正常训练没有额外分支、没有字符串、
 // 没有 host 下载路径，相关环境变量一律无效——探针只在排障时按需打开，
 // 不允许"设了环境变量就悄悄拖慢正常训练"。
