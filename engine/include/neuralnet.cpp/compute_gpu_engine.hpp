@@ -40,6 +40,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <cstdio>    // std::remove（.nnk 写失败时清理截断的 tmp）
 #include <fstream>
 #include <sstream>
 
@@ -1698,6 +1699,22 @@ public:
     [[nodiscard]] Result<void> persist_cache_() const
     {
         if (!kernel_cache_) return {};
+        // 写 tmp 并**检查写入结果**：磁盘满/IO 错误时 ofstream 只置 failbit
+        // （默认不抛），只管 write 不管 flush/close 会把截断的 tmp rename 成
+        // 正式缓存 → 下次加载解析失败、缓存永久不可用。失败即删 tmp。
+        const auto write_tmp = [](const std::string& tmp, const std::string& data)
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            if (!f) return false;
+            f.write(data.data(), static_cast<std::streamsize>(data.size()));
+            f.close();   // 冲刷缓冲区；写入/冲刷/关闭任一失败都会置 failbit
+            if (!f)
+            {
+                std::remove(tmp.c_str());
+                return false;
+            }
+            return true;
+        };
 #ifndef _WIN32
         // 进程锁：同一缓存路径的 .lock 文件上排他 flock；不同进程串行写。
         const std::string& path = nn::fused::kernel_cache_path();
@@ -1741,14 +1758,10 @@ public:
         const std::string data = kernel_cache_->serialize();
         ensure_nnk_cache_dir_(path);
         const std::string tmp = path + ".tmp";
+        if (!write_tmp(tmp, data))
         {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            if (!f)
-            {
-                ::close(lfd);
-                NN_FAIL("无法写 .nnk 缓存临时文件：" + tmp);
-            }
-            f.write(data.data(), static_cast<std::streamsize>(data.size()));
+            ::close(lfd);
+            NN_FAIL("无法写 .nnk 缓存临时文件（磁盘满/IO 错误？）：" + tmp);
         }
         const bool renamed = (std::rename(tmp.c_str(), path.c_str()) == 0);
         ::close(lfd);
@@ -1759,11 +1772,8 @@ public:
         const std::string& path = nn::fused::kernel_cache_path();
         ensure_nnk_cache_dir_(path);
         const std::string tmp = path + ".tmp";
-        {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            if (!f) NN_FAIL("无法写 .nnk 缓存临时文件：" + tmp);
-            f.write(data.data(), static_cast<std::streamsize>(data.size()));
-        }
+        if (!write_tmp(tmp, data))
+            NN_FAIL("无法写 .nnk 缓存临时文件（磁盘满/IO 错误？）：" + tmp);
         if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
             NN_FAIL("无法原子替换 .nnk 缓存：" + path);
         return {};
