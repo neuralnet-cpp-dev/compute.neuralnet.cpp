@@ -62,7 +62,7 @@ LD_LIBRARY_PATH=<Vulkan SDK>/lib ./build/kernelgen_smoke   # JIT 生成器 C ABI
 - **libnn-cpu.so ✅**：真实 `CpuEngine` 编进 `.so`，完整接口 C++ 直出；`consumer_test`
   跑通 matmul / 归约 / 原地操作 / transpose；LGPL 边界 nm 干净。
 - **libnn-gpu.so ✅**：真实 `GpuEngine` + Vulkan backend + glslc 管线（44 份 `*_spv.hpp`）
-  + `scan_exprs` AOT 融合（158 条表达式 → `fused_registry.hpp`）；真实 850M matmul PASS。
+  + 运行期 JIT（`.nnk` 缓存 miss 时由 kernelgen 现编 SPIR-V）；真实 850M matmul PASS。
 - **libnn-kernelgen.so ✅**：运行期 JIT 算子生成器（shaderc），`nnk_generate_spirv`
   现编 SPIR-V 冒烟 PASS；GPU 引擎运行期 dlopen（懒加载，`NN_KERNELGEN_PATH` 可覆盖）。
 - **主仓库接入 ✅**（T9，2026-11-01）：主仓库 `neuralnet.cpp` 以 submodule 挂载本仓库
@@ -100,10 +100,9 @@ NN_VULKAN_DEVICE=850M ctest --test-dir build -j1   # 10/10 全绿（GPU 测试�
    （glslc 默认 FMA）累加路径不同 → `scan_bitwise_test` 位型漂移（裸 `-O3` 实测 57/61
    失败，加 `-march=native` 后 61/61）。CMakeLists 已内置（`NN_ENABLE_NATIVE=OFF` 可关，
    但逐位锚测试将 SKIP）。
-2. **`expr_fuse_test` 的闭合世界登记**：其录制段链（`tests/expr_fuse_shapes.hpp` 单一
-   事实源）由 `scan_exprs` 的 **test_cover_pass** 在构建期登记进 `fused_registry.hpp`
-   ——否则 GPU `end_expr` 按 IR-C 闭合世界硬报错。链定义改动时两端自动同步（共用
-   同一组链函数）。
+2. **`expr_fuse_test` 的 GPU 路径**：录制段链（`tests/expr_fuse_shapes.hpp` 单一
+   事实源）不再需要构建期登记；GPU 首次执行时由运行期 JIT 现编并写 `.nnk`，
+   `model_warmup()` 可预热。链定义改动无需同步任何注册表。
 
 ## 待办（后续）
 
