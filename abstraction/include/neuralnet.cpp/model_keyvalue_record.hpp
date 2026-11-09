@@ -57,6 +57,11 @@
 namespace nn
 {
 
+// ── v2 字节源契约（公开类型；kvrec_memory_source 是其内存实现）──────────
+// ReadAt 语义：addr 为文件绝对偏移，取 [addr, addr+len) 字节。
+// KeyValueRecord::parse_at 的参数类型，库外自定义字节源（文件/流式）同用此型。
+using KvReadAt = std::function<Result<std::string>(std::uint64_t addr, std::uint64_t len)>;
+
 namespace detail
 {
 
@@ -97,10 +102,7 @@ inline bool take_u64(std::string_view& s, uint64_t& out)
     return true;
 }
 
-// ── v2 字节源与游标（内存块 / 文件皆可包装为 ReadAt）────────────────
-// ReadAt 语义：addr 为文件绝对偏移，取 [addr, addr+len) 字节。
-using KvReadAt = std::function<Result<std::string>(std::uint64_t addr, std::uint64_t len)>;
-
+// ── v2 解析游标（经 ReadAt 按绝对偏移取字节）────────────────────────
 struct KvCursor
 {
     const KvReadAt* read = nullptr;
@@ -142,7 +144,7 @@ struct KvCursor
 
 // ── ReadAt 的内存实现：bytes 视为完整文件映像，addr 为绝对偏移 ─────────
 // ⚠ 捕获 string_view，调用方须保证 bytes 生命周期覆盖解析期。
-inline detail::KvReadAt kvrec_memory_source(std::string_view bytes)
+inline KvReadAt kvrec_memory_source(std::string_view bytes)
 {
     return [bytes](std::uint64_t addr, std::uint64_t len) -> Result<std::string>
     {
@@ -169,8 +171,8 @@ public:
     static constexpr std::string_view KVREC_VERSION_KEY = "kvrec_version";
     static constexpr std::uint64_t KVREC_VERSION_V2 = 2;
 
-    // v2 字节源：按绝对偏移取字节（见 detail::KvReadAt）
-    using ReadAt = detail::KvReadAt;
+    // v2 字节源：按绝对偏移取字节（见 nn::KvReadAt）
+    using ReadAt = KvReadAt;
 
     // ── 写入 ────────────────────────────────────────────────────
     // ⚠ "kvrec_version" 为 v2 保留键名，业务字段不得使用。
