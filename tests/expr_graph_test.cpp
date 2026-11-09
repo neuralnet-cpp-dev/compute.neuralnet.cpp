@@ -786,6 +786,85 @@ void test_matmul_pure_chain_fuse()
     std::printf("[OK] test_matmul_pure_chain_fuse\n");
 }
 
+// ── 测试 11b（P10-①）：多消费者 matmul 头进 P2 分量（写穿其输出寄存器）──
+//   A: y = matmul(A0,B0) + bias（带尾链的 matmul 头）；B: y1 = y+1、C: y2 = y-1
+//   同时消费 A → 三节点融合为单 kernel（members=A,B,C；tail=C；
+//   extras=[A.out, B.out] 写穿），A 的输出寄存器经 extras 物化供组外读取。
+//   单消费者控制由既有 test_matmul_chain_fuse 锁定（P1 语义、extras 空不变）。
+void test_matmul_multi_consumer_fuse()
+{
+    auto eng_owner = nn::create_cpu_engine();
+    nn::ComputeEngine& eng = *eng_owner;
+    const std::size_t M = 3, K = 4, N = 2;
+    nn::ExprGraph g;
+    nn::Tensor A0 = make_tensor(eng, M, K, 0.5f, 0.03f);
+    nn::Tensor B0 = make_tensor(eng, K, N, -0.2f, 0.04f);
+    nn::Tensor bias = make_tensor(eng, M, N, 0.1f, 0.01f);
+
+    nn::ExprSpec sa;
+    sa.views = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
+    sa.num_regs = 1;
+    sa.matmul = nn::MatmulSpec{0, 1, 0, 0, static_cast<std::uint32_t>(K), 1};
+    sa.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add),
+                         0,
+                         nn::expr::matmul_op(),
+                         nn::expr::input(2),
+                         {}});
+    const int nA = g.add_node(sa, std::vector<nn::Tensor>{A0, B0, bias}, M, N, false);
+    nn::Tensor yt = make_placeholder(eng, M, N, g.tag_of_node[static_cast<std::size_t>(nA)]);
+    // B: y1 = y + 1；C: y2 = y − 1（双消费者，均 Linear 引用 y）
+    (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}),
+                     std::vector<nn::Tensor>{yt}, M, N, false);
+    (void)g.add_node(make_unary_const(nn::ExprOp::Sub, Scalar{1}),
+                     std::vector<nn::Tensor>{yt}, M, N, false);
+
+    auto kernels = fuse_expr_graph(g);
+    // #P10-①：expr_spec.hpp 契约守卫已放开（extras 支持 matmul spec）——
+    //   多消费者带尾链的 matmul 头必须融合为**单 kernel**（members=3、
+    //   extras=2），下方验收体直调执行对拍逐节点参考。
+    //   历史"守卫下退化为 kernels=2 也算 OK"的分支已删除：守卫放开后保留
+    //   它会把融合回归（重新分裂）静默记绿 = 假绿陷阱。
+    if (kernels.size() != 1)
+    {
+        std::printf("[diag] kernels=%zu:", kernels.size());
+        for (const auto& k : kernels)
+            std::printf(" {members=%zu matmul=%d extras=%zu tail=%d}", k.members.size(),
+                        k.spec.matmul ? 1 : 0, k.spec.extras.size(), k.tail);
+        std::printf("\n");
+    }
+    CHECK(kernels.size() == 1, "P10-①: 多消费者 matmul 头应融合为单 kernel");
+    if (kernels.size() != 1) return;
+    CHECK(kernels[0].members.size() == 3, "kernel 应含 matmul 头 + 2 消费者");
+    CHECK(kernels[0].spec.matmul.has_value(), "融合 spec 保留 matmul 段");
+    CHECK(kernels[0].spec.extras.size() == 2, "extras = [matmul头.out, B.out]（写穿）");
+    CHECK(kernels[0].tail == 2, "tail = 第三节点");
+    if (!kernels[0].spec.matmul) return;
+    // ── 单 kernel 三输出直调执行（守卫放开后的验收体）──
+    std::vector<nn::Tensor> kinputs;
+    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    std::vector<nn::Tensor> kouts;
+    for (int k = 0; k < 3; ++k) kouts.push_back(eng.create_tensor(M, N));
+    auto fused_r = eng.eval_expr_multi_into(kernels[0].spec, kinputs, M, N, kouts);
+    CHECK(static_cast<bool>(fused_r), "多输出（matmul+extras）求值成功");
+    auto a_ref = eng.eval_expr(sa, std::vector<nn::Tensor>{A0, B0, bias}, M, N);
+    CHECK(static_cast<bool>(a_ref), "逐节点参考 A 求值成功");
+    if (!fused_r || !a_ref) return;
+    auto b_ref = eng.eval_expr(make_unary_const(nn::ExprOp::Add, Scalar{1}),
+                               std::vector<nn::Tensor>{*a_ref}, M, N);
+    auto c_ref = eng.eval_expr(make_unary_const(nn::ExprOp::Sub, Scalar{1}),
+                               std::vector<nn::Tensor>{*a_ref}, M, N);
+    CHECK(static_cast<bool>(b_ref), "逐节点参考 B 求值成功");
+    CHECK(static_cast<bool>(c_ref), "逐节点参考 C 求值成功");
+    if (!b_ref || !c_ref) return;
+    CHECK(max_abs_diff(matrix_of(eng, kouts[0]), matrix_of(eng, *c_ref)) < 1e-6f,
+          "tail(C) 与逐节点一致");
+    CHECK(max_abs_diff(matrix_of(eng, kouts[1]), matrix_of(eng, *a_ref)) < 1e-6f,
+          "extras[0]=matmul 头输出写穿与逐节点一致");
+    CHECK(max_abs_diff(matrix_of(eng, kouts[2]), matrix_of(eng, *b_ref)) < 1e-6f,
+          "extras[1]=B 写穿与逐节点一致");
+    std::printf("[OK] test_matmul_multi_consumer_fuse (kernels=%zu)\n", kernels.size());
+}
+
 // ── 测试 12（#M1）：图计划缓存命中时，运行期值必须按**当前图**重推导 ──
 // `graph_cache_key` 只覆盖结构（节点结构哈希 + 形状 + 精度 + 依赖拓扑），而
 // matmul 的 k/batch/trans、`fold->k`、`views[].param/param2` 都是**运行期值**
@@ -955,6 +1034,155 @@ void test_plan_cache_runtime_values()
 
     cache.clear();
     std::printf("[OK] test_plan_cache_runtime_values\n");
+}
+
+// ── 测试 15（#P4 残余）：直派 canonical+key 备忘录等价性 ───────────────────
+// 锁住 canonicalize_with_key（expr_graph.hpp canon_key_memo 头注）的不变量：
+//  1. 命中/未命中返回值与现算 canonicalize_expr_spec + expr_spec_key 逐字等价
+//     （expr_spec_equal + key 字符串）——**不改任何 key 值**；
+//  2. 结构同、rparams 值 / RowMod 运行期 param / matmul k·transB 不同 →
+//     同一条目（命中），透传字段按当前 raw 刷新（陈旧值 = #M1 同类静默错值）；
+//  3. 结构同、const 值不同 → 不同条目（常量池布局依赖值本身，绝不复用）；
+//  4. fold spec 恒等返回、不进缓存（查找键成本 ≈ key 成本，见头注）。
+void test_canon_key_memo()
+{
+    auto& memo = nn::fused::canon_key_memo();
+    memo.clear();
+
+    const auto fresh = [](const nn::ExprSpec& raw) -> nn::CanonKey
+    {
+        nn::CanonKey c;
+        c.canon = nn::canonicalize_expr_spec(raw);
+        c.key = nn::expr_spec_key(c.canon);
+        return c;
+    };
+    const auto equiv = [](const nn::CanonKey& a, const nn::CanonKey& b)
+    { return a.key == b.key && nn::expr_spec_equal(a.canon, b.canon); };
+
+    // ── ① 未命中/命中均与现算等价；const 值不同必须分条目 ──
+    const nn::ExprSpec a1 = make_unary_const(nn::ExprOp::Mul, Scalar{2});
+    const nn::CanonKey a1_miss = nn::canonicalize_with_key(a1);
+    CHECK(equiv(a1_miss, fresh(a1)), "#P4: 未命中返回值须与现算 canonicalize+key 等价");
+    const nn::CanonKey a1_hit = nn::canonicalize_with_key(a1);
+    CHECK(equiv(a1_hit, fresh(a1)), "#P4: 命中返回值须与现算 canonicalize+key 等价");
+    CHECK(a1_hit.key == a1_miss.key, "#P4: 命中/未命中 key 须一致");
+    CHECK(memo.size() == 1, "#P4: 同一 spec 两次调用只占一条目");
+
+    const nn::ExprSpec a2 = make_unary_const(nn::ExprOp::Mul, Scalar{3});
+    CHECK(nn::canon_key_memo_index(a1) != nn::canon_key_memo_index(a2),
+          "#P4: const 值不同必须得到不同查找键（常量池布局依赖值）");
+    const nn::CanonKey a2r = nn::canonicalize_with_key(a2);
+    CHECK(memo.size() == 2, "#P4: 两种 const 值各占一条目");
+    CHECK(equiv(a2r, fresh(a2)), "#P4: 不同 const 值的返回值须各自与现算等价");
+    CHECK(!a2r.canon.consts.empty() && a2r.canon.consts[0] == Scalar{3},
+          "#P4: 不得复用另一 const 值的常量池");
+
+    // ── ② rparams 值：同条目 + 按当前 raw 刷新（无粘滞陈旧）──
+    const auto make_rp = [](Scalar rp)
+    {
+        nn::ExprSpec s;
+        s.views.push_back(nn::expr::linear());
+        s.rparams.push_back(rp);
+        nn::ExprInstr in;
+        in.op = static_cast<std::uint8_t>(nn::ExprOp::Mul);
+        in.dst = 0;
+        in.a = nn::expr::input(0);
+        in.b = nn::expr::rval(0);
+        s.instrs.push_back(in);
+        s.num_regs = 1;
+        return s;
+    };
+    const nn::ExprSpec b1 = make_rp(Scalar{0.5f});
+    const nn::ExprSpec b2 = make_rp(Scalar{0.25f});
+    CHECK(nn::canon_key_memo_index(b1) == nn::canon_key_memo_index(b2),
+          "#P4: rparams 值不进查找键（数量在结构口径里）");
+    const std::size_t before_b = memo.size();
+    const nn::CanonKey b1r = nn::canonicalize_with_key(b1);
+    CHECK(memo.size() == before_b + 1, "#P4: rparams 基线新增一条目");
+    const nn::CanonKey b2r = nn::canonicalize_with_key(b2);
+    CHECK(memo.size() == before_b + 1, "#P4: 仅 rparams 值不同须命中同一查找键");
+    CHECK(b2r.canon.rparams.size() == 1 && b2r.canon.rparams[0] == Scalar{0.25f},
+          "#P4: 命中后 rparams 必须按当前 raw 刷新（否则 push constant 走旧值）");
+    CHECK(equiv(b2r, fresh(b2)), "#P4: rparams 刷新后仍与现算逐字等价");
+    const nn::CanonKey b1r2 = nn::canonicalize_with_key(b1);
+    CHECK(b1r2.canon.rparams.size() == 1 && b1r2.canon.rparams[0] == Scalar{0.5f},
+          "#P4: 回切基线 rparams 须回到基线值");
+    CHECK(equiv(b1r2, fresh(b1)), "#P4: 回切后与现算等价");
+
+    // ── ③ matmul k/transB 与 RowMod param：同条目 + 透传字段刷新 ──
+    const auto make_mm = [](std::uint32_t k, std::uint8_t transB)
+    {
+        nn::ExprSpec s;
+        s.views = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
+        s.num_regs = 1;
+        s.matmul = nn::MatmulSpec{0, 1, 0, transB, k, 1};
+        s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add), 0,
+                            nn::expr::matmul_op(), nn::expr::input(2), {}});
+        return s;
+    };
+    const nn::ExprSpec c1 = make_mm(2, 0);
+    const nn::ExprSpec c2 = make_mm(5, 1);
+    CHECK(nn::canon_key_memo_index(c1) == nn::canon_key_memo_index(c2),
+          "#P4: matmul k/transB 不进查找键（同 expr_spec_key 口径）");
+    const std::size_t before_c = memo.size();
+    CHECK(equiv(nn::canonicalize_with_key(c1), fresh(c1)), "#P4: matmul 基线等价");
+    const nn::CanonKey c2r = nn::canonicalize_with_key(c2);
+    CHECK(memo.size() == before_c + 1, "#P4: matmul 同结构命中同一查找键");
+    CHECK(c2r.canon.matmul && c2r.canon.matmul->k == 5 && c2r.canon.matmul->transB == 1,
+          "#P4: 命中后 matmul k/transB 必须按当前 raw 刷新");
+    CHECK(equiv(c2r, fresh(c2)), "#P4: matmul 刷新后与现算逐字等价");
+
+    const auto make_rm = [](std::uint32_t mod)
+    {
+        nn::ExprSpec s;
+        s.views.push_back(nn::expr::row_mod(mod));
+        s.num_regs = 1;
+        s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add), 0,
+                            nn::expr::input(0), nn::expr::input(0), {}});
+        return s;
+    };
+    const nn::ExprSpec d1 = make_rm(2);
+    const nn::ExprSpec d2 = make_rm(4);
+    CHECK(nn::canon_key_memo_index(d1) == nn::canon_key_memo_index(d2),
+          "#P4: RowMod 运行期 param 不进查找键（vp 走运行时填充）");
+    const std::size_t before_d = memo.size();
+    CHECK(equiv(nn::canonicalize_with_key(d1), fresh(d1)), "#P4: RowMod 基线等价");
+    const nn::CanonKey d2r = nn::canonicalize_with_key(d2);
+    CHECK(memo.size() == before_d + 1, "#P4: RowMod 同结构命中同一查找键");
+    CHECK(d2r.canon.views.size() == 1 && d2r.canon.views[0].param == 4,
+          "#P4: 命中后 views[].param 必须按当前 raw 刷新");
+    CHECK(equiv(d2r, fresh(d2)), "#P4: RowMod 刷新后与现算逐字等价");
+
+    // ── ④ fold：恒等返回、不进缓存（最小 fold spec，仅测 canonicalize+key 语义）──
+    nn::ExprSpec f;
+    f.views.push_back(nn::expr::linear());
+    f.num_regs = 2;
+    f.fold = nn::FoldSpec{};
+    f.fold->k = 16;
+    f.fold->num_state = 1;
+    f.fold->inits = {Scalar{0}};
+    {
+        nn::ExprInstr b;
+        b.op = static_cast<std::uint8_t>(nn::ExprOp::Add);
+        b.dst = 1;
+        b.a = nn::expr::reg(0);
+        b.b = nn::expr::reduce(1);
+        f.fold->body.push_back(b);
+        nn::ExprInstr fin;
+        fin.op = static_cast<std::uint8_t>(nn::ExprOp::Add);
+        fin.dst = 0;
+        fin.a = nn::expr::reg(0);
+        fin.b = nn::expr::vec_state(0);
+        f.fold->finalize.push_back(fin);
+    }
+    const std::size_t before_f = memo.size();
+    const nn::CanonKey fr = nn::canonicalize_with_key(f);
+    CHECK(memo.size() == before_f, "#P4: fold spec 不进备忘录（恒等 + 查找键无净收益）");
+    CHECK(nn::expr_spec_equal(fr.canon, f), "#P4: fold 的 canon 须为 raw 恒等拷贝");
+    CHECK(fr.key == nn::expr_spec_key(f), "#P4: fold 的 key 须为 expr_spec_key(raw)");
+
+    memo.clear();
+    std::printf("[OK] test_canon_key_memo\n");
 }
 
 // ── 测试 13：IR-D emitter 抽象（一份 canonical IR → 多后端） ───────────
@@ -1176,7 +1404,9 @@ int main()
     test_input_order();
     test_matmul_chain_fuse();
     test_matmul_pure_chain_fuse();
+    test_matmul_multi_consumer_fuse();
     test_plan_cache_runtime_values();
+    test_canon_key_memo();
     test_emitter();
     test_fold_ash_tier_and_dead_store();
 
