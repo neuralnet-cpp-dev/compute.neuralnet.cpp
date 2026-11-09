@@ -12,6 +12,8 @@
 #include <new>        // for placement new（任务就地构造）
 #include <utility>    // for std::move / std::forward
 #include <algorithm>  // for std::transform (serial fallback)
+#include <bit>        // for std::countr_zero（调用者 slot 池）
+#include <cstdint>    // for std::uint64_t（调用者 slot 池位图）
 #include <numeric>    // for std::transform_reduce (serial fallback)
 #include <iterator>   // for std::distance
 #include <type_traits>
@@ -217,6 +219,50 @@ private:
     // 重抛，见 rethrow_if_failed —— 这里只是"至少记录一次"的持久观测点）
     std::atomic<std::size_t> task_exceptions_{0};
 
+    // ── 调用者 slot 池（#C2）────────────────────────────────────────
+    // 约定：slot ∈ [0, size()) 属于 worker；slot ≥ size() 属于"调用者"，
+    // 供 parallel_for_each_indexed 的调用者分片与 wait_for_latch 借用。
+    // 改动前调用者 slot 硬编码为 size()：嵌套并行或两个外部线程同时发起
+    // 并行区时，多个活跃 region 的调用者分片会共用同一条槽（per-slot 状态
+    // 数据竞争 / 唤醒与计数互相干扰）。这里改为每个活跃 region 入区时从
+    // 位图独占一个调用者 slot（bit 0 ⇒ size()，与非嵌套单调用者行为一致），
+    // 出区归还，因此嵌套层级与并发调用者各自独立。
+    static constexpr std::size_t kCallerSlotBits = 64;
+    std::atomic<std::uint64_t> caller_slots_in_use_{0};
+
+    [[nodiscard]] std::size_t acquire_caller_slot() noexcept
+    {
+        for (;;)
+        {
+            std::uint64_t cur = caller_slots_in_use_.load(std::memory_order_relaxed);
+            const std::uint64_t free_bits = ~cur;
+            // 64 层以上嵌套属病态路径：退回旧行为（共用 size()），不阻塞
+            if (free_bits == 0) return workers_.size();
+            const auto bit = static_cast<unsigned>(std::countr_zero(free_bits));
+            const std::uint64_t mask = std::uint64_t{1} << bit;
+            if (caller_slots_in_use_.compare_exchange_weak(cur, cur | mask,
+                                                           std::memory_order_acq_rel,
+                                                           std::memory_order_relaxed))
+                return workers_.size() + bit;
+        }
+    }
+
+    void release_caller_slot(std::size_t slot) noexcept
+    {
+        if (slot < workers_.size()) return;
+        const std::size_t bit = slot - workers_.size();
+        if (bit < kCallerSlotBits)
+            caller_slots_in_use_.fetch_and(~(std::uint64_t{1} << bit), std::memory_order_acq_rel);
+    }
+
+    // RAII：并行路径提前返回或异常重抛时都归还 slot
+    struct CallerSlotGuard
+    {
+        ThreadPool* pool;
+        std::size_t slot;
+        ~CallerSlotGuard() { pool->release_caller_slot(slot); }
+    };
+
 public:
     // ── worker 线程索引（每个 worker 在构造时绑定唯一 ID） ──────
     // 用于 parallel_for_each 内部识别当前执行线程，支持 per-worker 状态
@@ -351,10 +397,11 @@ private:
     //   3) 队列为空时阻塞等待 condition_variable（无超时轮询），
     //      由 finish_chunk 在 latch 归零时通知唤醒
     // 线程索引约定：调用者线程帮忙执行偷来的任务时，临时将
-    // tl_worker_index 置为 workers_.size()（调用者 slot），避免
+    // tl_worker_index 置为本 region 独占的调用者 slot（#C2：不再硬编码
+    // workers_.size()，嵌套/并发 region 各自独立），避免
     // parallel_for_each_indexed 的任务体与 worker 0 撞同一 slot；
     // 执行完恢复原值（嵌套并行时 worker 保留自己的索引）。
-    void wait_for_latch(std::atomic<int>& latch)
+    void wait_for_latch(std::atomic<int>& latch, std::size_t caller_slot)
     {
         // 阶段 1：短自旋（16 次 pause）——应对 latch 即将归零的快路径
         for (int spin = 0; spin < 16; ++spin)
@@ -375,9 +422,9 @@ private:
             }
             if (task)
             {
-                // 借用"调用者 slot 索引"执行，执行完恢复原值
+                // 借用本 region 的调用者 slot 执行，执行完恢复原值
                 const std::size_t saved = tl_worker_index;
-                tl_worker_index = workers_.size();
+                tl_worker_index = caller_slot;
                 task();
                 tl_worker_index = saved;
 
@@ -422,6 +469,10 @@ public:
         const std::size_t rem = total % n_chunks;
 
         // 原子计数器 + 首个异常记录（异常路径见 run_chunk）
+        // 本 region 独占一个调用者 slot（#C2），出区自动归还
+        const std::size_t caller_slot = acquire_caller_slot();
+        CallerSlotGuard caller_slot_guard{this, caller_slot};
+
         detail::RegionState st{static_cast<int>(n_chunks)};
 
         // 将前 n_chunks-1 个分块批量入队（仅一次加锁）；
@@ -470,15 +521,17 @@ public:
         }
 
         // work-stealing 等待：调用者帮忙处理队列任务而非空转
-        wait_for_latch(st.latch);
+        wait_for_latch(st.latch, caller_slot);
         rethrow_if_failed(st);
     }
 
     // ── 带 worker 索引的并行 for_each ────────────────────────────
     // 与 parallel_for_each 相同的分区和调度策略，但回调额外接收
-    // worker_index 参数（worker 线程 = 0..size()-1，调用者线程 = size()）。
+    // worker_index 参数（worker 线程 = 0..size()-1；调用者线程 = 本 region
+    // 独占的调用者 slot，非嵌套单 region 时即 size()，嵌套/并发 region 时
+    // 为 size()+k，见调用者 slot 池）。
     // 用于需要 per-worker 状态（如 BPE 训练的 local delta）的场景，
-    // 调用者可安全使用 index = n_threads 作为独立 slot，避免与 worker 0 冲突。
+    // 调用者可安全使用该 index 作为独立 slot，避免与 worker 0 冲突。
     template <typename Iterator, typename Func>
     void parallel_for_each_indexed(Iterator first, Iterator last, Func&& func)
     {
@@ -495,6 +548,10 @@ public:
 
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
+
+        // 本 region 独占一个调用者 slot（#C2），出区自动归还
+        const std::size_t caller_slot = acquire_caller_slot();
+        CallerSlotGuard caller_slot_guard{this, caller_slot};
 
         detail::RegionState st{static_cast<int>(n_chunks)};
 
@@ -525,7 +582,7 @@ public:
             }
         }
 
-        // 调用者处理最后一个分块，index = workers_.size()（不与任何 worker 冲突）
+        // 调用者处理最后一个分块，使用本 region 独占的调用者 slot
         {
             const std::size_t c = n_chunks - 1;
             const std::size_t len = base + (c < rem ? 1 : 0);
@@ -536,11 +593,11 @@ public:
                       [&]
                       {
                           for (auto it = beg; it != last; ++it)
-                              func(*it, workers_.size());
+                              func(*it, caller_slot);
                       });
         }
 
-        wait_for_latch(st.latch);
+        wait_for_latch(st.latch, caller_slot);
         rethrow_if_failed(st);
     }
 
@@ -562,6 +619,10 @@ public:
         const auto n_chunks = std::min(workers_.size(), total);
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
+        // 本 region 独占一个调用者 slot（#C2），出区自动归还
+        const std::size_t caller_slot = acquire_caller_slot();
+        CallerSlotGuard caller_slot_guard{this, caller_slot};
+
         detail::RegionState st{static_cast<int>(n_chunks)};
 
         {
@@ -604,7 +665,7 @@ public:
                       });
         }
 
-        wait_for_latch(st.latch);
+        wait_for_latch(st.latch, caller_slot);
         rethrow_if_failed(st);
     }
 
@@ -624,6 +685,10 @@ public:
         const auto n_chunks = std::min(workers_.size(), num_samples);
         const std::size_t base = num_samples / n_chunks;
         const std::size_t rem = num_samples % n_chunks;
+        // 本 region 独占一个调用者 slot（#C2），出区自动归还
+        const std::size_t caller_slot = acquire_caller_slot();
+        CallerSlotGuard caller_slot_guard{this, caller_slot};
+
         detail::RegionState st{static_cast<int>(n_chunks)};
 
         {
@@ -663,7 +728,7 @@ public:
                       });
         }
 
-        wait_for_latch(st.latch);
+        wait_for_latch(st.latch, caller_slot);
         rethrow_if_failed(st);
     }
 
@@ -683,6 +748,10 @@ public:
 
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
+        // 本 region 独占一个调用者 slot（#C2），出区自动归还
+        const std::size_t caller_slot = acquire_caller_slot();
+        CallerSlotGuard caller_slot_guard{this, caller_slot};
+
         detail::RegionState st{static_cast<int>(n_chunks)};
 
         {
@@ -731,7 +800,7 @@ public:
                       });
         }
 
-        wait_for_latch(st.latch);
+        wait_for_latch(st.latch, caller_slot);
         rethrow_if_failed(st);
     }
 
@@ -752,6 +821,10 @@ public:
 
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
+        // 本 region 独占一个调用者 slot（#C2），出区自动归还
+        const std::size_t caller_slot = acquire_caller_slot();
+        CallerSlotGuard caller_slot_guard{this, caller_slot};
+
         detail::RegionState st{static_cast<int>(n_chunks)};
 
         {
@@ -805,7 +878,7 @@ public:
                       });
         }
 
-        wait_for_latch(st.latch);
+        wait_for_latch(st.latch, caller_slot);
         rethrow_if_failed(st);
     }
 
@@ -862,6 +935,10 @@ public:
 
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
+        // 本 region 独占一个调用者 slot（#C2），出区自动归还
+        const std::size_t caller_slot = acquire_caller_slot();
+        CallerSlotGuard caller_slot_guard{this, caller_slot};
+
         detail::RegionState st{static_cast<int>(n_chunks)};
 
         // 部分和按固定块下标存放（与调度无关 → 确定性）
@@ -934,7 +1011,7 @@ public:
                       });
         }
 
-        wait_for_latch(st.latch);
+        wait_for_latch(st.latch, caller_slot);
         // 失败的分块不会写自己的 partials 槽；必须先重抛，绝不合并半成品
         rethrow_if_failed(st);
 
@@ -967,6 +1044,10 @@ public:
 
         const std::size_t base = total / n_chunks;
         const std::size_t rem = total % n_chunks;
+        // 本 region 独占一个调用者 slot（#C2），出区自动归还
+        const std::size_t caller_slot = acquire_caller_slot();
+        CallerSlotGuard caller_slot_guard{this, caller_slot};
+
         detail::RegionState st{static_cast<int>(n_chunks)};
         // 部分和按固定块下标存放（边界 = f(total)，与调度无关）
         std::vector<T> partials(n_chunks);
@@ -1044,7 +1125,7 @@ public:
                       });
         }
 
-        wait_for_latch(st.latch);
+        wait_for_latch(st.latch, caller_slot);
         rethrow_if_failed(st);
 
         T result = std::move(partials[0]);
@@ -1087,7 +1168,8 @@ public:
     // 返回当前线程的 worker 索引（0..size()-1）。
     // 非 worker 线程默认返回 0；当调用者线程在 wait_for_latch 中帮忙
     // 执行偷来的任务、或处理 parallel_for_each_indexed 的调用者分片时，
-    // 返回 size()（调用者 slot，不与任何 worker 冲突）。
+    // 返回本 region 独占的调用者 slot（非嵌套时 = size()；嵌套/并发
+    // region 各占一条，不与任何 worker 或其它 region 冲突）。
     [[nodiscard]] static std::size_t worker_index() noexcept { return tl_worker_index; }
 };
 

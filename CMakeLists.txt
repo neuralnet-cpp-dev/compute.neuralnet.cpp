@@ -302,6 +302,9 @@ if(NOT MSVC)
     target_compile_options(threadpool_exception_test PRIVATE -fexceptions)
 endif()
 
+# ── 嵌套并行的调用者 slot 隔离（审查报告-2026-11-09 #C2）────────────────
+nn_add_engine_test(threadpool_nested_test tests/threadpool_nested_test.cpp)
+
 if(TARGET nn_gpu)
     nn_add_engine_test(scan_bitwise_test tests/scan_bitwise_test.cpp)
     target_link_libraries(scan_bitwise_test PRIVATE nn_cpu nn_gpu)
