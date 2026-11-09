@@ -1829,6 +1829,13 @@ public:
                                                 std::size_t cols,
                                                 Precision P = Precision::F32) override
     {
+        // IR-C 录制段：入图不求值（占位 Tensor）。方案 A：状态读写归属引擎 TU
+        // （原 NVI 拦截的位置与参数，先于 scan 记录/边界 cast）。CPU 的
+        // begin_expr/end_expr 是 no-op——本分支仅在跨引擎误入本引擎求值时可达
+        // （由 check_graph_owner_ fail-fast），普通 CPU 路径行为不变。
+        if (auto* g = fused::recording_graph())
+            return record_graph_node_(*g, spec, inputs, rows, cols,
+                                      /*vector_out=*/false, P);
         scan_record_variant_(spec, inputs, P);
         trace_variant_(spec, inputs, P);
         // CPU 无带类型融合变体：任何非 f32（输入或输出精度）都走边界 cast
@@ -1859,6 +1866,11 @@ public:
                                                        std::size_t rows, std::size_t cols,
                                                        Precision P = Precision::F32) override
     {
+        // IR-C 录制段：归约向量占位入图（方案 A，同 eval_expr_impl 顶部；
+        // CPU 普通路径 begin/end 为 no-op → 此处恒不命中，行为不变）。
+        if (auto* g = fused::recording_graph())
+            return record_graph_node_(*g, spec, inputs, rows, cols,
+                                      /*vector_out=*/true, P);
         scan_record_variant_(spec, inputs, P);
         trace_variant_(spec, inputs, P);
         if (P != Precision::F32 || !all_f32(inputs))
@@ -1887,6 +1899,9 @@ public:
                                                           std::size_t rows, std::size_t cols,
                                                           Tensor& dst) override
     {
+        // 「录制段内不支持」守卫（方案 A：归属引擎 TU；文案与原 NVI 逐字一致）。
+        if (fused::is_recording())
+            NN_FAIL("eval_expr_reduce_into: 不支持在 begin_expr/end_expr 录制段内使用");
         scan_record_variant_(spec, inputs, dst.precision());
         if (dst.precision() != Precision::F32 || !all_f32(inputs))
         {
@@ -1920,6 +1935,10 @@ public:
                                                    std::span<const Tensor> inputs, std::size_t rows,
                                                    std::size_t cols, Tensor& dst) override
     {
+        // IR-C 录制段（P2 写穿物化）：目标传递节点入图（方案 A：与原 NVI 相同
+        // 的位置与参数，在 scan 记录/shape 守卫之前；CPU 普通路径恒不命中）。
+        if (auto* g = fused::recording_graph())
+            return record_graph_into_node_(*g, spec, inputs, rows, cols, dst);
         scan_record_variant_(spec, inputs, dst.precision());
         // 目标传递：out 可能是 f16 —— 在 f32 空间求值后 cast_into 写回原存储
         //（out 常同时是输入之一：抬 f32 的拷贝即"读旧值"，语义正确）。
@@ -1951,6 +1970,10 @@ public:
                                                          std::size_t rows, std::size_t cols,
                                                          std::span<Tensor> outs) override
     {
+        // 「录制段内不支持」守卫（方案 A：归属引擎 TU；文案与原 NVI 逐字一致，
+        // 在空指令表守卫之前 = 原 NVI 的相对次序）。epoch 守卫在 NVI。
+        if (fused::is_recording())
+            NN_FAIL("eval_expr_multi_into: 不支持在 begin_expr/end_expr 录制段内使用");
         if (raw_spec.instrs.empty()) NN_FAIL("eval_expr_multi_into: 空指令表");
         auto r0 = eval_expr_impl(raw_spec, inputs, rows, cols,
                                  /*vector_out=*/false, outs[0]);

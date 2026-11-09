@@ -153,8 +153,9 @@ public:
     [[nodiscard]] bool batch_active() const noexcept override { return backend_->in_batch(); }
 
     // ── 表达式录制（IR-C）──────────────────────────────
-    // begin_expr 开启录制：期间 eval_expr/eval_expr_reduce 经 NVI 拦截入图
-    // （expr_graph.hpp），返回带 virtual_tag 的占位 GPU 张量（真实存储）。
+    // begin_expr 开启录制：期间 eval_expr/eval_expr_reduce 在引擎 eval*_impl
+    // 顶部拦截入图（方案 A：录制状态读写全部归属引擎 TU，跨 DSO TLS 单副本
+    // 生效），返回带 virtual_tag 的占位 GPU 张量（真实存储）。
     // end_expr 融合分析（fuse_expr_graph）→ 复合 kernel 直接写回各 tail
     // 占位存储（output_override），中间量内联为寄存器。复合 spec 未命中
     // AOT 注册表 miss = JIT 现编兜底（须在 scan_exprs 覆盖录制段以预热）。
@@ -1905,6 +1906,13 @@ public:
                                                 std::size_t cols,
                                                 Precision P = Precision::F32) override
     {
+        // IR-C 录制段：入图不求值（占位 Tensor，end_expr 融合执行）。方案 A：
+        // 录制状态读写与 begin_expr/end_expr 同在引擎 TU（跨 DSO TLS 单副本
+        // 生效点）；拦截在 canonicalize/fold 选路之前 = 原 NVI 的位置与参数
+        // （record_graph_node_ 收 raw spec）。
+        if (auto* g = fused::recording_graph())
+            return record_graph_node_(*g, raw_spec, inputs, rows, cols,
+                                      /*vector_out=*/false, P);
         // 无注册表模式（NN_EXPR_SCAN 收集器 TU / 注册表缺失）：融合分支整体
         // 不编译 → rows/cols 仅在 NN_FUSED_REGISTRY_EMBEDDED 内被使用 →
         // 显式消 unused-parameter（clang -Werror）。
@@ -2061,7 +2069,14 @@ public:
                                                        std::span<const Tensor> inputs,
                                                        std::size_t rows, std::size_t cols,
                                                        Precision P = Precision::F32) override
-    { return eval_expr_reduce_run_(raw_spec, inputs, rows, cols, P, nullptr); }
+    {
+        // IR-C 录制段：入图不求值（归约向量占位，end_expr 融合执行）——方案 A，
+        // 归属引擎 TU（原 NVI 拦截位置与参数，vector_out=true）。
+        if (auto* g = fused::recording_graph())
+            return record_graph_node_(*g, raw_spec, inputs, rows, cols,
+                                      /*vector_out=*/true, P);
+        return eval_expr_reduce_run_(raw_spec, inputs, rows, cols, P, nullptr);
+    }
 
     // 归约向量的目标传递版（T1_58 显存修复 #L2）：结果写进 out 的既有存储。
     // 仅 f32 dst 支持零分配直写；其他精度 → 参考求值 + cast_into 写回原存储。
@@ -2071,6 +2086,10 @@ public:
                                                           std::size_t rows, std::size_t cols,
                                                           Tensor& out) override
     {
+        // 「录制段内不支持」守卫（方案 A：与 begin/end 同 TU 才读得到 DLL TLS
+        // 副本；文案与原 NVI 逐字一致）。epoch 守卫在 NVI（与录制状态无关）。
+        if (fused::is_recording())
+            NN_FAIL("eval_expr_reduce_into: 不支持在 begin_expr/end_expr 录制段内使用");
         if (out.precision() != Precision::F32)
         {
             NN_TRY(t, eval_expr_reduce_impl(raw_spec, inputs, rows, cols, Precision::F32));
@@ -2185,6 +2204,12 @@ public:
                                                    std::span<const Tensor> inputs, std::size_t rows,
                                                    std::size_t cols, Tensor& dst) override
     {
+        // IR-C 录制段（P2 写穿物化）：目标传递节点——输出即 dst 既有张量，
+        // end_expr 的复合 kernel 直接写回其存储（多输出槽 0）。方案 A：拦截与
+        // record_graph_into_node_ 归属引擎 TU（原 NVI 的位置与参数，在 shape/
+        // fold 守卫之前）。
+        if (auto* g = fused::recording_graph())
+            return record_graph_into_node_(*g, raw_spec, inputs, rows, cols, dst);
         if (dst.rows() != rows || dst.cols() != cols) NN_FAIL("eval_expr_into: dst shape mismatch");
         // fold 形态只经 eval_expr（PC 需 fold_k，本入口不传）——显式拒绝
         if (raw_spec.fold)
@@ -2300,6 +2325,10 @@ public:
                                                          std::size_t rows, std::size_t cols,
                                                          std::span<Tensor> outs) override
     {
+        // 「录制段内不支持」守卫（方案 A：归属引擎 TU；文案与原 NVI 逐字一致，
+        // 在 fold/归约守卫之前 = 原 NVI 的相对次序）。epoch 守卫在 NVI。
+        if (fused::is_recording())
+            NN_FAIL("eval_expr_multi_into: 不支持在 begin_expr/end_expr 录制段内使用");
         if (raw_spec.fold || expr_spec_reduce_axis(raw_spec) != -1)
             NN_FAIL("eval_expr_multi_into: 仅支持逐元素/前置 matmul 段 spec（无 fold、无归约）");
         // P4 残余：经 thread_local 备忘录（键值不变，见 expr_graph.hpp）。

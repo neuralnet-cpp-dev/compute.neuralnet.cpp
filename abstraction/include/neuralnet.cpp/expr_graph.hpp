@@ -280,9 +280,16 @@ struct FusedKernel
 };
 
 // ── 全局录制状态（线程局部，D3 修复） ──────────────────────────────────
-// begin_expr/end_expr（GPU 引擎执行 / scan 引擎登记）开启/关闭录制图。
-// dsl::compute 的 scan 分支与 GpuEngine::eval_expr 通过 recording_graph()
-// 判断"当前是否在录制"以及把表达式加入录制图。
+// begin_expr/end_expr（GPU 引擎执行）开启/关闭录制图；引擎 eval*_impl 顶部的
+// 录制拦截经 recording_graph()/is_recording() 判断"当前是否在录制"并把表达式
+// 加入录制图。
+//
+// ⚠ 跨 DSO 约束（方案 A）：本 thread_local 副本按**模块**（EXE/DLL/.so）分裂
+// ——Windows PE 下消费方 TU 与 nn-gpu.dll 各持一份、永不共享。因此该状态的
+// **读与写必须全部发生在引擎 TU**（begin_expr/end_expr + 两引擎 eval*_impl
+// 顶部的录制拦截）；消费方侧的 ComputeEngine NVI 不得触碰本组函数（否则
+// Windows 下录制空转，回归锁 = src/fused_gpu_test.cpp P10-④）。Linux ELF
+// 弱 TLS 可归并共享，但属于实现巧合、不得依赖。
 //
 // D3 修复：录制图由 thread_local unique_ptr 持有（堆分配），而非引擎成员
 // （std::optional<ExprGraph> recording_）。原设计中 recording_ 是引擎成员

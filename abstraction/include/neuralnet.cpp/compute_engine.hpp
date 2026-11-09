@@ -1444,10 +1444,8 @@ public:
         NN_TRY(ec, bind_check_(inputs));
         if (!spec.extras.empty())
             NN_FAIL("eval_expr: 多输出 spec（P2 extras）请走 eval_expr_multi_into");
-        // IR-C 录制段：入图不求值（占位 Tensor，end_expr 融合执行）
-        if (auto* g = fused::recording_graph())
-            return record_graph_node_(*g, spec, inputs, rows, cols,
-                                      /*vector_out=*/false, P);
+        // IR-C 录制段拦截在引擎 eval_expr_impl 顶部（方案 A：录制状态读写
+        // 只发生在引擎 TU——跨 DSO TLS 单副本生效，NVI 不读任何录制状态）。
         // 变体选路 / 边界 cast 归因**只做一次**：整段下沉到引擎的
         // eval_expr_impl（它本来就要算 key/精度签名）——F2 修复。
         return eval_expr_impl(spec, inputs, rows, cols, P);
@@ -1465,10 +1463,7 @@ public:
         NN_TRY(ec, bind_check_(inputs));
         if (!spec.extras.empty())
             NN_FAIL("eval_expr_reduce: 多输出 spec（P2 extras）请走 eval_expr_multi_into");
-        // IR-C 录制段：入图不求值（归约向量占位，end_expr 融合执行）
-        if (auto* g = fused::recording_graph())
-            return record_graph_node_(*g, spec, inputs, rows, cols,
-                                      /*vector_out=*/true, P);
+        // IR-C 录制段拦截在引擎 eval_expr_reduce_impl 顶部（方案 A，同 eval_expr）
         // 变体选路 / 边界 cast 归因整段下沉到引擎的 eval_expr_reduce_impl（F2 修复）
         return eval_expr_reduce_impl(spec, inputs, rows, cols, P);
     }
@@ -1488,8 +1483,8 @@ public:
         NN_TRY(ec2, bind_check_({&out}));
         if (!spec.extras.empty())
             NN_FAIL("eval_expr_reduce_into: 多输出 spec（P2 extras）请走 eval_expr_multi_into");
-        if (fused::is_recording())
-            NN_FAIL("eval_expr_reduce_into: 不支持在 begin_expr/end_expr 录制段内使用");
+        // 「录制段内不支持」守卫在引擎 eval_expr_reduce_into_impl 顶部（方案 A：
+        // 归属引擎 TU，NVI 不读录制状态）。epoch 守卫留在 NVI（与录制状态无关）。
         WriteEpochGuard wg{out};
         return eval_expr_reduce_into_impl(spec, inputs, rows, cols, out);
     }
@@ -1509,12 +1504,10 @@ public:
         if (!spec.extras.empty())
             NN_FAIL("eval_expr_into: 多输出 spec（P2 extras）请走 eval_expr_multi_into");
         WriteEpochGuard wg{out};
-        // IR-C 录制段（P2 写穿物化）：目标传递节点——输出即 dst 既有张量，
-        // end_expr 的复合 kernel 直接写回其存储（多输出槽 0）。物化发生在
-        // end_expr 且不经本入口，故写版本在**录制点**就推进（保守方向）。
-        if (auto* g = fused::recording_graph())
-            return record_graph_into_node_(*g, spec, inputs, rows, cols, out);
-        // 变体选路 / 边界 cast 归因整段下沉到引擎的 eval_expr_into_impl（F2 修复）
+        // IR-C 录制段（P2 写穿物化）拦截在引擎 eval_expr_into_impl 顶部（方案 A：
+        // 目标传递节点的录制检查与 record_graph_into_node_ 同在引擎 TU）。写版本
+        // 仍在**录制点之前的本入口**推进 epoch（保守方向，语义不变）；物化发生在
+        // end_expr 且不经本入口。
         return eval_expr_into_impl(spec, inputs, rows, cols, out);
     }
 
@@ -1540,8 +1533,8 @@ public:
         NN_TRY(ec, bind_check_(inputs));
         NN_TRY(ec2, bind_check_(outs));
         WriteEpochGuardMulti wgs{outs};   // 写版本：多输出逐个推进
-        if (fused::is_recording())
-            NN_FAIL("eval_expr_multi_into: 不支持在 begin_expr/end_expr 录制段内使用");
+        // 「录制段内不支持」守卫在引擎 eval_expr_multi_into_impl 顶部（方案 A：
+        // 归属引擎 TU，NVI 不读录制状态；epoch 守卫留在 NVI）。
         if (outs.size() != spec.extras.size() + 1)
             NN_FAIL("eval_expr_multi_into: outs 数量 != 1 + extras 数量");
         // 存储精度门（P10-④：原「仅全 f32」放宽到 F32/F16）——BF16/F64/T1_58
