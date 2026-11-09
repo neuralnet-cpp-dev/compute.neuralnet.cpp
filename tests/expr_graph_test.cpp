@@ -77,9 +77,9 @@ nn::Tensor make_tensor(nn::ComputeEngine& eng, std::size_t rows, std::size_t col
 
 // 录制占位 Tensor（真实存储 + virtual_tag，同旧测试 Tensor::cpu + set_virtual_tag）
 nn::Tensor make_placeholder(nn::ComputeEngine& eng, std::size_t rows, std::size_t cols,
-                            std::uint64_t tag)
+                            std::uint64_t tag, nn::Precision prec = nn::Precision::F32)
 {
-    nn::Tensor t = eng.create_tensor(rows, cols);
+    nn::Tensor t = eng.create_tensor(rows, cols, prec);
     t.set_virtual_tag(tag);
     return t;
 }
@@ -1388,6 +1388,116 @@ void test_fold_ash_tier_and_dead_store()
     std::printf("[OK] test_fold_ash_tier_and_dead_store\n");
 }
 
+// ── 测试 13（P10-④）：F16 菱形进 P2 分量（写穿多输出 + NVI 边界 cast）────
+// A = x*0.3；B = A*0.7；C = A*1.3（B/C 同时消费 A → 菱形），节点 prec=F16。
+// 结构：p2_eligible 精度门 F32/F16（P10-④ 放宽）→ 单 kernel
+//       members=3 / extras=[A,B] / prec=F16 / tail=C。
+// 执行：eval_expr_multi_into 收 f16 输入 + f16 输出 → NVI 边界 cast
+//       （输入抬 f32 → 全 f32 快路跑 V0 解释器 → f16 输出槽 cast_into 落回）；
+//       改动前 NVI 对非全 f32 直接报错。
+// 数值两条参考（算子全用乘法：避免 fma 收缩在"单 kernel"与"逐节点"两条
+// f32 路径间产生不同的舍入点）：
+//  ① f32 链（中间不舍入）→ 逐槽按 f16 舍入：融合结果应**逐位一致**——
+//    融合在 f32 寄存器内传递中间值、写回时才舍入，与该参考同一舍入点；
+//    f16 在本用例值域（O(0.1~1)）相邻值间距 ≥2^-14≈6e-5，1e-6 容差 =
+//    逐位等值断言（两个不同的 f16 值差不出这么小）。
+//  ② 逐节点 f16 参考（每节点各舍入一次，= 融合前的执行形态）：中间值舍入
+//    点不同 → 差 ≤ 传播的 f16 半 ULP：|A|≤0.79 半 ULP≤2.4e-4，
+//    B 链 ≤ 0.7×2.4e-4 + 半 ULP(0.55) ≈ 3e-4、C 链 ≤ 1.3×2.4e-4 +
+//    半 ULP(1.03) ≈ 8.1e-4 → 容差 2e-3（约 2.5× 余量）。
+void test_f16_diamond()
+{
+    auto eng_owner = nn::create_cpu_engine();
+    nn::ComputeEngine& eng = *eng_owner;
+    const std::size_t rows = 4, cols = 8;
+    nn::ExprGraph g;
+    // 输入以 f16 存储上传（先按 f16 舍入，两条路径读到同一位型）
+    nn::Matrix xm(rows, cols);
+    {
+        auto sp = xm.span();
+        for (std::size_t i = 0; i < sp.size(); ++i) sp[i] = 0.5f + static_cast<float>(i) * 0.07f;
+    }
+    auto x_r = eng.from_matrix(xm, nn::Precision::F16);
+    CHECK(static_cast<bool>(x_r), "f16 输入构造");
+    if (!x_r) return;
+    const nn::Tensor& x = *x_r;
+    const nn::ExprSpec m30 = make_unary_const(nn::ExprOp::Mul, Scalar{0.3f});
+    const nn::ExprSpec m70 = make_unary_const(nn::ExprOp::Mul, Scalar{0.7f});
+    const nn::ExprSpec m13 = make_unary_const(nn::ExprOp::Mul, Scalar{1.3f});
+
+    const int nA = g.add_node(m30, std::vector<nn::Tensor>{x}, rows, cols,
+                              /*vector_out=*/false, nn::Precision::F16);
+    nn::Tensor yt = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)],
+                                     nn::Precision::F16);
+    (void)g.add_node(m70, std::vector<nn::Tensor>{yt}, rows, cols, false, nn::Precision::F16);
+    nn::Tensor yt2 = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)],
+                                      nn::Precision::F16);
+    (void)g.add_node(m13, std::vector<nn::Tensor>{yt2}, rows, cols, false, nn::Precision::F16);
+
+    auto kernels = fuse_expr_graph(g);
+    CHECK(kernels.size() == 1, "F16 菱形：p2_eligible 放宽后融合为单 kernel");
+    if (kernels.size() != 1) return;
+    CHECK(kernels[0].members.size() == 3, "F16 菱形：3 成员（A,B,C）");
+    CHECK(kernels[0].spec.extras.size() == 2, "F16 菱形：extras=[A,B]（写穿）");
+    CHECK(kernels[0].prec == nn::Precision::F16, "F16 菱形：分量 prec=F16");
+    CHECK(kernels[0].tail == nA + 2, "F16 菱形：tail=C（末节点）");
+
+    // 执行：f16 输入 + f16 输出（核心执行断言——NVI 边界 cast）
+    std::vector<nn::Tensor> kinputs;
+    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    std::vector<nn::Tensor> kouts;
+    for (int k = 0; k < 3; ++k)
+        kouts.push_back(eng.create_tensor(rows, cols, nn::Precision::F16));
+    auto mul_r = eng.eval_expr_multi_into(kernels[0].spec, kinputs, rows, cols, kouts);
+    CHECK(static_cast<bool>(mul_r), "F16 多输出求值成功（NVI 边界 cast）");
+    if (!mul_r)
+    {
+        std::printf("    err=%s\n", mul_r.error().message.c_str());
+        return;
+    }
+    // 槽序（与 test_multi_consumer 同）：[0]=tail(C)，[1]=A，[2]=B
+
+    // 参考①：f32 链（中间不舍入）→ 逐槽舍入 f16 —— 融合结果逐位一致
+    auto a32 = eng.eval_expr(m30, std::vector<nn::Tensor>{x}, rows, cols, nn::Precision::F32);
+    CHECK(static_cast<bool>(a32), "参考① f32 链 A 求值");
+    if (!a32) return;
+    auto b32 = eng.eval_expr(m70, std::vector<nn::Tensor>{*a32}, rows, cols, nn::Precision::F32);
+    auto c32 = eng.eval_expr(m13, std::vector<nn::Tensor>{*a32}, rows, cols, nn::Precision::F32);
+    CHECK(static_cast<bool>(b32) && static_cast<bool>(c32), "参考① f32 链 B/C 求值");
+    if (!b32 || !c32) return;
+    auto a16r = eng.cast(*a32, nn::Precision::F16);
+    auto b16r = eng.cast(*b32, nn::Precision::F16);
+    auto c16r = eng.cast(*c32, nn::Precision::F16);
+    CHECK(static_cast<bool>(a16r) && static_cast<bool>(b16r) && static_cast<bool>(c16r),
+          "参考① f32→f16 逐槽舍入");
+    if (!a16r || !b16r || !c16r) return;
+    // 槽 ↔ 参考：[0]=C，[1]=A，[2]=B；1e-6 = 逐位等值（f16 值域 O(0.1~1)，
+    // 相邻值间距 ≥2^-14≈6e-5 → 差不出 1e-6，只有"完全相同"能过）
+    CHECK(max_abs_diff(matrix_of(eng, kouts[0]), matrix_of(eng, *c16r)) < 1e-6f,
+          "融合[tail=C] == f32 链舍入（逐位）");
+    CHECK(max_abs_diff(matrix_of(eng, kouts[1]), matrix_of(eng, *a16r)) < 1e-6f,
+          "融合[extras A] == f32 链舍入（逐位）");
+    CHECK(max_abs_diff(matrix_of(eng, kouts[2]), matrix_of(eng, *b16r)) < 1e-6f,
+          "融合[extras B] == f32 链舍入（逐位）");
+
+    // 参考②：逐节点 f16（每节点各舍入一次 = 融合前的执行形态）→ 融合前后对拍
+    auto a16 = eng.eval_expr(m30, std::vector<nn::Tensor>{x}, rows, cols, nn::Precision::F16);
+    CHECK(static_cast<bool>(a16), "参考② 逐节点 f16 A 求值");
+    if (!a16) return;
+    auto b16 = eng.eval_expr(m70, std::vector<nn::Tensor>{*a16}, rows, cols, nn::Precision::F16);
+    auto c16 = eng.eval_expr(m13, std::vector<nn::Tensor>{*a16}, rows, cols, nn::Precision::F16);
+    CHECK(static_cast<bool>(b16) && static_cast<bool>(c16), "参考② 逐节点 f16 B/C 求值");
+    if (!b16 || !c16) return;
+    // A 是根节点（输入未再舍入）→ 与融合 extras[0] 逐位；B/C 走 f16 量级容差
+    CHECK(max_abs_diff(matrix_of(eng, kouts[1]), matrix_of(eng, *a16)) < 1e-6f,
+          "融合[extras A] == 逐节点 f16 A（根节点逐位）");
+    CHECK(max_abs_diff(matrix_of(eng, kouts[2]), matrix_of(eng, *b16)) < 2e-3f,
+          "融合[extras B] ≈ 逐节点 f16 B（f16 半 ULP 传播量级）");
+    CHECK(max_abs_diff(matrix_of(eng, kouts[0]), matrix_of(eng, *c16)) < 2e-3f,
+          "融合[tail C] ≈ 逐节点 f16 C（f16 半 ULP 传播量级）");
+    std::printf("[OK] test_f16_diamond (kernels=%zu)\n", kernels.size());
+}
+
 } // namespace
 
 int main()
@@ -1409,6 +1519,7 @@ int main()
     test_canon_key_memo();
     test_emitter();
     test_fold_ash_tier_and_dead_store();
+    test_f16_diamond();
 
     if (g_fail == 0)
     {
