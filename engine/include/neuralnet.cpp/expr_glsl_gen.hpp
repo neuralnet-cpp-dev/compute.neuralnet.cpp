@@ -474,6 +474,13 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
                      /*vec4=*/false, /*native16=*/false, /*wrap=*/false)
               << ";\n";
         }
+        // P10-① 多输出（extras）：尾链寄存器存活期内写额外输出缓冲——索引与
+        // 主输出同式（grow*cols+col == (batch*m_per+row)*cols+col；调用方已在
+        // rr<m_per && cc<cols 守卫内）。仅 spec.extras 非空时发射：
+        // ksplit_reduce 恒 extras 空（其资格守卫拒绝）→ 不会出现 bex 未声明引用。
+        for (std::size_t k = 0; k < spec.extras.size(); ++k)
+            L << "    bex" << k << "[grow * cols + col] = r"
+              << static_cast<int>(spec.extras[k]) << ";\n";
         L << "    return r" << last_dst << ";\n";
     }
     else
@@ -548,6 +555,10 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
     // 输出声明钉成 float、写原始 acc（不做 f16 舍入）——否则 f16 签名会按
     // 2B/元素写进 4B/元素的缓冲（静默错值）。最终精度由伴生 #kr 落盘。
     if (k_split && (block != EXPR_MATMUL_BLOCK_FINE || expr_prec_sig_is_dispatch(sig))) return {};
+    // P10-① 多输出（extras）：仅 V0 全 f32（与逐元素生成器同款门禁——extras
+    // 的元素类型不在 ExprPrecSig 里，typed/分派/native16 变体不发 extras）；
+    // #ks 写部分和不跑尾链 → 拒绝（运行期留在细 tile 路径，降级非错误）。
+    if (!spec.extras.empty() && (sig != 0 || k_split)) return {};
     const MatmulSpec& mm = *spec.matmul;
     const std::size_t n_inputs = spec.views.size();
     const std::uint32_t a_slot = mm.a_input;
@@ -619,6 +630,12 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
         //（见本函数头 k_split 段：写的是原始部分和，不做精度落盘）。
         L << "layout(std430, binding = " << n_inputs << ") writeonly buffer BufOut { "
           << ((out_f16 && !k_split) ? "float16_t" : "float") << " bout[]; };\n";
+    // P10-① 多输出（extras，V0 only——守卫在函数头）：bex<k> 绑定在主输出
+    // 之后（binding = n_inputs+1+k，与逐元素生成器 / 后端 extra_outs 槽同序；
+    // 写点在 eval_tail 内，见 glsl_emit_matmul_tail_fn）。
+    for (std::size_t k = 0; k < spec.extras.size(); ++k)
+        L << "layout(std430, binding = " << (n_inputs + 1 + k)
+          << ") writeonly buffer BufOut" << (k + 1) << " { float bex" << k << "[]; };\n";
     // vec4 别名视图（A/B 全局快路径专用；同 binding 双声明 std430，op 级
     // matmul_tiled 同款）。a_slot==b_slot 时不发别名、快路径整体关闭。
     // f16 槽的别名用 uvec2（4×half = 8B，std430 步长恰好 8）→ 由

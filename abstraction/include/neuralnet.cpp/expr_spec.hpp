@@ -1092,12 +1092,14 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S = 8;
     if (spec.rparams.size() > EXPR_MAX_CONSTS)
         NN_FAIL("validate_expr_spec: too many runtime params");
     if (spec.views.size() != num_inputs) NN_FAIL("validate_expr_spec: views count != inputs count");
-    // P2 多输出（extras，IR-C 写穿物化）：仅纯逐元素 spec；额外输出寄存器须
-    // 被某指令定义、槽互异、且不与主输出（instrs.back().dst）重复。
+    // P2 多输出（extras，IR-C 写穿物化）：纯逐元素与 **matmul spec**（P10-①
+    // 多消费者 matmul 头经 P2 写穿物化；生成器侧 V0/非 ksplit 门禁缺则降级
+    // 派发、非错误）；fold/归约仍拒绝。额外输出寄存器须被某指令定义、槽互异、
+    // 且不与主输出（instrs.back().dst）重复。
     if (!spec.extras.empty())
     {
-        if (spec.matmul || spec.fold)
-            NN_FAIL("validate_expr_spec: extras 仅支持纯逐元素 spec（无 matmul/fold）");
+        if (spec.fold)
+            NN_FAIL("validate_expr_spec: extras 不支持 fold spec");
         if (expr_spec_reduce_axis(spec) != -1)
             NN_FAIL("validate_expr_spec: extras 仅支持纯逐元素 spec（无归约）");
         if (spec.extras.size() > EXPR_MAX_EXTRA_OUT)

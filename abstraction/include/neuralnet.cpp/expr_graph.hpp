@@ -623,13 +623,22 @@ namespace fused
     // ── P2 分量标记（写穿物化）──────────────────────────────────────────
     // 纯逐元素 F32 同形状同精度节点经**依赖边**连通成组（含多消费者/菱形）：
     // 组内全部成员物化（多输出 kernel，spec.extras = 除尾成员外的输出寄存器）
-    // → 中间量逃逸/多消费者不再是融合边界。非 F32 / matmul / fold / 归约 /
+    // → 中间量逃逸/多消费者不再是融合边界。非 F32 / fold / 归约 /
     // 归约输出走 P1 链语义（单输出，中间量契约不变）。
+    // P10-①：**多消费者**且带尾链的 matmul 头也进分量——其输出是普通寄存器
+    // （instrs.back().dst），经 extras 写穿物化：组内消费者 Linear 直替读寄存器、
+    // 组外消费者读物化占位，多消费者不再是 matmul 头的融合边界。
+    // 单消费者 matmul 头保持 P1 链语义（既有融合决策逐字不变——S5 形态不受
+    // 影响）；纯 matmul（instrs 空）无输出寄存器可写穿（"matmul 输出可寄存器
+    // 化"未做），恒走 P1。
     const auto p2_eligible = [&](std::size_t i) -> bool
     {
         const auto& N = g.nodes[i];
-        return !N.vector_out && N.prec == Precision::F32 && !N.spec.instrs.empty() &&
-               !N.spec.matmul && !N.spec.fold && expr_spec_reduce_axis(N.spec) == -1;
+        if (N.vector_out || N.prec != Precision::F32 || N.spec.instrs.empty() ||
+            N.spec.fold || expr_spec_reduce_axis(N.spec) != -1)
+            return false;
+        if (N.spec.matmul) return consumers[i].size() >= 2;
+        return true;
     };
     std::vector<int> uf_parent(g.nodes.size());
     for (std::size_t i = 0; i < uf_parent.size(); ++i)
@@ -821,6 +830,10 @@ namespace fused
         fused.rparams = std::move(rparams);
         fused.instrs = std::move(instrs);
         fused.num_regs = static_cast<std::uint32_t>(reg_base + Bs.num_regs);
+        // P10-①：保留头成员的前置 matmul 段（与 try_append 的 S5 拼接同款）——
+        // matmul 头进 P2 分量后，尾链 instrs 的 matmul_op 操作数靠该段解析；
+        // 漏拷 = validate 拒绝 = 静默分裂回改动前形态。
+        fused.matmul = cur.spec.matmul;
         outs.push_back(static_cast<std::uint8_t>(Bs.instrs.back().dst + reg_base));
         fused.extras.assign(outs.begin(), outs.end() - 1);
         if (auto v = validate_expr_spec(fused, fused.views.size()); !v)
@@ -1144,5 +1157,111 @@ graph_plan_cache()
 inline constexpr std::size_t GRAPH_PLAN_CACHE_MAX = 512;
 
 } // namespace fused
+
+// ── #P4 残余：直派路径 canonical spec + 结构 key 备忘录 ────────────────────
+// 图计划缓存（上文）只覆盖 execute_fused_graph；直派路径（eval_expr /
+// eval_expr_into / eval_expr_reduce / eval_expr_multi_into / 降级派发的
+// run_graph_kernel_into_ 无 hint 分支 / composite_kernel_available_）每次
+// 调用仍 canonicalize（5 道 pass + CSE 哈希表 + 多次 ExprSpec 物化）+
+// expr_spec_key（FNV + snprintf + 堆分配）。本备忘录把 raw spec →
+// {canonical spec, 结构 key} 按 thread_local 缓存（与 graph_plan_cache 同
+// 口径：同线程隔离、超限清空、纯性能层）。
+//
+// 正确性不变量（回归：expr_graph_test::test_canon_key_memo）：
+//   · 查找键 = expr_spec_struct_hash（字段口径镜像 expr_spec_key，见其头注）
+//     **再混入 const 值位型**——与 graph_cache_key 的 #M1 同因：常量池经
+//     dedupe/常量折叠后布局依赖值本身，结构同而 const 值不同的 spec 绝不
+//     能合并（否则命中后静默用错常量池）。
+//   · 命中 ⇒ 返回值与 `canonicalize_expr_spec(raw)` /
+//     `expr_spec_key(canonical)` **逐字节相同**：canonicalize 的输出是
+//     (结构, const 值) 的纯函数；其余字段（views / matmul / rparams）逐
+//     pass 原样透传——由返回前按当前 raw 刷新保证（与 instantiate_plan_into
+//     的运行期值重填同一教义；这些刷新字段全部不进 expr_spec_key，故缓存
+//     的 key 刷新后依然一致）。
+//   · **不改任何 key 值**：缓存的 key 一律来自 expr_spec_key(canon)；查找
+//     键只是进程内缓存索引，不是 shader 身份（shader 身份仍由 expr_spec_key
+//     字符串承担）。折叠为 raw 的恒等（fold 段不参与 IR-A/B）。
+//   · fold spec：直派路径本就跳过 canonicalize（恒等）、只差一个
+//     expr_spec_key——查找键成本 ≈ key 成本，备忘录无净收益 → 按恒等返回、
+//     不进缓存（调用方对 fold 走 raw + expr_spec_key 原路径）。
+// 返回**按值拷贝**：超限清空会使引用失效；一次向量拷贝远小于 5 道 pass + CSE。
+struct CanonKey
+{
+    ExprSpec canon;
+    std::string key;
+};
+
+namespace fused
+{
+
+[[nodiscard]] inline std::unordered_map<std::uint64_t, CanonKey>& canon_key_memo()
+{
+    static thread_local std::unordered_map<std::uint64_t, CanonKey> c;
+    return c;
+}
+inline constexpr std::size_t CANON_KEY_MEMO_MAX = 512;
+
+} // namespace fused
+
+// 查找键：结构哈希（镜像 expr_spec_key 口径）+ const 值位型混入。
+// 指纹域 = canonicalize 的全部纯函数输入（结构 + const 值；views/matmul/
+// rparams 为透传字段、命中时按 raw 刷新，不进索引）。
+[[nodiscard]] inline std::uint64_t canon_key_memo_index(const ExprSpec& raw) noexcept
+{
+    std::uint64_t h = expr_spec_struct_hash(raw);   // FNV-1a 64 终值
+    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+    const auto mix_u64 = [&h](std::uint64_t v)
+    {
+        for (int b = 0; b < 8; ++b)
+        {
+            h ^= static_cast<std::uint8_t>(v >> (8 * b));
+            h *= kFnvPrime;
+        }
+    };
+    // struct_hash 已混入 consts **个数**（长度定界）→ 此处逐值定宽混入
+    // 不会与"值拼接"歧义（同 graph_cache_key 对 const 的处理）。
+    for (const Scalar c : raw.consts)
+    {
+        std::uint32_t bits = 0;
+        static_assert(sizeof(Scalar) == sizeof(bits), "Scalar 需为 32 位");
+        std::memcpy(&bits, &c, sizeof(bits));
+        mix_u64(bits);
+    }
+    return h;
+}
+
+// 备忘录查询：命中返回缓存 {canon, key} + 按 raw 刷新透传字段；未命中现算
+// （canonicalize + expr_spec_key）并回填。与两步原调用逐字等价。
+[[nodiscard]] inline CanonKey canonicalize_with_key(const ExprSpec& raw)
+{
+    CanonKey out;
+    if (raw.fold)
+    {
+        // fold：canonicalize 恒等（expr_opt 入口 early-return）；见头注——
+        // 不进缓存（查找键成本 ≈ expr_spec_key 成本，无净收益）。
+        out.canon = raw;
+        out.key = expr_spec_key(raw);
+        return out;
+    }
+    auto& memo = fused::canon_key_memo();
+    const std::uint64_t idx = canon_key_memo_index(raw);
+    const auto it = memo.find(idx);
+    if (it != memo.end())
+    {
+        out.canon = it->second.canon;
+        out.key = it->second.key;
+        // 透传字段按当前 raw 刷新（canonicalize 逐 pass 原样透传；全部不进
+        // expr_spec_key → 刷新不改 key，与 instantiate_plan_into 同款）。
+        out.canon.rparams = raw.rparams;
+        out.canon.views = raw.views;
+        out.canon.matmul = raw.matmul;
+        return out;
+    }
+    out.canon = canonicalize_expr_spec(raw);
+    out.key = expr_spec_key(out.canon);
+    if (memo.size() >= fused::CANON_KEY_MEMO_MAX) memo.clear();   // 同 graph_plan_cache 口径
+    memo.emplace(idx, out);   // miss 冷路径：一次拷贝可接受
+    return out;
+}
 
 } // namespace nn

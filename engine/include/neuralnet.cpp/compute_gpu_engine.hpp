@@ -1966,9 +1966,13 @@ public:
         }
         // ── canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），
         //    key 与 shader 合成两端一致；dispatch 用 canonical 的 consts ──
-        const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
+        // P4 残余：canonical spec + 结构 key 经 thread_local 备忘录（命中免
+        // canonicalize 5 道 pass + key 的 FNV/snprintf；键值不变，见
+        // expr_graph.hpp 的 canon_key_memo 不变量）。
+        const nn::CanonKey ck = nn::canonicalize_with_key(raw_spec);
+        const ExprSpec& spec = ck.canon;
         // ── AOT 匹配：按规范结构 key 查预编译融合 shader ──────────────
-        const std::string key = nn::expr_spec_key(spec);
+        const std::string& key = ck.key;
         // psig **无条件计算**（不随 NN_FUSED_REGISTRY_EMBEDDED 走）：`#endif`
         // 之后的「变体未预生成」判定（`psig != 0`）在有/无注册表两种模式下都要
         // 能编译 —— 无注册表 = NN_EXPR_SCAN 收集器 TU（注册表是它自己的产物，
@@ -2094,26 +2098,20 @@ public:
         if (raw_spec.fold)
             NN_FAIL("GpuEngine::eval_expr_reduce: fold 表达式请走 eval_expr（需 fold_k 形态参数）");
         // canonical IR：与 eval_expr 同（canonicalize 为引擎内部优化）
-        const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
+        // P4 残余：经 thread_local 备忘录（键值不变，见 expr_graph.hpp）。
+        const nn::CanonKey ck = nn::canonicalize_with_key(raw_spec);
+        const ExprSpec& spec = ck.canon;
 
-        // ── 限制：归约向量输出的末指令必须是归约指令 ──────────────────────
-        // 归约融合 shader（generate_glsl_reduce）对"归约**之后**还有逐元素
-        // 后处理"的形态（如 rsqrt(col_sum(x²)*k + c)）尚未正确实现：列归约
-        // 分支会把后处理链在错误的索引上求值，实测给出**静默错值**
-        // （ce_fusion_test 的"归约+后处理"用例：GPU err≈1.9，CPU err≈1e-7）。
-        // 这里显式硬报错，把"静默错值"变成"立即暴露的错误"（AOT 注册表原则）。
-        // 改用两步写法即可：先 compute_reduce 取归约向量，再对 (rows,1)/(1,cols)
-        // 小向量用 dsl::compute 施加后处理（LayerNorm/RMSNorm 即此写法）。
-        // 注意：CPU 端已支持该形态（eval_expr_impl 的按指令下标反向切片），
-        // 生成器补齐该形态后可在此放开。
-        if (!spec.instrs.empty() && !expr_op_is_reduce(static_cast<ExprOp>(spec.instrs.back().op)))
-        {
-            NN_FAIL("GpuEngine::eval_expr_reduce: 归约向量输出的表达式末指令必须是归约指令"
-                    "（归约后逐元素后处理在归约融合 shader 中尚未正确实现）；"
-                    "请拆成两步：compute_reduce 取归约向量，再用 dsl::compute 做后处理");
-        }
+        // P10-②（E9 支持路径）：归约后的逐元素后处理链**已可执行**——此前这里
+        // 硬报错（防生成器静默错值，实测 err≈1.9 @2026-09-19），但列归约分支
+        // 其后整体重写（2026-09-25/27「列内组织」+ emit_col_merge、10-04 4 路
+        // 累加器），本轮已在 40HX 上按主机参考复核两轴形态（col sqrt(sum/C+ε)
+        // err=5.96e-08、row sum*s+b err=2.38e-07，fused_gpu_test
+        // run_reduce_postprocess）→ 校验放开。CPU 端按指令下标反向切片早已
+        // 支持同形态（两侧可直接对拍）；末指令非归约时 vector_out 输出沿
+        // 归约轴恒定的语义由生成器输出段承担（见 generate_glsl_reduce）。
 
-        const std::string key = nn::expr_spec_key(spec);
+        const std::string& key = ck.key;
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, P);
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 变体优先（`#a` native16 → `#x` 运行期分派）：与 eval_expr 同款
@@ -2191,10 +2189,12 @@ public:
         // fold 形态只经 eval_expr（PC 需 fold_k，本入口不传）——显式拒绝
         if (raw_spec.fold)
             NN_FAIL("GpuEngine::eval_expr_into: fold 表达式请走 eval_expr（需 fold_k 形态参数）");
-        const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
+        // P4 残余：经 thread_local 备忘录（键值不变，见 expr_graph.hpp）。
+        const nn::CanonKey ck = nn::canonicalize_with_key(raw_spec);
+        const ExprSpec& spec = ck.canon;
         if (nn::expr_spec_reduce_axis(spec) != -1)
             NN_FAIL("eval_expr_into: 仅支持逐元素表达式（无归约）");
-        const std::string key = nn::expr_spec_key(spec);
+        const std::string& key = ck.key;
         // 变体优先（`#a` native16 → `#x` 运行期分派）：目标精度 = dst.precision()
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, dst.precision());
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
@@ -2291,16 +2291,18 @@ public:
     // outs 全部为既有 f32 存储（主输出 + extras）；选路 = V0（NVI 已验全 f32，
     // extras 结构只生成 V0 变体）。输出视图经 import 取 GpuTensor 句柄，
     // 以 output_override + extra_outs 交给 run_fused_gpu（无分配路径）。
+    // P10-①：允许前置 matmul 段（多消费者 matmul 头的分量 kernel）——
+    // generate_glsl_matmul 已发 extras（V0 only），派发按 spec 填 mm 形态参数。
     [[nodiscard]] Result<void> eval_expr_multi_into_impl(const ExprSpec& raw_spec,
                                                          std::span<const Tensor> inputs,
                                                          std::size_t rows, std::size_t cols,
                                                          std::span<Tensor> outs) override
     {
-        if (raw_spec.fold || raw_spec.matmul || expr_spec_reduce_axis(raw_spec) != -1)
-            NN_FAIL("eval_expr_multi_into: 仅支持纯逐元素 spec");
-        const ExprSpec spec = nn::canonicalize_expr_spec(raw_spec);
-        const std::string key = nn::expr_spec_key(spec);
-        return eval_expr_multi_into_canon_(spec, key, inputs, rows, cols, outs);
+        if (raw_spec.fold || expr_spec_reduce_axis(raw_spec) != -1)
+            NN_FAIL("eval_expr_multi_into: 仅支持逐元素/前置 matmul 段 spec（无 fold、无归约）");
+        // P4 残余：经 thread_local 备忘录（键值不变，见 expr_graph.hpp）。
+        const nn::CanonKey ck = nn::canonicalize_with_key(raw_spec);
+        return eval_expr_multi_into_canon_(ck.canon, ck.key, inputs, rows, cols, outs);
     }
 
     // P4：已 canonical 的入口——融合图计划缓存已带 canon spec 与 key，
@@ -2342,8 +2344,13 @@ public:
             const auto vp = nn::expr_spec_runtime_view_params(spec);
             auto r = backend_->run_fused_gpu(fs->key, fi_r->bufs, spec.consts, rows, cols,
                                              /*vector_out=*/false, vp, spec.rparams, ptrs[0],
-                                             /*matmul_k=*/std::nullopt, /*matmul_batch=*/1u,
-                                             /*matmul_trans=*/0u, /*fold_k=*/std::nullopt,
+                                             // P10-①：按 spec 填 matmul 形态参数（无 matmul
+                                             // 段时 nullopt/1/0——与 run_fused_gpu 的对称
+                                             // 防呆同源；多消费者 matmul 头分量必需）
+                                             nn::expr_spec_runtime_matmul_k(spec),
+                                             nn::expr_spec_runtime_matmul_batch(spec),
+                                             nn::expr_spec_runtime_matmul_trans(spec),
+                                             /*fold_k=*/std::nullopt,
                                              /*out_f16=*/false, /*prec_sig=*/0, extra_ptrs);
             NN_TRY_CHECK(r);
             return {};
@@ -2375,8 +2382,11 @@ public:
             const auto vp = nn::expr_spec_runtime_view_params(spec);
             auto r = backend_->run_fused_gpu(key, fi_r->bufs, spec.consts, rows, cols,
                                              /*vector_out=*/false, vp, spec.rparams, ptrs[0],
-                                             /*matmul_k=*/std::nullopt, /*matmul_batch=*/1u,
-                                             /*matmul_trans=*/0u, /*fold_k=*/std::nullopt,
+                                             // P10-①：同上——按 spec 填 matmul 形态参数
+                                             nn::expr_spec_runtime_matmul_k(spec),
+                                             nn::expr_spec_runtime_matmul_batch(spec),
+                                             nn::expr_spec_runtime_matmul_trans(spec),
+                                             /*fold_k=*/std::nullopt,
                                              /*out_f16=*/false, /*prec_sig=*/0, extra_ptrs);
             NN_TRY_CHECK(r);
             return {};
@@ -2832,7 +2842,9 @@ private:
     // eval_expr_into_impl 的选路同源，output_override 精度视图同
     // eval_expr_into_impl（f16 目标必须经 f16_view 包 f16 buffer）。
     // P4：`canon_hint` / `key_hint` 非空时表示调用方已持有 canonical spec 与
-    // 结构 key（图计划缓存算一次），跳过本函数的 canonicalize / expr_spec_key。
+    // 结构 key（图计划缓存算一次），跳过本函数的 canonicalize / expr_spec_key；
+    // 无 hint 的直派（eval_expr 系 / 降级派发 dispatch_graph_member_）改走
+    // thread_local 备忘录（canonicalize_with_key，键值不变——见 expr_graph.hpp）。
     [[nodiscard]] Result<void> run_graph_kernel_into_(const ExprSpec& raw_spec,
                                                       std::span<const Tensor> inputs,
                                                       std::size_t rows, std::size_t cols,
@@ -2841,17 +2853,17 @@ private:
                                                       const std::string* key_hint = nullptr)
     {
         const bool is_fold = raw_spec.fold.has_value();
-        // P4：命中 plan 缓存的 kernel 已带 canonical spec 与结构 key —— 直接复用，
-        // 不再每 dispatch 重复 canonicalize + expr_spec_key 字符串格式化。
-        std::optional<ExprSpec> canon_own;
+        // P4：命中 plan 缓存的 kernel 已带 canonical spec 与结构 key —— 直接复用；
+        // 无 hint 且非 fold 走备忘录（fold 的 canonicalize 恒等，直接用 raw）。
+        std::optional<nn::CanonKey> memo_own;
         const ExprSpec* spec_p = canon_hint;
         if (spec_p == nullptr)
         {
             if (is_fold) spec_p = &raw_spec;
             else
             {
-                canon_own = nn::canonicalize_expr_spec(raw_spec);
-                spec_p = &*canon_own;
+                memo_own = nn::canonicalize_with_key(raw_spec);
+                spec_p = &memo_own->canon;
             }
         }
         const ExprSpec& spec = *spec_p;
@@ -2859,8 +2871,12 @@ private:
         const std::string* key_p = key_hint;
         if (key_p == nullptr)
         {
-            key_own = nn::expr_spec_key(spec);
-            key_p = &key_own;
+            if (memo_own) key_p = &memo_own->key;   // 随备忘录一并返回（不重复格式化）
+            else
+            {
+                key_own = nn::expr_spec_key(spec);   // fold：raw 的 key（恒等）
+                key_p = &key_own;
+            }
         }
         const std::string& key = *key_p;
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, out.precision());
@@ -3003,16 +3019,18 @@ private:
             if (t.precision() != Precision::F32) return false;
         return out.precision() == Precision::F32;
 #else
+        // P4 残余：canon/spec_key 随计划缓存必已填充（execute_fused_graph 的
+        // 命中/未命中两条路径都过 instantiate_plan_into，运行期值已按当前图
+        // 重填；graph_cache_key 保证结构+const 值一致 ⇒ k.canon ≡ 对 k.spec
+        // 现算 canonicalize 的结果）——直接复用，不再每 kernel 每 step
+        // canonicalize + expr_spec_key。
         if (k.spec.extras.empty())
         {
             // 单输出链：与 run_graph_kernel_into_ 同源的 (key, psig) 选路
-            const bool is_fold = k.spec.fold.has_value();
-            const ExprSpec spec = is_fold ? k.spec : nn::canonicalize_expr_spec(k.spec);
-            const std::string key = nn::expr_spec_key(spec);
             const nn::ExprPrecSig psig = nn::expr_prec_sig_of(ins, out.precision());
             const nn::fused::FusedShader* fs =
-                (psig != 0) ? find_prec_variant_(key, psig, spec, /*log_hit=*/false)
-                            : nn::fused::find_fused(key);
+                (psig != 0) ? find_prec_variant_(k.spec_key, psig, k.canon, /*log_hit=*/false)
+                            : nn::fused::find_fused(k.spec_key);
             return fs != nullptr && backend_->has_fused_shader(fs->key);
         }
         // 写穿物化（多输出）：V0 专用——eval_expr_multi_into 的 NVI 前置校验
@@ -3020,8 +3038,7 @@ private:
         for (const auto& t : ins)
             if (t.precision() != Precision::F32) return false;
         if (out.precision() != Precision::F32) return false;
-        const std::string key = nn::expr_spec_key(nn::canonicalize_expr_spec(k.spec));
-        const nn::fused::FusedShader* fs = nn::fused::find_fused(key);
+        const nn::fused::FusedShader* fs = nn::fused::find_fused(k.spec_key);
         return fs != nullptr && backend_->has_fused_shader(fs->key);
 #endif
     }
