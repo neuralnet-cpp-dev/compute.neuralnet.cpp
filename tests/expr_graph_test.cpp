@@ -14,6 +14,8 @@
 //   9. 录制图 add_node 依赖识别（virtual_tag）
 //  10. matmul 参与图融合（S5 两种形态）
 //  11. IR-D emitter 抽象
+//  12. #T5：fold Ash 容量分档（#P9）+ 链尾死存储消除（#P3）——GLSL 文本断言
+//      + CPU 执行语义数值对拍
 //
 //  构建/运行：cmake -B build -DNN_ENABLE_TESTS=ON && cmake --build build
 //            ctest --test-dir build -R expr_graph_test
@@ -395,11 +397,17 @@ void test_multi_consumer()
     CHECK(static_cast<bool>(mul_r), "多输出求值成功");
     auto a_ref = eng.eval_expr(make_unary_const(nn::ExprOp::Mul, Scalar{2}),
                                std::vector<nn::Tensor>{x}, rows, cols);
+    // #T6：参考求值失败必须 FAIL（此前裸 return 跳过断言仍记绿），且
+    // a_ref 未检即解引用是 UB——先断言再进后续参考。
+    CHECK(static_cast<bool>(a_ref), "逐节点参考 A 求值成功");
+    if (!mul_r || !a_ref) return;
     auto b_ref = eng.eval_expr(make_unary_const(nn::ExprOp::Add, Scalar{1}),
                                std::vector<nn::Tensor>{*a_ref}, rows, cols);
     auto c_ref = eng.eval_expr(make_unary_const(nn::ExprOp::Sub, Scalar{1}),
                                std::vector<nn::Tensor>{*a_ref}, rows, cols);
-    if (!mul_r || !a_ref || !b_ref || !c_ref) return;
+    CHECK(static_cast<bool>(b_ref), "逐节点参考 B 求值成功");
+    CHECK(static_cast<bool>(c_ref), "逐节点参考 C 求值成功");
+    if (!b_ref || !c_ref) return;
     // 槽序：[0]=tail(C)，[1]=A，[2]=B
     CHECK(max_abs_diff(matrix_of(eng, kouts[0]), matrix_of(eng, *c_ref)) < 1e-6f,
           "tail(C) 与逐节点一致");
@@ -440,8 +448,13 @@ void test_reduce_broadcast_fuse()
         kinputs.push_back(in.external);
     auto fused_r = eng.eval_expr(kernels[0].spec, kinputs, rows, cols);
     auto y_ref = eng.eval_expr_reduce(sum, std::vector<nn::Tensor>{x}, rows, cols);
+    // #T6：求值失败即 FAIL 再 return——裸 return 会让后续对拍断言被跳过、
+    // 测试仍记绿。
+    CHECK(static_cast<bool>(fused_r), "融合 kernel 求值成功");
+    CHECK(static_cast<bool>(y_ref), "归约参考求值成功");
     if (!fused_r || !y_ref) return;
     auto y_full = eng.eval_expr(add, std::vector<nn::Tensor>{*y_ref}, rows, cols);
+    CHECK(static_cast<bool>(y_full), "逐节点广播参考求值成功");
     if (!y_full) return;
     CHECK(max_abs_diff(matrix_of(eng, *fused_r), matrix_of(eng, *y_full)) < 1e-6f,
           "融合 kernel == 逐节点（归约 → 广播）");
@@ -970,6 +983,183 @@ void test_emitter()
     std::printf("[OK] test_emitter\n");
 }
 
+// ── 测试 14（#T5）：fold Ash 容量分档（a8f973d #P9）+ 链尾死存储消除（#P3）──
+// 双域 fold（v2：mm 段 + vecacc + 元素链）从三个层面锁住这两个代码生成机制
+//（此前只有 GPU 数值对拍间接兜底，无任何针对机制本身的断言）：
+//   1. 分档特征（GLSL 文本）：mm_k ∈ {64,128,256,512,1024} → shared float
+//      Ash[64|128|256|1024] 只出现本档；变体键 expr_spec_fold_variant_key
+//      = 基础键 + "#m<cap>"（基线 1024 档无后缀），非 fold / fold 无 mm 段
+//      键逐字不变；
+//   2. 死存储（GLSL 文本）：链尾之后无人再读的中间寄存器**不得**出现
+//      sreg[..][j] = r.. 写回；仍被后续段/尾部读的必须写回——含
+//      vecacc.weight 的 kTailUse 保守计入（漏计 = vecacc 读上块未初始化槽
+//      = 静默错值）；
+//   3. 执行语义（CPU 数值对拍）：spec 经 CPU fold 执行器与独立参考一致
+//      （A≡0.5、B≡1、V≡1 → C ≡ mm_k/2，O = Σ_j exp(exp(C))·1，V 全 1 使
+//      vecacc 的 b(j,d) 索引约定不影响期望值）；GPU 侧执行语义由主仓
+//      fused_gpu_test 的 fold 数值对拍覆盖（本测试二进制是纯 CPU 消费方形态）。
+//
+// body 结构（寄存器号 = 下方断言锚点；eidx 经 classify 现算并断言防漂移）：
+//   [0] a = Matmul + c0   （r1 元素链首）→ 仅被 [1] 读一次 → 链尾死存储
+//   [1] b = exp(a)        （r2 元素）    → 被 [2]（RowSum）与 [4]（链2）读 → 活
+//   [2] blk = RowSum(b)   （r3 块归约 dst = 行标量）→ flush 链1
+//   [3] r0 += Reduce(blk) （标量行，状态跨块累计）
+//   [4] w = exp(b)        （r4 元素末链）→ body 内无人再读，仅 vecacc 读它
+// finalize: out = O + c0；vecacc: O += Σ_j w(j)·V(j,d)（无 scale）
+nn::ExprSpec make_fold_mm_chain(std::uint32_t fold_k, std::uint32_t mm_k,
+                                std::uint32_t veclen = 8)
+{
+    const auto ins = [](nn::ExprOp op, std::uint8_t dst, nn::ExprOperand a,
+                        nn::ExprOperand b = {})
+    {
+        nn::ExprInstr i;
+        i.op = static_cast<std::uint8_t>(op);
+        i.dst = dst;
+        i.a = a;
+        i.b = b;
+        return i;
+    };
+    nn::ExprSpec s;
+    nn::FoldSpec f;
+    f.k = fold_k;
+    f.num_state = 1;
+    f.inits = {Scalar{0}};
+    f.vec_state_len = veclen;
+    f.matmul = nn::MatmulSpec{0, 1, 0, 0, mm_k, 1};  // A=输入0 B=输入1 batch=1
+    f.vecacc = nn::VecAccSpec{0, 4, 2, 0, 0};        // weight=r4 V=输入2 无 scale
+    f.body = {
+        ins(nn::ExprOp::Add, 1, nn::expr::matmul_op(), nn::expr::cst(0)),
+        ins(nn::ExprOp::Exp, 2, nn::expr::reg(1)),
+        ins(nn::ExprOp::RowSum, 3, nn::expr::reg(2)),
+        ins(nn::ExprOp::Add, 0, nn::expr::reg(0), nn::expr::reduce(3)),
+        ins(nn::ExprOp::Exp, 4, nn::expr::reg(2)),
+    };
+    f.finalize = {ins(nn::ExprOp::Add, 5, nn::expr::vec_state(0), nn::expr::cst(0))};
+    s.fold = std::move(f);
+    s.consts = {Scalar{0}};
+    s.num_regs = 6;
+    s.views = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
+    return s;
+}
+
+void test_fold_ash_tier_and_dead_store()
+{
+    auto eng_owner = nn::create_cpu_engine();
+    nn::ComputeEngine& eng = *eng_owner;
+    auto glsl = nn::emitter_registry::make("glsl");
+    CHECK(static_cast<bool>(glsl), "GlslEmitter 可创建");
+    if (!glsl) return;
+
+    // ── 1. Ash 容量分档：文本声明 + 变体键 ──
+    struct Tier
+    {
+        std::uint32_t mm_k;
+        const char* decl;   // shared 声明行（唯一出现点）
+        const char* key;    // expr_spec_fold_variant_key 期望
+    };
+    const Tier tiers[] = {
+        {64, "shared float Ash[64];", "K#m64"},
+        {128, "shared float Ash[128];", "K#m128"},
+        {256, "shared float Ash[256];", "K#m256"},
+        {512, "shared float Ash[1024];", "K"},    // >256 → 基线档，键无后缀
+        {1024, "shared float Ash[1024];", "K"},   // 基线原值
+    };
+    for (const Tier& t : tiers)
+    {
+        const nn::ExprSpec spec = make_fold_mm_chain(16, t.mm_k);
+        const auto vr = nn::validate_expr_spec(spec, spec.views.size());
+        std::string lab = "tier spec validate mm_k=" + std::to_string(t.mm_k);
+        CHECK(vr.has_value(), lab.c_str());
+        std::string vkey_st;
+        lab = "变体键 #m<cap> mm_k=" + std::to_string(t.mm_k);
+        CHECK(nn::expr_spec_fold_variant_key(spec, "K", vkey_st) == t.key, lab.c_str());
+        const std::string g = glsl->generate("fold_tier", spec);
+        lab = "tier GLSL 生成 mm_k=" + std::to_string(t.mm_k);
+        CHECK(!g.empty(), lab.c_str());
+        lab = "Ash 分档声明 mm_k=" + std::to_string(t.mm_k);
+        CHECK(g.find(t.decl) != std::string::npos, lab.c_str());
+        for (const Tier& o : tiers)
+        {
+            if (std::string(o.decl) == t.decl) continue;
+            lab = "非本档 Ash 声明不得出现 mm_k=" + std::to_string(t.mm_k) + " vs " +
+                  std::to_string(o.mm_k);
+            CHECK(g.find(o.decl) == std::string::npos, lab.c_str());
+        }
+    }
+    // 键保持：非 fold、fold 无 mm 段（无 Ash 预载 → 不分档）
+    std::string vkey_st;
+    CHECK(nn::expr_spec_fold_variant_key(make_unary_const(nn::ExprOp::Add, Scalar{1}), "K",
+                                          vkey_st) == std::string("K"),
+          "非 fold spec 键逐字不变");
+    nn::ExprSpec no_mm = make_fold_mm_chain(16, 64);
+    no_mm.fold->matmul.reset();
+    CHECK(nn::expr_spec_fold_variant_key(no_mm, "K", vkey_st) == std::string("K"),
+          "fold 无 mm 段键逐字不变");
+
+    // ── 2. 链尾死存储消除：写回集合恰为 {b, w} ──
+    const nn::ExprSpec base = make_fold_mm_chain(16, 4);
+    CHECK(nn::validate_expr_spec(base, base.views.size()).has_value(), "base spec validate");
+    const std::string g = glsl->generate("fold_dead", base);
+    CHECK(!g.empty(), "base fold GLSL 生成成功");
+    auto cls = nn::expr_fold_classify(*base.fold, base.num_regs);
+    CHECK(cls.has_value(), "expr_fold_classify 成功");
+    if (!cls || g.empty()) return;
+    // eidx = 元素寄存器按号序的 shared 槽位（与生成器同一算法）；锚点断言
+    // 防构造的寄存器编号漂移而断言失焦。
+    std::vector<int> eidx(base.num_regs, -1);
+    int ne = 0;
+    for (std::uint32_t r = 0; r < base.num_regs; ++r)
+        if ((*cls)[r]) eidx[r] = ne++;
+    CHECK(ne == 3 && eidx[1] == 0 && eidx[2] == 1 && eidx[4] == 2,
+          "元素槽映射锚点：a→sreg[0] b→sreg[1] w→sreg[2]");
+    const auto store = [&](std::uint32_t r)
+    {
+        return "sreg[" + std::to_string(eidx[r]) + "][j] = r" + std::to_string(r) + ";";
+    };
+    // 活：b 被 RowSum 与后续链读；w 被 vecacc 尾部读（kTailUse 保守计入）
+    CHECK(g.find(store(2)) != std::string::npos,
+          "死存储消除：b（跨归约/末链读）必须存回 sreg");
+    CHECK(g.find(store(4)) != std::string::npos,
+          "死存储消除：w（vecacc 尾部读）必须存回——漏计即静默错值");
+    // 死：a 写后全函数无人再读 → 不得出现写回
+    CHECK(g.find(store(1)) == std::string::npos,
+          "死存储消除：a（链尾无后续读）不得写回 sreg");
+    // 链2 首次访问 = 读 b → 必须从 sreg 载入（与 b 的存回配对）
+    CHECK(g.find("float r2 = sreg[" + std::to_string(eidx[2]) + "][j];") != std::string::npos,
+          "链2 按读集载入 b（与存回配对）");
+
+    // ── 3. CPU 执行语义数值对拍 ──
+    const std::size_t rows = 3, K = 16, mmk = 4, veclen = 8;
+    const nn::ExprSpec num = make_fold_mm_chain(static_cast<std::uint32_t>(K),
+                                                static_cast<std::uint32_t>(mmk),
+                                                static_cast<std::uint32_t>(veclen));
+    nn::Tensor A = make_tensor(eng, rows, mmk, 0.5f, 0.0f);
+    nn::Tensor B = make_tensor(eng, mmk, K, 1.0f, 0.0f);
+    nn::Tensor V = make_tensor(eng, K, veclen, 1.0f, 0.0f);
+    auto out = eng.eval_expr(num, std::vector<nn::Tensor>{A, B, V}, rows, veclen);
+    CHECK(static_cast<bool>(out), "fold v2 CPU 求值成功");
+    if (out)
+    {
+        // 参考：C = Σ_d A·B ≡ mmk·0.5；w = exp(exp(C))；O = Σ_{j<K} w·V ≡ K·w（V≡1）
+        const Scalar w = std::exp(std::exp(static_cast<Scalar>(mmk) * Scalar{0.5f}));
+        const nn::Matrix om = matrix_of(eng, *out);
+        const auto sp = om.span();
+        bool ok = sp.size() == rows * veclen;
+        for (std::size_t r = 0; ok && r < rows; ++r)
+        {
+            Scalar acc = 0;
+            for (std::size_t j = 0; j < K; ++j) acc += w * Scalar{1.0f};
+            for (std::size_t d = 0; d < veclen; ++d)
+            {
+                const Scalar diff = std::fabs(sp[r * veclen + d] - acc);
+                if (!(diff <= Scalar{1e-3f} * std::fabs(acc) + Scalar{1e-3f})) ok = false;
+            }
+        }
+        CHECK(ok, "fold v2 CPU 数值 == 独立参考 K·exp(exp(mm_k/2))");
+    }
+    std::printf("[OK] test_fold_ash_tier_and_dead_store\n");
+}
+
 } // namespace
 
 int main()
@@ -988,6 +1178,7 @@ int main()
     test_matmul_pure_chain_fuse();
     test_plan_cache_runtime_values();
     test_emitter();
+    test_fold_ash_tier_and_dead_store();
 
     if (g_fail == 0)
     {
