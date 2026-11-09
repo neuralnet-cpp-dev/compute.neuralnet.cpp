@@ -9,10 +9,12 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <functional>
 #include <limits>
 #include <optional>
+#include <vector>
 
 #include "compute_engine.hpp"
 #include <neuralnet.cpp/core_parallel.hpp> // nn::for_each / parallel_for_blocks / parallel_for_samples
@@ -2105,6 +2107,12 @@ public:
         //   (row, gk) 会在每条引用它的指令上重复算）。
         //   语义对齐 batched_matmul：A/B 按各自视图的头分组比（GQA）垂直切分，
         //   转置标志按 MatmulSpec。span 内核是累加语义 ⇒ 输出需零初始化。
+        //   tri_skip（因果）：body 只对 gk ≤ qt（qt = r % m_per）的块取值，上三角
+        //   块整体不读。故 mm 段改为"下三角块任务表"：i 块 [i0,i1) 只需列 [0,i1)，
+        //   死区整块不算；全部任务在**一次**块级并行区分发（任务内 n_blocks==1，
+        //   内核不再二次进池），避免小块并行区反复唤醒 worker 的开销。
+        //   逐位一致：任务边界与全宽调用的 BLOCK_SIZE 分块边界重合（<8 列的
+        //   尾巴并进同一边界的上一块），每个元素的 j 子块 / 归约顺序不变。
         Matrix matmul_out;
         std::span<const Scalar> mmc;
         if (fmm)
@@ -2113,41 +2121,101 @@ public:
             const std::size_t n_out = K;
             matmul_out = Matrix(rows, n_out);
             auto mm_span = matmul_out.span();
-            for (std::size_t b = 0; b < mm_batch; ++b)
+            // 单块调度：A 行片 [m0,m0+mt) × B 列片 [j0,j0+nt) → c（行步长 nt）。
+            //   非 tri_skip 时 m0=0/j0=0/mt=m_per/nt=n_out，与旧路径参数逐一相同。
+            const auto mm_block = [&](std::size_t b, std::size_t m0, std::size_t mt,
+                                      std::size_t j0, std::size_t nt, Scalar* c_base)
             {
                 const std::size_t bA = b / gqa_ratio_of(spec, fmm->a_input);
                 const std::size_t bB = b / gqa_ratio_of(spec, fmm->b_input);
                 const auto& as = spans[fmm->a_input];
                 const auto& bs = spans[fmm->b_input];
-                const auto a_sub = std::span<const Scalar>(as.data() + bA * m_per * inner,
-                                                           m_per * inner);
-                const auto b_sub = std::span<const Scalar>(bs.data() + bB * inner * n_out,
-                                                           inner * n_out);
-                auto c_sub = std::span<Scalar>(mm_span.data() + b * m_per * n_out,
-                                               m_per * n_out);
+                auto c_blk = std::span<Scalar>(c_base, mt * nt);
+                // A：trans0 → (batch·m, inner)，行片起点 m0·inner；trans1 →
+                //   (batch·inner, m)，列片起点 m0（行步长仍为全宽 m_per）
+                const Scalar* a_t = fmm->transA ? as.data() + bA * inner * m_per + m0
+                                                : as.data() + bA * m_per * inner + m0 * inner;
+                const auto a_span =
+                    std::span<const Scalar>(a_t, fmm->transA ? inner * m_per - m0 : mt * inner);
+                // B：trans0 → (batch·inner, n)，列片起点 j0（行步长 n_out）；
+                //   trans1 → (batch·n, inner)，行片起点 j0（行步长 inner）
+                const Scalar* b_t =
+                    bs.data() + bB * inner * n_out + (fmm->transB ? j0 * inner : j0);
+                const auto b_span = std::span<const Scalar>(
+                    b_t, fmm->transB ? (n_out - j0) * inner : inner * n_out - j0);
                 if (!fmm->transA && !fmm->transB)
-                    Matrix::multiply_to_span(c_sub, m_per, n_out, a_sub, m_per, inner, b_sub,
-                                             inner, n_out);
+                    Matrix::multiply_to_span(c_blk, mt, nt, a_span, mt, inner, b_span, inner,
+                                             n_out);
                 else if (!fmm->transA && fmm->transB)
-                    Matrix::multiply_transposed_to_span(c_sub, m_per, n_out, a_sub, m_per,
-                                                        inner, b_sub, n_out, inner);
+                    Matrix::multiply_transposed_to_span(c_blk, mt, nt, a_span, mt, inner,
+                                                        b_span, n_out, inner);
                 else if (fmm->transA && !fmm->transB)
-                    Matrix::transpose_multiply_to_span(c_sub, m_per, n_out, a_sub, inner,
-                                                       m_per, b_sub, inner, n_out);
+                    Matrix::transpose_multiply_to_span(c_blk, mt, nt, a_span, inner, m_per,
+                                                       b_span, inner, n_out);
                 else
                 {
-                    // 双转置（A^T·B^T）：无对应的 span 内核，保留标量累加
+                    // 双转置（A^T·B^T）：无对应的 span 内核，保留标量累加（#P2
+                    //   的"双转置保留标量累加"约定不变；这里只收窄 n 的范围）
                     const Scalar* a_base = as.data() + bA * inner * m_per;
                     const Scalar* b_base = bs.data() + bB * n_out * inner;
-                    Scalar* c_base = mm_span.data() + b * m_per * n_out;
-                    for (std::size_t m = 0; m < m_per; ++m)
-                        for (std::size_t n = 0; n < n_out; ++n)
+                    for (std::size_t m = 0; m < mt; ++m)
+                        for (std::size_t n = 0; n < nt; ++n)
                         {
                             Scalar acc = 0;
                             for (std::size_t d = 0; d < inner; ++d)
-                                acc += a_base[d * m_per + m] * b_base[n * inner + d];
-                            c_base[m * n_out + n] = acc;
+                                acc += a_base[d * m_per + (m0 + m)] *
+                                       b_base[(j0 + n) * inner + d];
+                            c_base[m * nt + n] = acc;
                         }
+                }
+            };
+            if (!f.tri_skip)
+            {
+                // 无上三角可跳：整片全宽，一次调用（与旧路径逐参数一致）
+                for (std::size_t b = 0; b < mm_batch; ++b)
+                    mm_block(b, 0, m_per, 0, n_out, mm_span.data() + b * m_per * n_out);
+            }
+            else
+            {
+                // 下三角块任务表：i 块 [i0,i1)（qt 上界 = i1-1）只需列 [0,i1)；
+                //   列按 BLOCK_SIZE 切，<8 列的尾巴并进上一块以保持内核路径一致。
+                struct BlockTask
+                {
+                    std::size_t b, i0, j0, nt;
+                };
+                std::vector<BlockTask> tasks;
+                for (std::size_t b = 0; b < mm_batch; ++b)
+                    for (std::size_t i0 = 0; i0 < m_per; i0 += BLOCK_SIZE)
+                    {
+                        const std::size_t i1 = std::min(i0 + BLOCK_SIZE, m_per);
+                        const std::size_t j_end = std::min(n_out, i1);
+                        for (std::size_t j0 = 0; j0 < j_end;)
+                        {
+                            std::size_t nt = std::min(BLOCK_SIZE, j_end - j0);
+                            const std::size_t rest = j_end - (j0 + nt);
+                            if (rest > 0 && rest < 8) nt = j_end - j0; // 尾巴并入
+                            tasks.push_back({b, i0, j0, nt});
+                            j0 += nt;
+                        }
+                    }
+                const auto run_task = [&](const BlockTask& t)
+                {
+                    const std::size_t mt = std::min(BLOCK_SIZE, m_per - t.i0);
+                    // 内核 C 行步长 = nt ⇒ 用栈上单片缓冲；n_blocks==1 ⇒ 内核
+                    //   在本线程内串行，不再二次进池。
+                    std::array<Scalar, BLOCK_SIZE * (BLOCK_SIZE + 8)> c_blk{};
+                    mm_block(t.b, t.i0, mt, t.j0, t.nt, c_blk.data());
+                    for (std::size_t i = 0; i < mt; ++i)
+                        std::copy_n(c_blk.data() + i * t.nt, t.nt,
+                                    mm_span.data() + (t.b * m_per + t.i0 + i) * n_out + t.j0);
+                };
+                if (tasks.size() <= 1)
+                {
+                    for (const auto& t : tasks) run_task(t);
+                }
+                else
+                {
+                    nn::parallel_for_blocks(tasks.begin(), tasks.end(), run_task);
                 }
             }
             mmc = mm_span;
