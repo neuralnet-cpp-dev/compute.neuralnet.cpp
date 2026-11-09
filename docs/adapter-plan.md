@@ -99,6 +99,6 @@ backend/ 等），include 路径改指 submodule 抽象层头 + 链 .so。
   layer/model 必须 include 它才能写 `dsl::compute`（模板在消费方 TU 实例化、数值与
   .so 一致）；这是 LGPL 头的消费方 include（动态链接语境），设计如此。
 - **引擎级测试**：主仓库引擎级测试迁入 `tests/`（消费方形态，见 README"引擎级测试"节），
-  共 10 个 ctest；`scan_exprs` 增 **test_cover_pass**（登记 `tests/expr_fuse_shapes.hpp`
-  链，闭合世界两端一致）。
+  共 10 个 ctest；GPU 融合路径不依赖构建期登记——首次执行由运行期 JIT 现编并写
+  `.nnk`（`tests/expr_fuse_shapes.hpp` 只作为链定义单一事实源，`model_warmup()` 可预热）。
 - **未做**：§2.1 的 `kernel_cache.hpp` 迁移（留主仓库）；`core_parallel.hpp` 已在抽象层。

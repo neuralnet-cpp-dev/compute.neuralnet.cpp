@@ -53,14 +53,14 @@ GPU 引擎把 `create_cpu_engine()` 换成 `create_gpu_engine(device)`（`device
 `nn::ComputeEngine` 是完整接口（52 个虚方法，NVI：public 非虚入口 → protected
 `*_impl`）：矩阵级（matmul/转置/add/scale）、归约级（row/col/grouped_reduce）、
 数据操作（slice/gather/scatter/im2col/col2im/cast）、扫描级（scan_prefix/suffix_outer）、
-表达式（`eval_expr`/`eval_expr_reduce`/`eval_expr_into`，AOT 融合）、批次/内存池、
+表达式（`eval_expr`/`eval_expr_reduce`/`eval_expr_into`，运行期 JIT 融合）、批次/内存池、
 IR-C 录制（`begin_expr`/`end_expr`）、activation offload。能力**信息**只经
 `describe()` 的 `EngineInfo` 披露（禁止用于选路——选路是引擎内部的事）。
 
 层/模型/DSL 模板面（`dsl::compute` 等）在**主仓库** `neuralnet.cpp`（MIT 消费侧）；
-本仓库 `engine/engine/include` 只保留引擎实现头，层/模型/优化器头一律引用主仓 `include/`
+本仓库 `engine/include` 只保留引擎实现头，层/模型/优化器头一律引用主仓 `include/`
 （嵌入主仓构建时自动加入测试的 include 路径——主仓头以引号包含 `"expr_dsl.hpp"`
-等引擎兄弟头，故测试目标同样带 `engine/engine/include/neuralnet.cpp`；独立 clone
+等引擎兄弟头，故测试目标同样带 `engine/include/neuralnet.cpp`；独立 clone
 下跳过依赖主仓头的用例，`.so` 本体仍可独立构建，其 include 路径不含主仓）。
 
 ## 5. LGPL 可替换验证
