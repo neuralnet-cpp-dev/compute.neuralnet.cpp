@@ -2,11 +2,13 @@
 #  compute.neuralnet.cpp — 计算引擎（引擎 LGPL + 抽象层 MIT）
 #
 #  目标：引擎实现编进独立 .so（libnn-cpu.so / libnn-gpu.so），以抽象层（MIT）
-#  的 neuralnet::ComputeEngine C++ 接口直出。消费方只 include 抽象层头 + 链接 .so。
+#  的 neuralnet::ComputeEngine C++ 接口直出。消费方只 include 抽象层头 + 链接 .so
+#  —— 纯接口头（expr_dsl / expr_fold / expr_registry / ternary_pack / int8_pack /
+#  kernel_cache）单一真源也在 abstraction/，该承诺对全部消费方成立。
 #
 #  目录：
-#    engine/       LGPL —— 真实引擎实现（CpuEngine/GpuEngine + 原语 + DSL + shader）
-#    abstraction/  MIT  —— 公共 C++ 抽象接口（compute_engine.hpp）
+#    engine/       LGPL —— 真实引擎实现（CpuEngine/GpuEngine + 原语 + DSL 求值 + shader）
+#    abstraction/  MIT  —— 公共 C++ 抽象接口（compute_engine / expr_spec / expr_dsl 等）
 #    tests/        消费方验证
 # ═══════════════════════════════════════════════════════════════════════════
 cmake_minimum_required(VERSION 3.30)
@@ -71,7 +73,9 @@ set(ENGINE_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/engine/include)
 set(GENERATED_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 # 消费侧头（层/模型/训练/数据集/分词器/优化器）单一真源在主仓 include/，
-# engine/engine/include 只保留引擎实现头，不再保存层/模型头副本。
+# engine/engine/include 只保留引擎实现头，不再保存层/模型头副本；
+# 纯接口头（expr_dsl / expr_fold / expr_registry / ternary_pack / int8_pack /
+# kernel_cache）单一真源在 abstraction/include。
 # 引擎测试按消费方形态编译（含 compute_layer.hpp / compute_optimizer.hpp），
 # 嵌入主仓构建时直接引用主仓 include；独立 clone（无主仓）时跳过这些用例。
 set(NN_MAIN_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -272,11 +276,11 @@ endif()
 set(NN_TESTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 function(nn_add_engine_test name)
     add_executable(${name} ${ARGN})
-    # 引号 include（"core_domain.hpp" 等）需要 abstraction 的 neuralnet.cpp
-    # 子目录在 -I 路径（同主仓库 nn_core 教训）。引擎实现头同理：主仓的
-    # compute_layer_base.hpp / compute_optimizer.hpp 以引号包含 "expr_dsl.hpp"
-    # "int8_pack.hpp"，必须有 ${ENGINE_INCLUDE}/neuralnet.cpp 才能解析——
-    # 头副本下线后主仓头不再自带这些兄弟头，缺这一条独立构建即失败。
+    # 引号 include（"core_domain.hpp"、主仓头的 "expr_dsl.hpp" / "int8_pack.hpp"
+    # 等）需要 abstraction 的 neuralnet.cpp 子目录在 -I 路径（同主仓库 nn_core
+    # 教训）——纯接口头单一真源在抽象层，ABST 两条 -I 即可解析；${ENGINE_INCLUDE}
+    # 两条供引擎实现头（compute_*_engine / expr_emitter / expr_glsl_gen /
+    # backend/*）及其引号兄弟包含使用。
     target_include_directories(${name} PRIVATE
         ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE}
         ${ENGINE_INCLUDE}/neuralnet.cpp ${NN_TESTS_DIR})
