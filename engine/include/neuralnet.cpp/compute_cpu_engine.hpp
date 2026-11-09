@@ -2239,9 +2239,9 @@ public:
 
         Span out = output.cpu_matrix().span();
         // 行间完全独立（状态 / 元素临时 / 归约槽 / 行向量态都在行首复位），
-        // 逐位一致 ⇒ 行是天然的并行单元。按行段分片、每片自建 scratch，
-        // 分片边界只由 rows/n_chunks 决定（与调度无关）；门控按 rows*K
-        // （fold body 每元素含多条指令，比裸逐元素重一个量级）。
+        // 逐位一致 ⇒ 行是天然的并行单元。按行段分片、每片用本线程的持久
+        // scratch（见 run_rows）；分片边界只由 rows/n_chunks 决定（与调度无关），
+        // 门控按 rows*K（fold body 每元素含多条指令，比裸逐元素重一个量级）。
         constexpr std::size_t kFoldParallelMinWork = 65536;
         constexpr std::size_t kFoldRowsPerChunk = 8;
         std::size_t n_chunks = 1;
@@ -2252,12 +2252,20 @@ public:
         }
         const auto run_rows = [&](std::size_t r_begin, std::size_t r_end)
         {
-            std::vector<Scalar> reg(spec.num_regs, Scalar{0}); // 状态 + 标量类临时
-            std::vector<std::vector<Scalar>> elem(spec.num_regs); // 元素类临时（BLOCK 槽）
+            // scratch 按执行线程持久复用（chunk 与线程一一对应，行段互不重叠，
+            //   故复用不改数值）：每 chunk 重建即「chunk 数 × (4 + 元素类 reg 数)」
+            //   次小型堆分配落在热路径上；缓冲只增不减，稳态下零分配。
+            thread_local std::vector<Scalar> reg; // 状态 + 标量类临时
+            thread_local std::vector<std::vector<Scalar>> elem; // 元素类临时（BLOCK 槽）
+            thread_local std::vector<Scalar> red; // 块归约 dst（行标量）
+            thread_local std::vector<Scalar> vecd; // 行向量态
+            // assign/resize 只在容量不足时分配 → 同形状重复调用零堆分配
+            reg.assign(spec.num_regs, Scalar{0});
+            if (elem.size() < spec.num_regs) elem.resize(spec.num_regs);
             for (std::uint32_t r = 0; r < spec.num_regs; ++r)
                 if (is_elem[r]) elem[r].resize(EXPR_FOLD_BLOCK);
-            std::vector<Scalar> red(spec.num_regs, Scalar{0}); // 块归约 dst（行标量）
-            std::vector<Scalar> vecd(f.vec_state_len, Scalar{0}); // 行向量态（累加初值 0）
+            red.assign(spec.num_regs, Scalar{0});
+            vecd.assign(f.vec_state_len, Scalar{0}); // 累加初值 0
             std::size_t cur_d = 0; // 向量域当前输出列（eval_op 的 VecState 读）
 
             // fold matmul 段：直接读预计算好的 C[row, gk]（分块内核已算完）
