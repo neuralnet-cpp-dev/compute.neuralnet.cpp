@@ -326,6 +326,13 @@ public:
     // 独立 128MB 块导致的碎片膨胀）。CPU 引擎 no-op（开启只会得到 1×1 张量）。
     // 存储精度 = 激活**自身**精度（f32 = 4 B/元素，f16 = 2 B/元素，#P8）——
     // 混合精度层（如 RMSNorm 的 1/rms 恒 f32）可以和 f16 激活共享同一块 slab。
+    //
+    // 容量口径（#M2/#G1 的唯一事实源）：slab 在引擎里**恒为 f32 视图**
+    // （GpuTensor 1×ceil(bytes/4)），1 个 slab 元素 = kOffloadSlabElemBytes
+    // 字节，容量字节数 = slab.size() × kOffloadSlabElemBytes。引擎的
+    // create_offload_buffer_impl 与宿主侧（ActivationOffloader::slab_bytes）
+    // 都引用本常量：将来改视图精度或取整方式时两侧同步失效，不会静默算错。
+    static constexpr std::size_t kOffloadSlabElemBytes = sizeof(float);
     [[nodiscard]] Result<Tensor> create_offload_buffer(std::size_t bytes)
     {
         NN_PROF_OP("create_offload_buffer");

@@ -209,7 +209,9 @@ public:
         // #P8：slab 以 f32 视图持有一块原始字节缓冲（capacity = bytes）。
         // create_host_visible_empty 的单位是 f32 元素（内部 4 B 对齐），故按
         // 4 字节字向上取整分配——f16 激活（2 B/元素）同样落在这块缓冲里。
-        auto g = GpuTensor::create_host_visible_empty(1, (bytes + 3u) / 4u, *backend_);
+        // 容量口径统一见 ComputeEngine::kOffloadSlabElemBytes（#M2/#G1）。
+        auto g = GpuTensor::create_host_visible_empty(
+            1, (bytes + kOffloadSlabElemBytes - 1) / kOffloadSlabElemBytes, *backend_);
         NN_TRY_CHECK(g);
         return Tensor::from_gpu(std::move(*g));
     }
@@ -221,6 +223,13 @@ public:
         if (src.is_cpu()) return {};
         const std::size_t elem_bytes = (src.precision() == Precision::F16) ? 2u : 4u;
         const VkDeviceSize size = static_cast<VkDeviceSize>(src.size() * elem_bytes);
+        // #M2：容量校验必须由引擎做（不能靠调用方的 8B 对齐+容量记账）。
+        // 越界直接 fail-fast，否则 vkCmdCopyBuffer 写到子分配之外 = GPU 越界。
+        const std::size_t cap = buffer.size() * kOffloadSlabElemBytes;
+        if (byte_offset > cap || size > cap - byte_offset)
+            NN_FAIL("offload_save: 写入越界（byte_offset=" + std::to_string(byte_offset) +
+                    ", size=" + std::to_string(size) + ", slab 容量=" + std::to_string(cap) +
+                    " 字节）");
         const VkBuffer sbuf =
             (src.precision() == Precision::F16)
                 ? gpu_vk_impl(src.gpu_tensor<Precision::F16>().buffer())
@@ -237,6 +246,12 @@ public:
     {
         const std::size_t elem_bytes = (P == Precision::F16) ? 2u : 4u;
         const VkDeviceSize size = static_cast<VkDeviceSize>(rows * cols * elem_bytes);
+        // #M2：读源容量同样要校验（越界读同样是 GPU 端 UB），在分配 dst 前先拒绝。
+        const std::size_t cap = buffer.size() * kOffloadSlabElemBytes;
+        if (byte_offset > cap || size > cap - byte_offset)
+            NN_FAIL("offload_restore: 读取越界（byte_offset=" + std::to_string(byte_offset) +
+                    ", size=" + std::to_string(size) + ", slab 容量=" + std::to_string(cap) +
+                    " 字节）");
         VkBuffer dst_buf = VK_NULL_HANDLE;
         Tensor out;
         if (P == Precision::F16)
