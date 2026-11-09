@@ -1631,19 +1631,44 @@ public:
             ss << f.rdbuf();
             bytes = ss.str();
         }
-        if (bytes.empty())
+        const auto fresh = [&]()
         {
             auto c = std::make_shared<nn::fused::KernelCache>();
             c->generator_version = nn::fused::kKernelCacheGeneratorVersion;
             c->rec.set("nnk_format_version", nn::fused::kKernelCacheFormatVersion);
             c->rec.set("generator_version", nn::fused::kKernelCacheGeneratorVersion);
             kernel_cache_ = std::move(c);
+        };
+        if (bytes.empty())
+        {
+            fresh();
         }
         else
         {
             auto r = nn::fused::KernelCache::from_bytes(bytes, nn::fused::kKernelCacheGeneratorVersion);
-            if (!r) NN_FAIL("kernels.nnk 缓存解析失败（损坏？）：" + cpath);
-            kernel_cache_ = std::make_shared<nn::fused::KernelCache>(std::move(*r));
+            if (!r)
+            {
+                // 坏缓存不得让启动永久失败（#E1）：隔离改名留证（.corrupt），
+                // 以空缓存重建——后续 JIT miss 重新填充并由 persist_cache_ 重写；
+                // 改名失败（权限/占用）则退回删除原文件，同样消除"每次启动都
+                // 解析失败"的死路。
+                const std::string bad = cpath + ".corrupt";
+                std::remove(bad.c_str());
+                if (std::rename(cpath.c_str(), bad.c_str()) == 0)
+                    std::fprintf(stderr, "[nnk] .nnk 缓存解析失败，已隔离为 %s，重建空缓存：%s\n",
+                                 bad.c_str(), r.error().message.c_str());
+                else
+                {
+                    std::remove(cpath.c_str());
+                    std::fprintf(stderr, "[nnk] .nnk 缓存解析失败，隔离失败已删除原文件，重建空缓存：%s\n",
+                                 r.error().message.c_str());
+                }
+                fresh();
+            }
+            else
+            {
+                kernel_cache_ = std::make_shared<nn::fused::KernelCache>(std::move(*r));
+            }
         }
         return {};
     }
@@ -1716,7 +1741,8 @@ public:
         if (!kernel_cache_) return {};
         // 写 tmp 并**检查写入结果**：磁盘满/IO 错误时 ofstream 只置 failbit
         // （默认不抛），只管 write 不管 flush/close 会把截断的 tmp rename 成
-        // 正式缓存 → 下次加载解析失败、缓存永久不可用。失败即删 tmp。
+        // 正式缓存 → 下次加载解析失败、整份缓存报废（触发 ensure_cache_ 的
+        // 隔离重建，#E1，白丢全部已编译 kernel）。失败即删 tmp。
         const auto write_tmp = [](const std::string& tmp, const std::string& data)
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
