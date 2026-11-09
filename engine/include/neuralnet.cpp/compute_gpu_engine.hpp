@@ -2288,8 +2288,10 @@ public:
     }
 
     // ── P2 多输出（IR-C 写穿物化）────────────────────────────────────────
-    // outs 全部为既有 f32 存储（主输出 + extras）；选路 = V0（NVI 已验全 f32，
-    // extras 结构只生成 V0 变体）。输出视图经 import 取 GpuTensor 句柄，
+    // 选路 = V0（extras 结构只生成 V0 变体）。经 NVI 进来时输入/输出已是全 f32
+    // （NVI 对 f16/混合先边界 cast，P10-④）；图执行直达点（execute_fused_graph
+    // 直调 eval_expr_multi_into_canon_）可能带 f16，由 canon_ 开头的同款边界
+    // cast 折回。输出视图经 import 取 GpuTensor 句柄，
     // 以 output_override + extra_outs 交给 run_fused_gpu（无分配路径）。
     // P10-①：允许前置 matmul 段（多消费者 matmul 头的分量 kernel）——
     // generate_glsl_matmul 已发 extras（V0 only），派发按 spec 填 mm 形态参数。
@@ -2321,6 +2323,42 @@ public:
         (void)cols;
         (void)outs;
 #endif
+        // ── P10-④ f16/混合存储多输出：边界 cast（GPU 图执行直达点）────────
+        // execute_fused_graph 为省 per-dispatch canonicalize 直调本函数、绕过
+        // NVI，故 f16 分量（成员 prec=F16 → 占位/输出全 f16）必须在此折回：
+        // 输入抬 f32 → 自递归走全 f32 快路（V0 复合 kernel）→ f16 输出槽
+        // cast_into 逐槽落回原存储（f32 槽直写）。与 NVI eval_expr_multi_into
+        // 的边界 cast、run_graph_kernel_into_（单输出 f16 图执行，C4 裁决）
+        // 同一口径；递归一次即全 f32，不会重入本分支。
+        if (!all_f32(inputs) || !all_f32(outs))
+        {
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            std::vector<Tensor> slots;
+            std::vector<Tensor> owned;   // f16 槽的 f32 临时（保活）
+            slots.reserve(outs.size());
+            owned.reserve(outs.size());
+            for (Tensor& o : outs)
+            {
+                if (o.precision() == Precision::F32)
+                {
+                    slots.push_back(o);
+                    continue;
+                }
+                Tensor t = create_tensor(rows, cols, Precision::F32);
+                owned.push_back(std::move(t));
+                slots.push_back(owned.back());
+            }
+            NN_TRY(r, eval_expr_multi_into_canon_(spec, key, *in32, rows, cols, slots));
+            for (std::size_t i = 0; i < outs.size(); ++i)
+            {
+                if (outs[i].precision() != Precision::F32)
+                {
+                    NN_TRY(cr, cast_into(slots[i], outs[i]));
+                }
+            }
+            return {};
+        }
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         const nn::fused::FusedShader* fs = nn::fused::find_fused(key);
         if (fs && backend_->has_fused_shader(fs->key))
@@ -3012,12 +3050,16 @@ private:
 #ifndef NN_FUSED_REGISTRY_EMBEDDED
         // 无注册表（P3/D4 起的常态）：可用性 = JIT 能否执行。
         //   · 单输出链：JIT 兜底覆盖（fold/reduce/静态签名，run_graph_kernel_into_）→ 可用；
-        //   · 多输出（extras）：仅全 f32 可用（eval_expr_multi_into 的 NVI 前置
-        //     校验同条件；f16 成员降级为逐成员派发，与注册表时代的判据一致）。
+        //   · 多输出（extras）：**F32/F16 存储可用**（P10-④）——eval_expr_multi_into
+        //     的 NVI 与 GPU 图执行直达点（eval_expr_multi_into_canon_）各带边界
+        //     cast：f16/混合输入抬 f32 跑 V0 复合 kernel、f16 输出 cast_into
+        //     落回，与单输出 f16 图执行同一口径；非 {F32,F16} 精度的张量不可
+        //     构造，保守分支保留（不可用 = 逐成员降级，可观测非错误）。
         if (k.spec.extras.empty()) return true;
         for (const auto& t : ins)
-            if (t.precision() != Precision::F32) return false;
-        return out.precision() == Precision::F32;
+            if (t.precision() != Precision::F32 && t.precision() != Precision::F16)
+                return false;
+        return out.precision() == Precision::F32 || out.precision() == Precision::F16;
 #else
         // P4 残余：canon/spec_key 随计划缓存必已填充（execute_fused_graph 的
         // 命中/未命中两条路径都过 instantiate_plan_into，运行期值已按当前图
@@ -3033,11 +3075,13 @@ private:
                             : nn::fused::find_fused(k.spec_key);
             return fs != nullptr && backend_->has_fused_shader(fs->key);
         }
-        // 写穿物化（多输出）：V0 专用——eval_expr_multi_into 的 NVI 前置校验
-        // 要求输入/输出全 f32，这里同条件（不满足 = 不可用 = 逐成员降级）
+        // 写穿物化（多输出）：V0 预编译 + F32/F16 存储（f16 由 canon_ 开头的
+        // 边界 cast 折回 f32 后查 V0，与无注册表分支同条件；不满足 = 降级）。
         for (const auto& t : ins)
-            if (t.precision() != Precision::F32) return false;
-        if (out.precision() != Precision::F32) return false;
+            if (t.precision() != Precision::F32 && t.precision() != Precision::F16)
+                return false;
+        if (out.precision() != Precision::F32 && out.precision() != Precision::F16)
+            return false;
         const nn::fused::FusedShader* fs = nn::fused::find_fused(k.spec_key);
         return fs != nullptr && backend_->has_fused_shader(fs->key);
 #endif

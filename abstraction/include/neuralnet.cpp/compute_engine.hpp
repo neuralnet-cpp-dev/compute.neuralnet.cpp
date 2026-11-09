@@ -1520,10 +1520,17 @@ public:
 
     // ── P2 多输出（IR-C 写穿物化）：一次求值写多个输出张量 ────────────────
     // outs[0] = 主输出（instrs.back().dst），outs[1+k] = spec.extras[k] 的值
-    // 各自写进对应张量的既有存储。仅纯逐元素 **V0（全 f32）** spec——生成器
-    // 对带 extras 的结构只发 V0 变体（`#x`/typed/native16 跳过），且多输出
-    // 融合由 fuse_expr_graph 的精度门禁限定 F32。不支持录制段（图执行是
-    // end_expr 的职责）。
+    // 各自写进对应张量的既有存储。仅纯逐元素（+前置 matmul 段）spec——生成器
+    // 对带 extras 的结构只发 **V0（全 f32）** 变体（`#x`/typed/native16 门禁
+    // 保留，运行期亦不可达：多输出恒按 V0 现编）。多输出融合的分量门禁
+    // （fuse_expr_graph 的 p2_eligible）为存储精度 F32/F16；f16/混合存储在此
+    // **边界 cast**（输入抬 f32 → 递归走全 f32 快路 → f32 临时槽 cast_into
+    // 落回原存储），与 eval_expr_into / 单输出 f16 图执行同一口径（C4 裁决）。
+    // 边界 cast 放 NVI 而非引擎 impl：多输出无变体选路（V0 唯一），唯一职责
+    // 就是折回 f32 空间——基类一处两引擎共享，引擎 impl 保持"只见全 f32"契约
+    // （F2 的"选路/归因只做一次"在此无选路可做）。GPU 图执行直达点
+    // （eval_expr_multi_into_canon_，绕过本入口）另有同款分支。
+    // 不支持录制段（图执行是 end_expr 的职责）。
     [[nodiscard]] Result<void> eval_expr_multi_into(const ExprSpec& spec,
                                                     std::span<const Tensor> inputs,
                                                     std::size_t rows, std::size_t cols,
@@ -1537,12 +1544,48 @@ public:
             NN_FAIL("eval_expr_multi_into: 不支持在 begin_expr/end_expr 录制段内使用");
         if (outs.size() != spec.extras.size() + 1)
             NN_FAIL("eval_expr_multi_into: outs 数量 != 1 + extras 数量");
+        // 存储精度门（P10-④：原「仅全 f32」放宽到 F32/F16）——BF16/F64/T1_58
+        // 不是存储精度（建不了张量），fail-fast 不放行。
         for (const auto& t : inputs)
-            if (t.precision() != Precision::F32)
-                NN_FAIL("eval_expr_multi_into: 多输出仅支持全 f32（V0）输入");
+            if (t.precision() != Precision::F32 && t.precision() != Precision::F16)
+                NN_FAIL("eval_expr_multi_into: 输入仅支持 F32/F16 存储精度");
         for (const auto& t : outs)
-            if (t.precision() != Precision::F32)
-                NN_FAIL("eval_expr_multi_into: 多输出仅支持全 f32（V0）输出");
+            if (t.precision() != Precision::F32 && t.precision() != Precision::F16)
+                NN_FAIL("eval_expr_multi_into: 输出仅支持 F32/F16 存储精度");
+        if (!all_f32(inputs) || !all_f32(outs))
+        {
+            // 边界 cast：输入抬 f32（f16→f32 精确无损；f32 零拷贝直通）；
+            // f32 输出槽直写真实存储（零多余拷贝），f16 输出槽换 f32 临时——
+            // 复合 kernel 全部写完后逐槽 cast_into 落回原存储（RHE 舍入，
+            // 对象身份不替换；in-place 目标先读旧值后写回，语义正确）。
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            std::vector<Tensor> slots;
+            std::vector<Tensor> owned;   // f16 槽的 f32 临时（保活；slots 拷贝共享）
+            slots.reserve(outs.size());
+            owned.reserve(outs.size());
+            for (Tensor& o : outs)
+            {
+                if (o.precision() == Precision::F32)
+                {
+                    slots.push_back(o);
+                    continue;
+                }
+                Tensor t = create_tensor(rows, cols, Precision::F32);
+                owned.push_back(std::move(t));
+                slots.push_back(owned.back());
+            }
+            // 递归：全 f32 → 快路 → 引擎 impl（V0 复合 kernel）
+            NN_TRY(r, eval_expr_multi_into(spec, *in32, rows, cols, slots));
+            for (std::size_t i = 0; i < outs.size(); ++i)
+            {
+                if (outs[i].precision() != Precision::F32)
+                {
+                    NN_TRY(cr, cast_into(slots[i], outs[i]));
+                }
+            }
+            return {};
+        }
         return eval_expr_multi_into_impl(spec, inputs, rows, cols, outs);
     }
 

@@ -142,7 +142,9 @@ run_fused_gpu(const std::string& shader_name,
               nn::ExprPrecSig prec_sig = 0,
               // P2 多输出（extras，IR-C 写穿物化）：主输出之外的**额外输出存储**
               // （槽 1..k，与生成器的 `bex<k>` 绑定同序）。仅 V0（全 f32）逐元素
-              // shader 支持（`#x`/typed/native16 变体不生成 extras，见 expr_glsl_gen）。
+              // shader 支持（`#x`/typed/native16 变体不生成 extras，见 expr_glsl_gen；
+              // P10-④ 起 f16 分量由引擎侧边界 cast 折回 f32 后到此，绑定类型
+              // 因此恒为 f32——本参数对元素类型无感，槽序/字节即契约）。
               std::span<GpuTensor* const> extra_outs = {})
 {
     if (!initialized_) NN_FAIL("GPU backend not initialized");

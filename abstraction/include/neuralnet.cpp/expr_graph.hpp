@@ -621,10 +621,14 @@ namespace fused
     };
 
     // ── P2 分量标记（写穿物化）──────────────────────────────────────────
-    // 纯逐元素 F32 同形状同精度节点经**依赖边**连通成组（含多消费者/菱形）：
+    // 纯逐元素 F32/F16 同形状同精度节点经**依赖边**连通成组（含多消费者/菱形）：
     // 组内全部成员物化（多输出 kernel，spec.extras = 除尾成员外的输出寄存器）
-    // → 中间量逃逸/多消费者不再是融合边界。非 F32 / fold / 归约 /
-    // 归约输出走 P1 链语义（单输出，中间量契约不变）。
+    // → 中间量逃逸/多消费者不再是融合边界。执行侧：分量 kernel 恒由生成器发
+    // **V0（全 f32）**——F32 直发；F16/混合存储由 eval_expr_multi_into 的
+    // 边界 cast（NVI 与 GPU 图执行直达点两处）在 f32 空间算一次再落回原存储，
+    // 与单输出 f16 图执行同一口径（C4 裁决）。非存储精度（T1_58/BF16/F64）
+    // 建不了张量，恒排除；fold / 归约 / 归约输出走 P1 链语义（单输出，中间量
+    // 契约不变）。
     // P10-①：**多消费者**且带尾链的 matmul 头也进分量——其输出是普通寄存器
     // （instrs.back().dst），经 extras 写穿物化：组内消费者 Linear 直替读寄存器、
     // 组外消费者读物化占位，多消费者不再是 matmul 头的融合边界。
@@ -634,7 +638,11 @@ namespace fused
     const auto p2_eligible = [&](std::size_t i) -> bool
     {
         const auto& N = g.nodes[i];
-        if (N.vector_out || N.prec != Precision::F32 || N.spec.instrs.empty() ||
+        // 精度门（P10-④）：存储精度 F32/F16——分量执行 = 生成器 V0 + 引擎内
+        // 边界 cast（见上方 P2 标记说明）；T1_58 等非存储精度无张量可言，恒拒。
+        const bool prec_ok =
+            N.prec == Precision::F32 || N.prec == Precision::F16;
+        if (N.vector_out || !prec_ok || N.spec.instrs.empty() ||
             N.spec.fold || expr_spec_reduce_axis(N.spec) != -1)
             return false;
         if (N.spec.matmul) return consumers[i].size() >= 2;
@@ -858,8 +866,9 @@ namespace fused
     // ── 主循环（双规则）────────────────────────────────────────────────
     // ① S5 例外：matmul 头链优先按 P1 链语义拼（逐元素尾链附在 matmul 段后，
     //    单输出——matmul 输出无寄存器可写穿）；② P2 分量（写穿全输出，支持
-    //    多消费者/菱形合并与超预算分裂）；③ 其余（非 F32/matmul/fold/归约）
-    //    按 P1 链语义。分量 kernel 与 P1 kernel 互不混拼。
+    //    多消费者/菱形合并与超预算分裂，F32/F16 存储精度）；③ 其余
+    //    （非存储精度/matmul/fold/归约）按 P1 链语义。分量 kernel 与 P1
+    //    kernel 互不混拼。
     for (std::size_t i = 0; i < g.nodes.size(); ++i)
     {
         if (!kernels.empty() && kernels.back().spec.matmul && !k_is_comp.back() &&

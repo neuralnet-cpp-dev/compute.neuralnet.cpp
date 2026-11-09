@@ -557,6 +557,9 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
     if (k_split && (block != EXPR_MATMUL_BLOCK_FINE || expr_prec_sig_is_dispatch(sig))) return {};
     // P10-① 多输出（extras）：仅 V0 全 f32（与逐元素生成器同款门禁——extras
     // 的元素类型不在 ExprPrecSig 里，typed/分派/native16 变体不发 extras）；
+    // P10-④ 起分量门禁为 F32/F16，但 f16 分量在引擎侧边界 cast 折回 f32 后
+    // 才到本函数 ⇒ 此处 sig 恒 0，门保留为安全网。ksplit 拒绝不变（部分和
+    // 不跑尾链，写穿无意义）。
     // #ks 写部分和不跑尾链 → 拒绝（运行期留在细 tile 路径，降级非错误）。
     if (!spec.extras.empty() && (sig != 0 || k_split)) return {};
     const MatmulSpec& mm = *spec.matmul;
@@ -2271,8 +2274,11 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec, 
     const std::size_t n_inputs = spec.views.size();
     const bool disp = expr_prec_sig_is_dispatch(sig);
     // P2 多输出（extras，IR-C 写穿物化）：仅 V0（全 f32）生成——`#x` 分派/
-    // typed/native16 变体跳过（返回空串 = 上层 [skip]，该结构运行时只走 V0；
-    // 多输出节点同精度融合由 fuse_expr_graph 的精度门禁保证）。
+    // typed/native16 变体跳过（返回空串 = 上层 [skip]，该结构运行时只走 V0）。
+    // 分量精度门（fuse_expr_graph 的 p2_eligible）为 F32/F16（P10-④）：
+    // f16/混合分量在引擎侧**边界 cast**（eval_expr_multi_into 的 NVI / GPU
+    // 图执行直达点）折回 f32 后才进入本函数 ⇒ extras 恒以 sig==0 发射，
+    // 本门保留为安全网（typed/native16 多输出路径运行期不可达）。
     if (!spec.extras.empty() && (disp || sig != 0 || native16)) return {};
     std::ostringstream L;
     const auto in_type = [&](std::size_t i) -> const char*
