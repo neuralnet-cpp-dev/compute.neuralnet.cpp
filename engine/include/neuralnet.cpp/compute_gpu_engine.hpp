@@ -1850,7 +1850,9 @@ public:
         // #P9 选路点：fold mm 段按运行期 mm_k 选 Ash 容量档（与 scan_prefix
         //   的 d32 变体同套——形状值仍走 PC，变体身份进 JIT 缓存/pipeline
         //   名）。1024 档无后缀 → 非 fold / 大 d_k 的键与历史逐字一致。
-        const std::string vkey = nn::expr_spec_fold_variant_key(spec, key);
+        //   直通时 vkey 引用 key（不拷贝：结构 key 超出 SSO，拷贝 = 一次堆分配）。
+        std::string vkey_storage;
+        const std::string& vkey = nn::expr_spec_fold_variant_key(spec, key, vkey_storage);
         auto spv_r = jit_compile_(vkey, spec, /*prec_sig=*/0);
         NN_TRY_CHECK(spv_r);
         auto fi_r = fused_buffers_(inputs);
@@ -2914,7 +2916,9 @@ private:
         {
             // #P9 选路点（同 jit_run_）：fold mm 段按运行期 mm_k 选 Ash 容量档，
             //   变体身份 = 键后缀 #m<cap>，同时进 .nnk 缓存键与 pipeline 名。
-            const std::string vkey = nn::expr_spec_fold_variant_key(spec, key);
+            //   直通时 vkey 引用 key（零拷贝，见 expr_spec_fold_variant_key）。
+            std::string vkey_storage;
+            const std::string& vkey = nn::expr_spec_fold_variant_key(spec, key, vkey_storage);
             auto spv_r = jit_compile_(vkey, spec, psig);
             NN_TRY_CHECK(spv_r);
             const std::string pname = nn::fused::kernel_cache_key(vkey, psig);

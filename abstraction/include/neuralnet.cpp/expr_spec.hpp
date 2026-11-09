@@ -1005,13 +1005,17 @@ inline constexpr std::uint32_t FOLD_MMK_CAP_LARGE = 256;
 
 // fold 窄变体键：加 `#m<cap>` 后缀（基线 1024 不加，保持历史键/缓存逐字
 // 一致）。仅 fold 且带 mm 段（有 Ash 预载）才分档；其余 spec 原样返回。
-[[nodiscard]] inline std::string expr_spec_fold_variant_key(const ExprSpec& s,
-                                                            const std::string& base)
+// 直通分支返回 base 的**引用**（不拷贝）——结构 key 是 16 位 hex，超出 SSO
+// 15 字符，按值返回即每次派发一次堆分配；变体键写进调用方给的 storage。
+[[nodiscard]] inline const std::string& expr_spec_fold_variant_key(const ExprSpec& s,
+                                                                   const std::string& base,
+                                                                   std::string& storage)
 {
     if (!s.fold || !s.fold->matmul) return base;
     const std::uint32_t cap = fold_mmk_cap_for(s.fold->matmul->k);
     if (cap == FOLD_MAX_MMK) return base;
-    return base + "#m" + std::to_string(cap);
+    storage = base + "#m" + std::to_string(cap);
+    return storage;
 }
 // fold 块大小：CPU 执行器与 GPU 生成器**共用**的常量（不进 key——分块是
 // 实现细节，但两侧必须同值以对齐分块边界与 max 类逐位；sum 类 GPU subgroup
