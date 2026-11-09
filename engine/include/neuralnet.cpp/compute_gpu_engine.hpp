@@ -1765,7 +1765,11 @@ public:
         }
         const bool renamed = (std::rename(tmp.c_str(), path.c_str()) == 0);
         ::close(lfd);
-        if (!renamed) NN_FAIL("无法原子替换 .nnk 缓存：" + path);
+        if (!renamed)
+        {
+            std::remove(tmp.c_str());   // 半成品 tmp 不留盘（下次不误读）
+            NN_FAIL("无法原子替换 .nnk 缓存：" + path);
+        }
         return {};
 #else
         const std::string data = kernel_cache_->serialize();
@@ -1775,7 +1779,10 @@ public:
         if (!write_tmp(tmp, data))
             NN_FAIL("无法写 .nnk 缓存临时文件（磁盘满/IO 错误？）：" + tmp);
         if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+        {
+            std::remove(tmp.c_str());   // 半成品 tmp 不留盘（下次不误读）
             NN_FAIL("无法原子替换 .nnk 缓存：" + path);
+        }
         return {};
 #endif
     }
@@ -1805,7 +1812,14 @@ public:
             reinterpret_cast<const std::uint32_t*>(spirv) + len / sizeof(std::uint32_t));
         jit_.free(spirv);
         NN_TRY_CHECK(kernel_cache_->insert(K, spv));
-        NN_TRY_CHECK(persist_cache_());
+        // .nnk 落盘是**纯优化**：磁盘满/只读/IO 错误只意味着"本次不更新盘上缓存"。
+        // 此时 SPIR-V 已生成、已进内存缓存，本次派发完全可用——若把落盘失败
+        // 当求值失败抛给调用方，调用方拿到的 Result 里没有任何输出，失败路径上
+        // 继续用该结果就会崩（实测 0xC0000005）。截断 tmp 已由 persist_cache_
+        // 清理，这里只留可观测告警。
+        if (auto pr = persist_cache_(); !pr)
+            std::fprintf(stderr, "[nnk] .nnk 缓存落盘失败（本次不写盘，继续执行）：%s\n",
+                         pr.error().message.c_str());
         return spv;
     }
 
