@@ -1670,7 +1670,7 @@ public:
         if (!h)
         {
             const auto err = static_cast<unsigned long>(GetLastError());
-            NN_FAIL("libnn-kernelgen.so 加载失败（JIT 需要生成器，可设 NN_KERNELGEN_PATH）："
+            NN_FAIL(path + " 加载失败（JIT 需要生成器，可设 NN_KERNELGEN_PATH）："
                     "win32 error " +
                     std::to_string(err));
         }
