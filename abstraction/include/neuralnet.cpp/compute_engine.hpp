@@ -47,7 +47,7 @@
 #include <cstdlib>
 #include <limits>   // RV-02：create_tensor 的形状溢出检查
 #include <memory>
-#include <optional>   // InferenceScope 的 begin_batch 错误槽（issue #28）
+#include <optional>   // InferenceScope 的 begin/finish 错误槽（issue #28 / #G2）
 #include <random>
 #include <source_location>
 #include <span>
@@ -2352,7 +2352,10 @@ private:
 //   · 构造时若 `batch_active() == false` → begin_batch（自己开的才自己收）；
 //     已在 batch 中（训练循环持有的外层 batch）→ 被动透传，析构不收口；
 //   · begin_batch 失败经 `ok()` / `error()` 上抛（不 abort）；
-//   · 析构收口 best-effort（错误已被上层 NN_TRY 传播或忽略，同 ExprSegment）；
+//   · 析构 noexcept 兜底收口：不抛、不 terminate，但把**首个** end_batch
+//     错误存进 `finish_error()`（调用方应在 `finish()` 之后查询）；
+//   · `finish()` 显式收口并返回 Result，收口失败不会被改写成成功
+//     （重复调用返回同一首错）；
 //   · 不可嵌套自开（第二次自开会撞 backend 的 "Already in batch mode"，
 //     属编程错误——外层已有 batch 时内层自动透传，不会发生）。
 class InferenceScope
@@ -2369,9 +2372,14 @@ public:
     }
     InferenceScope(const InferenceScope&) = delete;
     InferenceScope& operator=(const InferenceScope&) = delete;
-    ~InferenceScope()
+    ~InferenceScope() noexcept
     {
-        if (active_) (void)e_->end_batch();   // 兜底收口（同 ExprSegment）
+        if (!active_) return;
+        active_ = false;
+        // 兜底收口：noexcept 路径只记录首错（错误对象移动不分配）；
+        // 调用方若需要检查，应显式调用 finish()。
+        auto r = e_->end_batch();
+        if (!r && !finish_err_) finish_err_ = std::move(r.error());
     }
 
     // 本作用域是否真的开启了 batch（false = 外层已有 batch，透传）
@@ -2379,18 +2387,31 @@ public:
     [[nodiscard]] bool ok() const noexcept { return !err_.has_value(); }
     [[nodiscard]] const Error& error() const noexcept { return *err_; }
 
-    // 显式收口：正常路径可调用以传播 end_batch 错误；不调用则析构兜底。
-    [[nodiscard]] Result<void> end()
+    // 显式收口：返回并记录首个 end_batch 错误。收口失败后再次调用仍返回
+    // 同一首错（不会把已发生的失败改报为成功）。透传作用域无操作。
+    [[nodiscard]] Result<void> finish()
     {
-        if (!active_) return {};
-        active_ = false;
-        return e_->end_batch();
+        if (active_)
+        {
+            active_ = false;
+            auto r = e_->end_batch();
+            if (!r && !finish_err_) finish_err_ = r.error();
+            return r;
+        }
+        if (finish_err_) return std::unexpected(*finish_err_);
+        return {};
     }
+
+    // 首个收口错误（finish() 或析构兜底写入）；未发生收口失败时为空。
+    // ok()/error() 只描述 begin 阶段，收口阶段用本接口查询。
+    [[nodiscard]] const std::optional<Error>& finish_error() const noexcept
+    { return finish_err_; }
 
 private:
     ComputeEngine* e_;
     bool active_ = false;
-    std::optional<Error> err_;
+    std::optional<Error> err_;         // begin_batch 错误（ok()/error()）
+    std::optional<Error> finish_err_;  // 首个 end_batch 错误（finish_error()）
 };
 
 // ═══════════════════════════════════════════════════════════════════════
