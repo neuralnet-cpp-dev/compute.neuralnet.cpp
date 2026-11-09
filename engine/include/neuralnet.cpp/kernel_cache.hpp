@@ -16,6 +16,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -379,6 +380,23 @@ inline bool read_expr_spec(ByteReader& r, ExprSpec& s)
     return rec.serialize_v2();
 }
 
+// ── kernel 字段长度守卫（审查 #M3）──────────────────────────────────────────
+// kernel 字段值 = SPIR-V u32 字节流：必须非空且长度为 4 的倍数，否则按
+// size()/4 截取会静默丢弃尾部残字（截断成半个 SPIR-V 当完整数据，错误延后
+// 到 pipeline 创建才暴露）。两个进入 rec 的边界都过闸：
+//   · from_bytes（加载边界）→ 非法即返回错误 → ensure_cache_ 的隔离链
+//     （c8a72c7：改名 .corrupt 留证 + 空缓存重建，不永久失败）；
+//   · merge_kernels_from（persist 内盘上重读）→ 与既有"parse 失败即跳过
+//     合并"同口径：坏字段跳过 + 告警，好字段照常合并，随后整文件重写自然
+//     修复盘上损坏——不把错误上抛，避免 POSIX 侧提前返回跳过写锁释放。
+[[nodiscard]] inline Result<void> check_kernel_field(const std::string& key, std::size_t size)
+{
+    if (size == 0 || size % sizeof(std::uint32_t) != 0)
+        NN_FAIL("kernel_cache: 字段 '" + key + "' 长度 " + std::to_string(size) +
+                " 非法（SPIR-V 须非空且为 4 的倍数）——缓存损坏");
+    return {};
+}
+
 // 运行期 JIT 算子缓存：懒加载 + 内存热缓存 + 追加持久化。
 struct KernelCache
 {
@@ -398,6 +416,14 @@ struct KernelCache
                                   : std::string(kKernelCacheGeneratorVersion);
         if (c.generator_version == expected_genver)
         {
+            // 接受前过 #M3 长度闸（陈旧分支整份丢弃、字段永不读，无需校验）：
+            // 非法字段 → 错误 → ensure_cache_ 隔离 .corrupt 重建，绝不放行到
+            // hit() 的 uint32_t 视图。
+            for (const std::string& key : rec_r->string_keys_with_prefix(kKernelFieldPrefix))
+            {
+                std::string v;
+                if (rec_r->get(key, v)) NN_TRY_CHECK(check_kernel_field(key, v.size()));
+            }
             c.rec = std::move(*rec_r);
         }
         else
@@ -418,8 +444,14 @@ struct KernelCache
         std::string bytes;
         if (rec.get(std::string(kKernelFieldPrefix) + K, bytes))
         {
-            const auto* data = reinterpret_cast<const std::uint32_t*>(bytes.data());
-            std::vector<std::uint32_t> spv(data, data + bytes.size() / sizeof(std::uint32_t));
+            // #M3：长度闸在加载/合并边界（from_bytes 抛错进 .corrupt 隔离链、
+            //   merge_kernels_from 跳过坏字段）→ 此处 size 恒非空且为 4 的
+            //   倍数，size()/4 无静默截断；对齐由 memcpy 兜底——std::string
+            //   （含 SSO 缓冲）不承诺 uint32_t 对齐，reinterpret_cast 视图属
+            //   理论 UB。memcpy 与原迭代器构造同为一次逐字拷贝，零额外开销。
+            std::vector<std::uint32_t> spv(bytes.size() / sizeof(std::uint32_t));
+            if (!spv.empty())
+                std::memcpy(spv.data(), bytes.data(), spv.size() * sizeof(std::uint32_t));
             const auto [ins, _] = hot.emplace(K, std::move(spv));
             return &ins->second;
         }
@@ -450,7 +482,20 @@ struct KernelCache
             std::string v;
             if (!other.get(key, v)) continue;
             std::string mine;
-            if (!rec.get(key, mine)) rec.set(key, v);
+            if (!rec.get(key, mine))
+            {
+                // #M3：盘上重读的坏字段（长度非 4 倍数/空）不入 rec——跳过 +
+                // 告警（与本路径"parse 失败即跳过合并"的既有宽容口径一致）；
+                // 被跳的 key 后续 JIT miss 重编，persist 整文件重写会顺带
+                // 修复盘上损坏。错误不上抛：POSIX 写锁在调用方后续路径才释放。
+                if (auto ck = check_kernel_field(key, v.size()); !ck)
+                {
+                    std::fprintf(stderr, "[nnk] 合并跳过损坏字段 %s（%s）\n", key.c_str(),
+                                 ck.error().message.c_str());
+                    continue;
+                }
+                rec.set(key, v);
+            }
         }
         return {};
     }
