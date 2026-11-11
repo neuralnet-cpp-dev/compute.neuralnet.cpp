@@ -32,6 +32,17 @@
 // 约束（继承铁律 #1）：终止策略只有 abort / exit，本头任何情况下不出现
 // throw；宏体续行禁止 // 注释（铁律 #10，一律 /* */）。
 
+// ── MSVC 模块消费：__tlregdtor 修饰名路由（2026-11-11 实测）───────────────
+// 模块附件的 thread_local（如 core_profile.hpp 的 st）被消费方经 export 内联
+// 使用者（prof::Op 等）触达时，cl 发出 **C++ 修饰名** `?__tlregdtor@@YAHXZ`
+// 的析构注册引用；CRT 只提供 C 链接裸名 `__tlregdtor`
+// （MSVCRT.lib(tlsdtor.obj)，14.51/14.52 同）⇒ 全量 LNK2019。普通 TU（无
+// 模块）对同一注册发裸名，故孤立微复现不中。/alternatename 把修饰名路由到
+// 裸名；链指令随本头进入每个消费方 obj、链接期全局生效。仅 MSVC（非 clang）。
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma comment(linker, "/alternatename:?__tlregdtor@@YAHXZ=__tlregdtor")
+#endif
+
 // ── 错误处理宏族（铁律 #1 的全仓统一写法）───────────────────────────────
 // `auto r = f(); if (!r) return std::unexpected(r.error());` 是本项目实施
 // 铁律 #1 的主形态，在 L2 层重复约 500 次、占 Layer 代码近 9%。全仓统一为
