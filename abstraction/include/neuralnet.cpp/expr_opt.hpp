@@ -630,13 +630,15 @@ expr_try_algebraic_simplify(ExprOp op, const ExprOperand& a, const ExprOperand& 
 // ═══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline ExprSpec canonicalize_expr_spec(const ExprSpec& spec)
 {
-    // fold 段：整段不参与 IR-A/B——所有 pass 只作用于顶层 instrs
-    // （fold spec 顶层恒空），且它们构造 out 时逐字段拷贝、不认识 fold 字段
-    // （放行即静默丢段 → registry key 撞车 + gen_fused 收到空 instrs spec
-    //   栈溢出崩溃 0xC00000FD）。原样返回同时保证 scan / runtime / key 三端一致
-    // （canonical 不变式：expr_spec_key(spec) ≡ expr_spec_key(canonical(spec))，
-    //   对 fold spec 退化为恒等——双域 fold 若要在 body 上跑 DCE/CSE，须先给
-    //   各 pass 补 fold 字段透传再放开，勿直接删本行）。
+    // fold 段：整段不参与 IR-A/B——pass 只认识顶层 instrs 而构造 out 时逐字段
+    // 拷贝、不认识 fold 字段（放行即静默丢段 → registry key 撞车 + 生成器收到
+    //   空 instrs spec 栈溢出崩溃 0xC00000FD）。P10-③ 起 fold spec 顶层可带
+    //   逐元素尾链，但**同样跳过**（raw 即 canonical）：key/去重/派发三端都走
+    //   本函数，fold 恒等返回使它们对 fold+尾链仍逐字一致——尾链只是不做
+    //   DCE/CSE/重编号优化（构造源 = DSL/融合器，本身良构）。
+    //   canonical 不变式：expr_spec_key(spec) ≡ expr_spec_key(canonical(spec))，
+    //   对 fold spec 退化为恒等——若要让尾链/body 参与 IR-A/B，须先给各 pass
+    //   补 fold 字段透传再放开，勿直接删本行）。
     if (spec.fold) return spec;
     ExprSpec s = fold_constants_and_algebra(spec);
     s = dead_code_elimination(s);

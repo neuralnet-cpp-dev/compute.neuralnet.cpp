@@ -16,6 +16,8 @@
 //  11. IR-D emitter 抽象
 //  12. #T5：fold Ash 容量分档（#P9）+ 链尾死存储消除（#P3）——GLSL 文本断言
 //      + CPU 执行语义数值对拍
+//  13. P10-③：fold 头 + 尾链融合 / fold 作链成员拒拼 / v2 双域 fold 尾链
+//      （reg 与 VecState 两读法：validate + GLSL 文本 + CPU 数值）
 //
 //  构建/运行：cmake -B build -DNN_ENABLE_TESTS=ON && cmake --build build
 //            ctest --test-dir build -R expr_graph_test
@@ -40,10 +42,13 @@
 #include <neuralnet.cpp/expr_opt.hpp>
 #include <neuralnet.cpp/expr_graph.hpp>
 #include <neuralnet.cpp/expr_dsl.hpp>
+#include <neuralnet.cpp/expr_fold.hpp>     // P10-③ fold 头链样例（make_fold_rowsum）
 #include <neuralnet.cpp/expr_emitter.hpp>
 #include <neuralnet.cpp/expr_glsl_gen.hpp>    // 注册 GlslEmitter（IR-D）
+#include "expr_fuse_shapes.hpp" // 共享 fold fixture（make_fold_mm_chain，#T5/P10-③ 共用）
 
 using nn::Scalar;
+using nn::test_fuse::make_fold_mm_chain;
 
 namespace
 {
@@ -479,6 +484,165 @@ void test_reduce_axis_mismatch_boundary()
     auto kernels = fuse_expr_graph(g);
     CHECK(kernels.size() == 2, "归约轴不匹配时保持独立 kernel（走 JIT/单节点路径）");
     std::printf("[OK] test_reduce_axis_mismatch_boundary (kernels=%zu)\n", kernels.size());
+}
+
+// ── 测试 5c（P10-③）：fold 头 + 逐元素尾链融合 ─────────────────────────────
+// A: s = fold_rowsum(x)（fold 输出网格 (rows,1)，顶层空）；B: y = s + 2.5
+// （唯一消费者，Linear 引用 fold 输出）→ 拼成单 kernel：fold 段保留 + 顶层
+// instrs = 尾链（尾链读 finalize 末 dst）。融合 spec 必须过 validate，数值
+// == 逐节点（fold → 加法）参考；尾链 GLSL 生成（'T' 上下文）非空。
+void test_fold_tail_fuse()
+{
+    auto eng_owner = nn::create_cpu_engine();
+    nn::ComputeEngine& eng = *eng_owner;
+    const std::size_t rows = 4;
+    const std::uint32_t K = 16;
+    nn::ExprGraph g;
+    nn::Tensor x = make_tensor(eng, rows, K, -1.0f, 0.1f);
+    const nn::ExprSpec fold = nn::expr::make_fold_rowsum(K);
+    const nn::ExprSpec add = make_unary_const(nn::ExprOp::Add, Scalar{2.5});
+
+    const int nA = g.add_node(fold, std::vector<nn::Tensor>{x}, rows, 1, false);
+    nn::Tensor st = make_placeholder(eng, rows, 1, g.tag_of_node[static_cast<std::size_t>(nA)]);
+    (void)g.add_node(add, std::vector<nn::Tensor>{st}, rows, 1, false);
+
+    auto kernels = fuse_expr_graph(g);
+    CHECK(kernels.size() == 1, "fold 头 + 消费链应融合为单 kernel");
+    if (kernels.size() != 1) return;
+    CHECK(kernels[0].members.size() == 2, "kernel 应包含 fold + 消费节点");
+    CHECK(kernels[0].spec.fold.has_value(), "融合 spec 保留 fold 段");
+    CHECK(kernels[0].spec.instrs.size() == 1, "顶层 instrs = 消费链尾链");
+    if (kernels[0].spec.fold && !kernels[0].spec.instrs.empty())
+    {
+        const nn::ExprOperand& a = kernels[0].spec.instrs[0].a;
+        CHECK(a.kind == static_cast<uint8_t>(nn::ExprOperandKind::Reg) &&
+                  a.idx == kernels[0].spec.fold->finalize.back().dst,
+              "尾链读 fold finalize 末指令 dst");
+    }
+    auto v = nn::validate_expr_spec(kernels[0].spec, kernels[0].spec.views.size());
+    CHECK(static_cast<bool>(v), "融合 fold+尾链 spec 通过 validate");
+    if (!v) return;
+
+    std::vector<nn::Tensor> kinputs;
+    for (auto& in : kernels[0].inputs)
+        kinputs.push_back(in.external);
+    auto fused_r = eng.eval_expr(kernels[0].spec, kinputs, rows, 1);
+    auto y_ref0 = eng.eval_expr(fold, std::vector<nn::Tensor>{x}, rows, 1);
+    CHECK(static_cast<bool>(fused_r), "融合 fold+尾链求值成功");
+    CHECK(static_cast<bool>(y_ref0), "fold 参考求值成功");
+    if (!fused_r || !y_ref0) return;
+    auto y_ref = eng.eval_expr(add, std::vector<nn::Tensor>{*y_ref0}, rows, 1);
+    CHECK(static_cast<bool>(y_ref), "尾链参考求值成功");
+    if (!y_ref) return;
+    CHECK(max_abs_diff(matrix_of(eng, *fused_r), matrix_of(eng, *y_ref)) < 1e-6f,
+          "融合 fold+尾链 == 逐节点（fold → 加法）");
+
+    // 尾链 GLSL 生成（v1 分支：vec_state_len=0）非空 = 'T' 上下文可发射
+    auto gl = nn::emitter_registry::make("glsl");
+    if (gl)
+    {
+        const std::string src = gl->generate("fold_tail", kernels[0].spec);
+        CHECK(!src.empty(), "fold+尾链 GLSL 生成成功（v1）");
+        CHECK(src.find("fold tail") != std::string::npos, "生成源包含尾链段");
+    }
+    std::printf("[OK] test_fold_tail_fuse (kernels=%zu)\n", kernels.size());
+}
+
+// ── 测试 5d（P10-③ 边界）：B 自身是 fold 头 → 不拼接 ─────────────────────
+// fold 必须位于链首（其 finalize 即自带尾链）；前序链的消费者是 fold 节点时
+// 保持独立 kernel。
+void test_fold_as_chain_member_rejected()
+{
+    auto eng_owner = nn::create_cpu_engine();
+    nn::ComputeEngine& eng = *eng_owner;
+    const std::size_t rows = 3, cols = 4;
+    const std::uint32_t K = 4;
+    nn::ExprGraph g;
+    nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
+
+    const int nA = g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}),
+                              std::vector<nn::Tensor>{x}, rows, cols, false);
+    nn::Tensor yt = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
+    // fold B：输入 = A 输出（cols=K 网格），输出 (rows,1)
+    (void)g.add_node(nn::expr::make_fold_rowsum(K), std::vector<nn::Tensor>{yt}, rows, 1, false);
+
+    auto kernels = fuse_expr_graph(g);
+    CHECK(kernels.size() == 2, "fold 节点作链成员（B）时保持独立 kernel");
+    std::printf("[OK] test_fold_as_chain_member_rejected (kernels=%zu)\n", kernels.size());
+}
+
+// ── 测试 15b（P10-③ v2）：双域 fold + 尾链（'T' 上下文 / dd 步进循环）──────
+// v2 = mm 段 + vecacc（make_fold_mm_chain，输出网格 (rows, veclen)）。尾链两种
+// 读法：① 读 finalize 输出寄存器（融合消费链的真实形态）；② 直读 VecState
+//（向量域操作数）。验收：validate 通过、GLSL 走 v2 分支且含尾链段、CPU 数值
+// == 基线 × 2.5。GPU 执行语义由 expr_fuse_test 的 run_fold_v2_tail 覆盖。
+void test_fold_v2_tail()
+{
+    auto eng_owner = nn::create_cpu_engine();
+    nn::ComputeEngine& eng = *eng_owner;
+    const std::size_t rows = 4;
+    const std::uint32_t fold_k = 16, mm_k = 16, veclen = 8;
+    nn::Tensor a0 = make_tensor(eng, rows, mm_k, 0.5f, 0.0f);   // A ≡ 0.5
+    nn::Tensor b0 = make_tensor(eng, mm_k, fold_k, 1.0f, 0.0f); // B ≡ 1
+    nn::Tensor vv = make_tensor(eng, fold_k, veclen, 1.0f, 0.0f); // V ≡ 1
+    const std::vector<nn::Tensor> ins{a0, b0, vv};
+
+    const nn::ExprSpec base = make_fold_mm_chain(fold_k, mm_k, veclen);
+    auto mk_tail = [&](bool via_vecstate)
+    {
+        nn::ExprSpec s = base;
+        s.consts.push_back(Scalar{2.5f});
+        nn::ExprInstr ti;
+        ti.op = static_cast<uint8_t>(nn::ExprOp::Mul);
+        ti.dst = 6;
+        ti.a = via_vecstate ? nn::expr::vec_state(0) : nn::expr::reg(5);
+        ti.b = nn::expr::cst(1);
+        s.instrs = {ti};
+        s.num_regs = 7;
+        return s;
+    };
+    const nn::ExprSpec tail_reg = mk_tail(false);
+    const nn::ExprSpec tail_vec = mk_tail(true);
+
+    CHECK(static_cast<bool>(nn::validate_expr_spec(tail_reg, 3)),
+          "v2 尾链（读 finalize dst）validate 通过");
+    CHECK(static_cast<bool>(nn::validate_expr_spec(tail_vec, 3)),
+          "v2 尾链（直读 VecState）validate 通过");
+
+    auto base_out = eng.eval_expr(base, ins, rows, veclen);
+    auto tail_out = eng.eval_expr(tail_reg, ins, rows, veclen);
+    auto vec_out = eng.eval_expr(tail_vec, ins, rows, veclen);
+    CHECK(static_cast<bool>(base_out), "v2 基线求值成功");
+    CHECK(static_cast<bool>(tail_out), "v2 尾链（reg）求值成功");
+    CHECK(static_cast<bool>(vec_out), "v2 尾链（VecState）求值成功");
+    if (base_out && tail_out && vec_out)
+    {
+        const auto bm = matrix_of(eng, *base_out);
+        const auto tm = matrix_of(eng, *tail_out);
+        const auto vm = matrix_of(eng, *vec_out);
+        const auto bs = bm.span(), tss = tm.span(), vs = vm.span();
+        bool ok = bs.size() == tss.size() && bs.size() == vs.size();
+        Scalar err = 0;
+        for (std::size_t i = 0; ok && i < bs.size(); ++i)
+        {
+            const Scalar ref = bs[i] * Scalar{2.5f};
+            err = std::fmax(err, std::fabs(tss[i] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
+            err = std::fmax(err, std::fabs(vs[i] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
+        }
+        CHECK(ok && err < 1e-5f, "v2 尾链数值 == 基线 × 2.5（reg 与 VecState 两读法）");
+    }
+
+    auto gl = nn::emitter_registry::make("glsl");
+    if (gl)
+    {
+        const std::string src = gl->generate("fold_v2_tail", tail_reg);
+        CHECK(!src.empty(), "v2 fold+尾链 GLSL 生成成功");
+        CHECK(src.find("fold tail") != std::string::npos, "v2 生成源包含尾链段");
+        CHECK(src.find("fold v2") != std::string::npos, "走 v2 双域分支");
+        if (std::getenv("NN_DUMP_FOLD_TAIL") != nullptr)
+            std::printf("===== fold v2 tail GLSL =====\n%s\n===== end =====\n", src.c_str());
+    }
+    std::printf("[OK] test_fold_v2_tail\n");
 }
 
 // ── 测试 6：上限压力（拼接后超 EXPR_MAX_INSTRS 则放弃融合） ───────────
@@ -1227,48 +1391,14 @@ void test_emitter()
 //      vecacc 的 b(j,d) 索引约定不影响期望值）；GPU 侧执行语义由主仓
 //      fused_gpu_test 的 fold 数值对拍覆盖（本测试二进制是纯 CPU 消费方形态）。
 //
-// body 结构（寄存器号 = 下方断言锚点；eidx 经 classify 现算并断言防漂移）：
+// body 结构（寄存器号 = 下方断言锚点；eidx 经 classify 现算并断言防漂移；
+// 函数本体已迁共享 fixture expr_fuse_shapes.hpp——P10-③ 起 expr_fuse_test 共用）：
 //   [0] a = Matmul + c0   （r1 元素链首）→ 仅被 [1] 读一次 → 链尾死存储
 //   [1] b = exp(a)        （r2 元素）    → 被 [2]（RowSum）与 [4]（链2）读 → 活
 //   [2] blk = RowSum(b)   （r3 块归约 dst = 行标量）→ flush 链1
 //   [3] r0 += Reduce(blk) （标量行，状态跨块累计）
 //   [4] w = exp(b)        （r4 元素末链）→ body 内无人再读，仅 vecacc 读它
 // finalize: out = O + c0；vecacc: O += Σ_j w(j)·V(j,d)（无 scale）
-nn::ExprSpec make_fold_mm_chain(std::uint32_t fold_k, std::uint32_t mm_k,
-                                std::uint32_t veclen = 8)
-{
-    const auto ins = [](nn::ExprOp op, std::uint8_t dst, nn::ExprOperand a,
-                        nn::ExprOperand b = {})
-    {
-        nn::ExprInstr i;
-        i.op = static_cast<std::uint8_t>(op);
-        i.dst = dst;
-        i.a = a;
-        i.b = b;
-        return i;
-    };
-    nn::ExprSpec s;
-    nn::FoldSpec f;
-    f.k = fold_k;
-    f.num_state = 1;
-    f.inits = {Scalar{0}};
-    f.vec_state_len = veclen;
-    f.matmul = nn::MatmulSpec{0, 1, 0, 0, mm_k, 1};  // A=输入0 B=输入1 batch=1
-    f.vecacc = nn::VecAccSpec{0, 4, 2, 0, 0};        // weight=r4 V=输入2 无 scale
-    f.body = {
-        ins(nn::ExprOp::Add, 1, nn::expr::matmul_op(), nn::expr::cst(0)),
-        ins(nn::ExprOp::Exp, 2, nn::expr::reg(1)),
-        ins(nn::ExprOp::RowSum, 3, nn::expr::reg(2)),
-        ins(nn::ExprOp::Add, 0, nn::expr::reg(0), nn::expr::reduce(3)),
-        ins(nn::ExprOp::Exp, 4, nn::expr::reg(2)),
-    };
-    f.finalize = {ins(nn::ExprOp::Add, 5, nn::expr::vec_state(0), nn::expr::cst(0))};
-    s.fold = std::move(f);
-    s.consts = {Scalar{0}};
-    s.num_regs = 6;
-    s.views = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
-    return s;
-}
 
 void test_fold_ash_tier_and_dead_store()
 {
@@ -1508,6 +1638,9 @@ int main()
     test_multi_consumer();
     test_reduce_broadcast_fuse();
     test_reduce_axis_mismatch_boundary();
+    test_fold_tail_fuse();
+    test_fold_as_chain_member_rejected();
+    test_fold_v2_tail();
     test_limit_pressure();
     test_determinism();
     test_dep_recognition();

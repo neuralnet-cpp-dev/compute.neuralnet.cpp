@@ -61,11 +61,15 @@ public:
     // 批量变体 kernel 源码（键 = key#b，P3 跨链批量派发）：同结构多实例
     // 经实例表（uvec2 数组，stride = 输入+输出+尾槽）+ buffer device address
     // 一次 dispatch。资格 = expr_spec_batchable（纯逐元素）。sig = 变体身份
-    // 签名：0 = V0 全 f32（**含 extras 复合结构**，extras 引用恒 f32）；具体
-    // 签名 = 静态特化变体，仅 **extras 为空**的结构（extras 的元素类型不在签名
-    // 编码里 → 带 extras 的 f16 结构仍逐 kernel 降级）。运行期分派哨兵不支持。
-    // 默认返回空串 = 该后端不支持 → 运行期回退逐 kernel 派发（注册表降级，
-    // 不是错误）。
+    // 签名：0 = V0 全 f32（**含 extras 复合结构**，extras 引用恒 f32——P10-④
+    // 起 f16/混合分量先经引擎侧边界 cast 折回 f32 才进生成器，extras 结构到达
+    // 时恒 sig==0）；具体签名 = 静态特化变体，仅 **extras 为空**的结构（extras
+    // 的元素类型不在签名编码里；引擎侧批量资格同源：extras 恒 F32、sig≠0 须
+    // extras 空，见 execute_fused_graph 的 b_prefix 判定）。运行期分派哨兵不
+    // 支持。带 extras 的 f16 结构 P10-④ 后**能融合执行**（单复合 kernel：边界
+    // cast → V0 → 输出落回），只是不入批量组 → 逐 kernel（非批量）派发——
+    // 不是逐成员降级。默认返回空串 = 该后端不支持 → 运行期回退逐 kernel
+    // 派发（注册表降级，不是错误）。
     [[nodiscard]] virtual std::string generate_batched(const std::string&, const ExprSpec&,
                                                        ExprPrecSig = 0) const
     { return {}; }

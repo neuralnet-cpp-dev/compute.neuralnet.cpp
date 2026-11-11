@@ -2023,6 +2023,35 @@ public:
         const std::size_t out_cols = (f.vec_state_len > 0) ? f.vec_state_len : 1;
         if (cols != out_cols)
             NN_FAIL("eval_fold: cols must equal fold output width (vec_state_len or 1)");
+        // ── P10-③ 域簿记：body 域槽（body Input / f.matmul A·B / vecacc.b）与
+        //   尾链域槽（顶层 instrs 的 Input）——尾链独占槽按输出网格校验、
+        //   body 槽（或无人引用的旧槽）按既有 (rows, K) 规则校验、两域皆用则
+        //   双重校验（各自规则见下）。
+        std::vector<uint8_t> used_body(inputs.size(), 0), used_tail(inputs.size(), 0);
+        const auto mark_use = [&](std::vector<uint8_t>& set, const ExprOperand& o)
+        {
+            if (o.kind == static_cast<uint8_t>(ExprOperandKind::Input) && o.idx < inputs.size())
+                set[o.idx] = 1;
+        };
+        for (const auto& ins : f.body)
+        {
+            mark_use(used_body, ins.a);
+            mark_use(used_body, ins.b);
+            mark_use(used_body, ins.c);
+        }
+        if (f.matmul)
+        {
+            if (f.matmul->a_input < inputs.size()) used_body[f.matmul->a_input] = 1;
+            if (f.matmul->b_input < inputs.size()) used_body[f.matmul->b_input] = 1;
+        }
+        if (f.vecacc && f.vecacc->b_input < inputs.size())
+            used_body[f.vecacc->b_input] = 1;
+        for (const auto& ins : spec.instrs)
+        {
+            mark_use(used_tail, ins.a);
+            mark_use(used_tail, ins.b);
+            mark_use(used_tail, ins.c);
+        }
         // 输入：分 fold.matmul 的 A/B（按 trans 布局）与普通输入（视图校验）
         std::vector<ConstSpan> spans;
         spans.reserve(inputs.size());
@@ -2038,6 +2067,57 @@ public:
             const bool is_tag_table =
                 (vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol);
             const bool is_rowvec = (vk == ExprViewKind::RowBroadcast); // (rows,1) 行参数
+            // ── 尾链域形状校验（P10-③；网格 = (rows, out_cols)）──────────────
+            //   视图种类已由 validate_expr_spec 收紧为不内嵌 PC cols 的集合
+            //   （Linear/HeadGroup/Transpose/RowBroadcast/ColBroadcast +
+            //    需 f.matmul 的 BatchMod/BatchCol），此处按放行集合逐种核形状；
+            //   与 body 校验可叠加（同一槽两域皆用 → 双重校验）。
+            if (used_tail[k])
+            {
+                if (vk == ExprViewKind::Linear || vk == ExprViewKind::HeadGroup)
+                {
+                    if (t.rows() != rows || t.cols() != out_cols)
+                        NN_FAIL("eval_fold: tail input shape mismatch (expect (rows, out_cols))");
+                }
+                else if (vk == ExprViewKind::RowBroadcast)
+                {
+                    if (!(t.rows() == rows && t.cols() == 1))
+                        NN_FAIL("eval_fold: tail RowBroadcast input must be (rows, 1)");
+                }
+                else if (vk == ExprViewKind::ColBroadcast)
+                {
+                    if (!(t.rows() == 1 && t.cols() == out_cols))
+                        NN_FAIL("eval_fold: tail ColBroadcast input must be (1, out_cols)");
+                }
+                else if (vk == ExprViewKind::Transpose)
+                {
+                    const std::size_t stride = spec.views[k].param;
+                    if (stride == 0 || (out_cols - 1) * stride + rows > t.size())
+                        NN_FAIL("eval_fold: tail Transpose input addressing out of range");
+                }
+                else if (vk == ExprViewKind::BatchMod)
+                {
+                    const std::uint32_t vparam = spec.views[k].param;
+                    if (t.rows() != 1 || vparam == 0)
+                        NN_FAIL("eval_fold: tail BatchMod input must be (1, n), param > 0");
+                }
+                else if (vk == ExprViewKind::BatchCol)
+                {
+                    const std::uint32_t vparam = spec.views[k].param;
+                    const std::size_t batch_n = f.matmul ? f.matmul->batch : 1;
+                    if (t.rows() != 1 || vparam == 0 ||
+                        t.cols() != batch_n * static_cast<std::size_t>(vparam))
+                        NN_FAIL("eval_fold: tail BatchCol input must be (1, batch*param)");
+                }
+                else
+                    NN_FAIL("eval_fold: tail view outside supported scope");
+                // 尾链独占槽：跳过 body 侧的 (rows, K)/白名单校验（域不同）
+                if (!used_body[k])
+                {
+                    spans.push_back(t.cpu_matrix().span());
+                    continue;
+                }
+            }
             if (!is_vecb && !is_tag_table && !is_rowvec && f.matmul &&
                 (k == static_cast<std::size_t>(f.matmul->a_input) ||
                  k == static_cast<std::size_t>(f.matmul->b_input)))
@@ -2260,6 +2340,33 @@ public:
             return spans[k][r * K + gk];
         };
 
+        // P10-③ 尾链输入读（**输出网格域**：列 = out_cols、批分解 = m_per）——
+        //   与 eval_expr_impl 的 read_input 同源语义，仅覆盖 validate 放行的
+        //   尾链视图集合（Linear/HeadGroup/Transpose/RowBroadcast/ColBroadcast/
+        //   BatchMod/BatchCol；归约视图与内嵌键长行距的种类已在 validate 拒）。
+        const auto tail_read = [&](std::size_t k, std::size_t r, std::size_t d) -> Scalar
+        {
+            const ExprView& v = spec.views[k];
+            const auto vk = static_cast<ExprViewKind>(v.kind);
+            const ConstSpan& s = spans[k];
+            const std::size_t b_idx = (f.matmul && m_per > 0) ? r / m_per : 0;
+            switch (vk)
+            {
+            case ExprViewKind::RowBroadcast:
+                return s[r]; // (rows,1)
+            case ExprViewKind::ColBroadcast:
+                return s[d]; // (1,out_cols)
+            case ExprViewKind::Transpose:
+                return s[d * static_cast<std::size_t>(v.param) + r]; // b[col*stride+row]
+            case ExprViewKind::BatchMod:
+                return s[b_idx % v.param];
+            case ExprViewKind::BatchCol:
+                return s[b_idx * v.param + d];
+            default: // Linear / HeadGroup（恒等索引，同主链 default）
+                return s[r * out_cols + d];
+            }
+        };
+
         Span out = output.cpu_matrix().span();
         // 行间完全独立（状态 / 元素临时 / 归约槽 / 行向量态都在行首复位），
         // 逐位一致 ⇒ 行是天然的并行单元。按行段分片、每片用本线程的持久
@@ -2349,6 +2456,48 @@ public:
                 const Scalar vb = (nops >= 2) ? eval_op(ins.b, r, kb, gk) : Scalar{0};
                 return exec_alu(op, va, vb);
             };
+            // ── P10-③ 尾链操作数/指令（输出网格域；validate 保证：行标量寄存器
+            //   / 放行视图 / 无 Reduce·Matmul；Row/Col/Batch 与正常主链同源）──
+            const auto eval_tail_op = [&](const ExprOperand& op, std::size_t r,
+                                          std::size_t d) -> Scalar
+            {
+                switch (op.kind)
+                {
+                default:
+                case static_cast<uint8_t>(ExprOperandKind::Reg):
+                case static_cast<uint8_t>(ExprOperandKind::Fanout):
+                    return reg[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::Const):
+                    return spec.consts[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::RParam):
+                    return spec.rparams[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::Input):
+                    return tail_read(op.idx, r, d);
+                case static_cast<uint8_t>(ExprOperandKind::Row):
+                    return static_cast<Scalar>(r % m_per); // 无 f.matmul 时 m_per = rows → r
+                case static_cast<uint8_t>(ExprOperandKind::Col):
+                    return static_cast<Scalar>(d);
+                case static_cast<uint8_t>(ExprOperandKind::Batch):
+                    return static_cast<Scalar>((f.matmul && m_per > 0) ? r / m_per : 0);
+                case static_cast<uint8_t>(ExprOperandKind::VecState):
+                    return (d < vecd.size()) ? vecd[d] : Scalar{0};
+                }
+            };
+            const auto eval_tail_full = [&](const ExprInstr& ins, std::size_t r,
+                                            std::size_t d) -> Scalar
+            {
+                const ExprOp op = static_cast<ExprOp>(ins.op);
+                const Scalar va = eval_tail_op(ins.a, r, d);
+                if (op == ExprOp::Select)
+                {
+                    const Scalar vt = eval_tail_op(ins.b, r, d);
+                    const Scalar ve = eval_tail_op(ins.c, r, d);
+                    return (va != Scalar{0}) ? vt : ve;
+                }
+                const std::size_t nops = expr_instr_num_operands(op);
+                const Scalar vb = (nops >= 2) ? eval_tail_op(ins.b, r, d) : Scalar{0};
+                return exec_alu(op, va, vb);
+            };
 
             for (std::size_t r = r_begin; r < r_end; ++r)
             {
@@ -2433,7 +2582,13 @@ public:
                     cur_d = d;
                     for (const auto& ins : f.finalize)
                         reg[ins.dst] = eval_full(ins, r, 0, 0);
-                    out[r * out_cols + d] = reg[f.finalize.back().dst];
+                    // P10-③ 尾链：finalize 之后逐 (row, d) 执行；输出 = 尾链末
+                    //   指令 dst（无尾链 = finalize 末指令 dst）
+                    for (const auto& ins : spec.instrs)
+                        reg[ins.dst] = eval_tail_full(ins, r, d);
+                    out[r * out_cols + d] =
+                        reg[spec.instrs.empty() ? f.finalize.back().dst
+                                                : spec.instrs.back().dst];
                 }
             }
         };

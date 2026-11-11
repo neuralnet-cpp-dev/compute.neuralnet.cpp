@@ -180,6 +180,35 @@ namespace nn::expr
     return s;
 }
 
+// ── 5) fold rowsum + 逐元素尾链（P10-③「fold 后逐元素收尾」样例）──────────
+// 在 rowsum 之上追加输出网格 (rows,1) 的顶层尾链（finalize 之后执行）：
+//   [2] t1 = r0 + c1          （读状态 + 常量）
+//   [3] t2 = t1 * g(row)      （读尾链域新输入 g：(rows,1) Linear）
+// 输出 = t2（instrs.back().dst）。body/finalize 与 rowsum 逐字同构；对拍参考
+// = (Σ_k x(row,k) + 2.5) * g[row]。两域输入分槽（0 = 键域、1 = 尾链域），
+// CPU/GPU 按域校验形状。
+[[nodiscard]] inline ExprSpec make_fold_rowsum_tail(std::uint32_t k)
+{
+    ExprSpec s = make_fold_rowsum(k);
+    s.consts.push_back(Scalar{2.5}); // c1
+    s.views.push_back(linear());     // 输入 1 = 尾链域网格 (rows,1)
+    const auto ins = [](ExprOp op, std::uint8_t dst, ExprOperand a, ExprOperand b)
+    {
+        ExprInstr i;
+        i.op = static_cast<uint8_t>(op);
+        i.dst = dst;
+        i.a = a;
+        i.b = b;
+        return i;
+    };
+    s.instrs = {
+        ins(ExprOp::Add, 2, reg(0), cst(1)),   // t1 = Σ + 2.5
+        ins(ExprOp::Mul, 3, reg(2), input(1)), // t2 = t1 * g(row)
+    };
+    s.num_regs = 4;
+    return s;
+}
+
 } // namespace nn::expr
 
 // ═══════════════════════════════════════════════════════════════════════════

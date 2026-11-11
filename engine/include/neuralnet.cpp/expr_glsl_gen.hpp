@@ -1188,8 +1188,11 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
 inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& spec,
                                       ExprPrecSig sig = 0)
 {
-    // 形态由 validate_expr_spec 保证；防御性拒绝一切越界组合
-    if (!spec.fold || spec.matmul || !spec.instrs.empty()) return {};
+    // 形态由 validate_expr_spec 保证；防御性拒绝一切越界组合。
+    // P10-③：顶层 instrs = fold 后逐元素尾链（finalize 之后逐行执行，输出 =
+    // instrs.back().dst）——域规则在 validate 的 fold 段（仅行标量寄存器 /
+    // 输出网格视图 / 无归约）。
+    if (!spec.fold || spec.matmul) return {};
     const FoldSpec& f = *spec.fold;
     auto cls = expr_fold_classify(f, spec.num_regs);
     if (!cls) return {};
@@ -1368,6 +1371,43 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
           << ";\n";
     };
 
+    // ── P10-③ 尾链操作数（输出网格域，与 body 的键域分域）─────────────────
+    // v1 输出列恒 1（vec_state_len=0 ⇒ out_cols=1）：col ≡ 0、idx = row。
+    // Input 走输出网格索引（Linear 等视图的 idx_var = row）；Row/Col/Batch =
+    // 输出网格坐标（v1 无 f.matmul ⇒ batch 分解恒等：Row=row、Batch=0）。
+    // 读寄存器恒为行标量（validate 尾链规则）→ rN 直读；VecState/Reduce/
+    // Matmul 由 validate 拒绝，不可达。
+    const auto tail_operand = [&](const ExprOperand& op) -> std::string
+    {
+        switch (op.kind)
+        {
+        default:
+        case static_cast<uint8_t>(ExprOperandKind::Reg):
+        case static_cast<uint8_t>(ExprOperandKind::Fanout):
+            return "r" + std::to_string(op.idx);
+        case static_cast<uint8_t>(ExprOperandKind::Const):
+            return "c" + std::to_string(op.idx);
+        case static_cast<uint8_t>(ExprOperandKind::RParam):
+            return "rp" + std::to_string(op.idx);
+        case static_cast<uint8_t>(ExprOperandKind::Input):
+        {
+            std::ostringstream os;
+            const bool f16_in = sig != 0 && expr_prec_sig_in_f16(sig, op.idx);
+            if (f16_in) os << "float(";
+            glsl_view_read(os, spec.views[op.idx], op.idx, "row", "row", "0u",
+                           glsl_vp_slot(spec, op.idx), sig);
+            if (f16_in) os << ")";
+            return os.str();
+        }
+        case static_cast<uint8_t>(ExprOperandKind::Row):
+            return "float(row)";
+        case static_cast<uint8_t>(ExprOperandKind::Col):
+            return "float(0.0)";
+        case static_cast<uint8_t>(ExprOperandKind::Batch):
+            return "float(0.0)";
+        }
+    };
+
     // ── 内联表达式文本（递归展开可内联元素寄存器；与 emit_assign 同形）────
     const auto def_of = [&](std::uint32_t r) -> const ExprInstr*
     {
@@ -1469,20 +1509,42 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
         L << "    ";
         emit_assign(ins, "r" + std::to_string(ins.dst), "0u");
     }
+    // ── P10-③ 尾链（fold 后逐元素收尾）：finalize 之后逐行执行一次 ────────
+    if (!spec.instrs.empty())
+    {
+        L << "\n    // fold tail (P10-③)\n";
+        for (const auto& ins : spec.instrs)
+        {
+            const ExprOp op = static_cast<ExprOp>(ins.op);
+            const std::string a = tail_operand(ins.a);
+            const detail::ExprOpInfo& info = detail::expr_op_info(op);
+            const std::string dst_str = "r" + std::to_string(ins.dst);
+            if (info.emit == detail::ExprEmitKind::None)
+            {
+                L << "    " << dst_str << " = (" << a << ");\n";
+                continue;
+            }
+            L << "    " << dst_str << " = "
+              << glsl_alu_expr(info, a, [&] { return tail_operand(ins.b); },
+                               [&] { return tail_operand(ins.c); }, /*vec4=*/false,
+                               /*native16=*/false, /*wrap=*/false)
+              << ";\n";
+        }
+    }
+    // 输出 = 尾链末指令 dst（P10-③）；无尾链 = finalize 末指令 dst
+    const std::string out_reg_expr = "r" + std::to_string(static_cast<int>(
+                                                spec.instrs.empty() ? f.finalize.back().dst
+                                                                    : spec.instrs.back().dst));
     if (disp)
     {
         L << "    if ((prec >> 16u & 1u) != 0u)\n";
-        L << "        bout16[row] = "
-          << glsl_f16_store("r" + std::to_string(static_cast<int>(f.finalize.back().dst))) << ";\n";
+        L << "        bout16[row] = " << glsl_f16_store(out_reg_expr) << ";\n";
         L << "    else\n";
-        L << "        bout[row] = r" << static_cast<int>(f.finalize.back().dst) << ";\n";
+        L << "        bout[row] = " << out_reg_expr << ";\n";
     }
     else
         L << "    bout[row] = "
-          << (out_f16
-                  ? glsl_f16_store("r" + std::to_string(static_cast<int>(f.finalize.back().dst)))
-                  : ("r" + std::to_string(static_cast<int>(f.finalize.back().dst))))
-          << ";\n";
+          << (out_f16 ? glsl_f16_store(out_reg_expr) : out_reg_expr) << ";\n";
     L << "}\n";
     return L.str();
 }
@@ -1514,7 +1576,9 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
 inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec& spec,
                                          ExprPrecSig sig = 0)
 {
-    if (!spec.fold || spec.matmul || !spec.instrs.empty()) return {};
+    // P10-③：顶层 instrs = fold 后逐元素尾链（向量域 dd 循环内 finalize 之后
+    // 执行）——域规则在 validate 的 fold 段。
+    if (!spec.fold || spec.matmul) return {};
     const FoldSpec& f = *spec.fold;
     auto cls = expr_fold_classify(f, spec.num_regs);
     if (!cls) return {};
@@ -1683,7 +1747,8 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     }
 
     // ── 操作数 → GLSL 片段。ctx：'E'=链(j 上下文) 'R'=归约源(内层 j)
-    //    'S'=标量行(无 j) 'F'=finalize(dd 上下文)。──
+    //    'S'=标量行(无 j) 'F'=finalize(dd 上下文) 'T'=P10-③ 尾链(dd 上下文，
+    //    Input/Row/Col/Batch 走**输出网格**语义——与 'E' 的键域语义分域)。──
     // （mm 段输出在块首以 smm[] 协作计算——链内不做现场串行 Σ_d，
     //   现场串行是吞吐回退主因，见块循环头）
     const auto operand = [&](const ExprOperand& op, char ctx, const std::string& jv) -> std::string
@@ -1707,26 +1772,42 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
             //   不做现场串行 Σ_d（现场串行结构是吞吐回退主因）
             return "smm[" + jv + "]";
         case static_cast<uint8_t>(ExprOperandKind::Row):
+            // 尾链（'T'）= 输出网格行号（与正常主链同源：无 f.matmul 时
+            //   batch 分解恒等 → 直接 row；有 f.matmul 走 m_per 取模）；
+            //   键域（'E' 等）= 批内行号（body 的 Row 仅在 f.matmul 下可用）。
+            if (ctx == 'T')
+                return has_mm ? "float(row % m_per)" : "float(row)";
             return "float(row % m_per)";
         case static_cast<uint8_t>(ExprOperandKind::Col):
+            // 尾链 = 输出列（dd）；键域 = 全局收缩列（k0 + j）
+            if (ctx == 'T')
+                return "float(" + jv + ")";
             return "float(k0 + " + jv + ")";
         case static_cast<uint8_t>(ExprOperandKind::Batch):
+            if (ctx == 'T')
+                return has_mm ? "float(batch)" : "float(0.0)";
             return "float(batch)";
         case static_cast<uint8_t>(ExprOperandKind::VecState):
         {
             // finalize：dd 步进分片 → oi = (dd - tid)/256；[0] = 崩叠后的
             //   最终值（收尾段把 VA_ACC 个累加器求和进 [0]，路径 B 还多一道
-            //   跨线程列归约后写 [0]——finalize 只读 [0]）
+            //   跨线程列归约后写 [0]——finalize 只读 [0]）。尾链（'T'）同读。
             (void)ctx;
             return "o[(dd - tid) / 256u][0]";
         }
         case static_cast<uint8_t>(ExprOperandKind::Input):
         {
-            const std::string gk = "(k0 + " + jv + ")";
+            // 键域：列 = 全局收缩下标（行距 = PC cols = 键长）；
+            // 尾链（'T'）：列 = 输出列 dd、行距 = vector_out（输出列数）——
+            //   同一视图函数 (row, col) → 存储，仅 col/idx 的域参数不同。
+            const std::string gk =
+                (ctx == 'T') ? jv : ("(k0 + " + jv + ")");
+            const std::string lin =
+                (ctx == 'T') ? ("(row * vector_out + " + jv + ")") : ("(row * cols + " + gk + ")");
             std::ostringstream os;
             const bool f16_in = sig != 0 && expr_prec_sig_in_f16(sig, op.idx);
             if (f16_in) os << "float(";
-            glsl_view_read(os, spec.views[op.idx], op.idx, "(row * cols + " + gk + ")", "row", gk,
+            glsl_view_read(os, spec.views[op.idx], op.idx, lin, "row", gk,
                            glsl_vp_slot(spec, op.idx), sig);
             if (f16_in) os << ")";
             return os.str();
@@ -2155,23 +2236,29 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     {
         L << emit_assign(ins, "r" + std::to_string(ins.dst), 'F', "dd");
     }
+    // ── P10-③ 尾链（fold 后逐元素收尾）：同一 dd 步进分片、finalize 之后 ──
+    if (!spec.instrs.empty())
+    {
+        L << "      // fold tail (P10-③)\n";
+        for (const auto& ins : spec.instrs)
+            L << emit_assign(ins, "r" + std::to_string(ins.dst), 'T', "dd");
+    }
+    // 输出 = 尾链末指令 dst（P10-③）；无尾链 = finalize 末指令 dst
+    const std::string out_reg_expr = "r" + std::to_string(static_cast<int>(
+                                                spec.instrs.empty() ? f.finalize.back().dst
+                                                                    : spec.instrs.back().dst));
     if (disp)
     {
         L << "      if (row_ok) {\n";
         L << "        if ((prec >> 16u & 1u) != 0u)\n";
-        L << "          bout16[row * vector_out + dd] = "
-          << glsl_f16_store("r" + std::to_string(static_cast<int>(f.finalize.back().dst))) << ";\n";
+        L << "          bout16[row * vector_out + dd] = " << glsl_f16_store(out_reg_expr) << ";\n";
         L << "        else\n";
-        L << "          bout[row * vector_out + dd] = r" << static_cast<int>(f.finalize.back().dst)
-          << ";\n";
+        L << "          bout[row * vector_out + dd] = " << out_reg_expr << ";\n";
         L << "      }\n";
     }
     else
         L << "      if (row_ok) bout[row * vector_out + dd] = "
-          << (out_f16
-                  ? glsl_f16_store("r" + std::to_string(static_cast<int>(f.finalize.back().dst)))
-                  : ("r" + std::to_string(static_cast<int>(f.finalize.back().dst))))
-          << ";\n"; // 越界 ri 不写回
+          << (out_f16 ? glsl_f16_store(out_reg_expr) : out_reg_expr) << ";\n"; // 越界 ri 不写回
     L << "    }\n";
     L << "    }\n"; // NR 行循环尾
     L << "}\n";
@@ -2226,7 +2313,9 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec, 
     // ⚠ **带 extras 的结构仅支持 V0 全 f32**：extras 的元素类型不在
     //   ExprPrecSig 里（它只描述输入 + 主输出），运行期又无法在构建期枚举，
     //   故 f16 批量变体只对 **extras 为空**的结构发射（实测优化器在 f16 下的
-    //   4 个结构全是单输出 → 覆盖到）；带 extras 的 f16 结构仍逐 kernel 降级。
+    //   4 个结构全是单输出 → 覆盖到）；带 extras 的 f16 结构 P10-④ 后经边界
+    //   cast 融合执行（单复合 kernel，不逐成员降级），但批量资格要求 extras
+    //   恒 F32 且 sig≠0 须 extras 空 → 仍逐 kernel（非批量）派发。
     //   运行期分派哨兵不叠加批量变体。
     if (batched && (expr_prec_sig_is_dispatch(sig) || native16 || !expr_spec_batchable(spec) ||
                     (sig != 0 && !spec.extras.empty())))

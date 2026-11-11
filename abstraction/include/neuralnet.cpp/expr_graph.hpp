@@ -455,11 +455,13 @@ namespace fused
         //   - A 含 matmul → 允许拼接 B：fused 保留 A.matmul，B 的指令拼在
         //     A 的尾链之后（A 纯 matmul 时 B 对 A 输出的引用替换为 Matmul 操作数）
         if (Bs.matmul) return false;
-        // P10-③：fold 头禁止拼接——fold spec 契约要求顶层 instrs 为空（见
-        // validate_expr_spec / expr_fold_test），"fold 后逐元素收尾"在当前
-        // IR 里无法表达；必须先经 fold emitter 扩展，故此处显式拒绝，
-        // 让 fold kernel 与其消费者各自独立派发（兜底 JIT，不再误入拼接）。
-        if (cur.spec.fold || Bs.fold) return false;
+        // P10-③：fold 头**可**拼逐元素尾链（顶层 instrs = finalize 之后在输出
+        //   网格上执行的收尾，validate_expr_spec / GLSL 生成器 / CPU eval_fold
+        //   三方已同域扩展）——fold 消费链由此并入同一 kernel；但 B 自身是
+        //   fold 头时仍拒绝：fold 必须位于链首（其 finalize 即自带尾链，
+        //   fold 规格不能拼在别的链之后）。域不合法的尾链由下方 validate
+        //   兜底（失败即放弃拼接，独立派发，非错误）。
+        if (Bs.fold) return false;
         // P10-②：归约头 + 广播应用（LayerNorm/CE 形态）。
         //   - 首次拼接：A 是 vector_out 归约 kernel（输出 (rows,1)/(1,cols)），
         //     B 是其唯一消费者的逐元素广播应用 → fused 保留 A 的归约指令，
@@ -505,7 +507,18 @@ namespace fused
         // A 纯 matmul（空链，S5）时无输出寄存器：B 对 A 输出的引用替换为
         // Matmul 操作数（读取前置 matmul 段输出），否则替换为 A 的输出寄存器。
         const bool a_pure_matmul = A.matmul && A.instrs.empty();
-        const std::size_t out_reg_A = a_pure_matmul ? 0 : A.instrs.back().dst;
+        // fold 头（顶层 instrs 空）：输出寄存器 = finalize 末指令 dst（fold
+        //   向量域输出；P10-③ 消费链经此读 fold 输出）。已带尾链的 fold
+        //   （二次拼接）走 A.instrs.back().dst 通用分支。录制期 spec 未经
+        //   validate（NVI 先入图），畸形空 finalize 防御性放弃拼接。
+        if (A.instrs.empty() && !a_pure_matmul && (!A.fold || A.fold->finalize.empty()))
+            return false;
+        const std::size_t out_reg_A =
+            a_pure_matmul
+                ? 0
+                : (A.instrs.empty()
+                       ? static_cast<std::size_t>(A.fold->finalize.back().dst)
+                       : static_cast<std::size_t>(A.instrs.back().dst));
         // 归约头：A 的输出向量值住在 s_red（Reduce 操作数），不是普通寄存器；
         // 若 A 末指令是逐元素收尾（非归约），则输出值就是该寄存器。
         const bool tail_from_reduce =
@@ -595,6 +608,8 @@ namespace fused
         fused.instrs = std::move(instrs);
         fused.num_regs = static_cast<std::uint32_t>(reg_base + Bs.num_regs);
         fused.matmul = A.matmul;   // 保留前置 matmul 段（S5：matmul 参与图融合）
+        fused.fold = A.fold;       // P10-③：fold 头保留 fold 段（顶层 instrs = 尾链；
+                                   // canonicalize 对 fold 恒等返回，不丢段）
         fused = canonicalize_expr_spec(fused);
         if (auto v = validate_expr_spec(fused, fused.views.size()); !v)
             return false;  // 超限/非法 → 放弃融合（保守）
@@ -895,6 +910,20 @@ namespace fused
         {
             k_members.back().push_back(static_cast<int>(i));
             k_out_reg.back().clear();   // P1 单输出（广播应用）
+            continue;
+        }
+
+        // ②b P10-③：fold 头 + 逐元素尾链——fold kernel 的唯一消费者是逐元素
+        //    应用时拼成单 kernel（fold spec 顶层 instrs = finalize 后的尾链）。
+        //    必须先于 P2 分量判定：消费者通常 p2_eligible，否则会先开分量
+        //    kernel、永远走不到下方通用 P1 拼接分支（matmul 头 ① / 归约头 ②
+        //    的前置拼接同一动机）。不命中（多消费者 / 非其消费者 / 形状精度
+        //    不符 / 尾链域非法）→ 消费者照常走 P2 分量或独立 kernel（兜底）。
+        if (!kernels.empty() && kernels.back().spec.fold && !k_is_comp.back() &&
+            try_append(kernels.back(), static_cast<int>(i)))
+        {
+            k_members.back().push_back(static_cast<int>(i));
+            k_out_reg.back().clear();   // P1 单输出（fold+尾链）
             continue;
         }
 

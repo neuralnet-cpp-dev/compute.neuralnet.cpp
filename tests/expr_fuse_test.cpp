@@ -12,6 +12,8 @@
 //   6. 契约守卫：compute_into 在录制段内必须报错
 //   7. Adam 金刚石（P2 多输出写穿，融合 vs 未融合逐位一致）
 //   8. P3 跨链批量派发（`#b`）：批量 vs 逐个逐字节一致 + CPU 对照
+//   9. P10-③ fold 头 + 逐元素尾链（fold 消费链并入单 kernel）
+//  10. P10-③ v2 fold 头 + 尾链（mm+vecacc 双域，dd 循环 'T' 发射 + JIT 编译）
 //
 //  链定义在 expr_fuse_shapes.hpp（单一事实源）。注册表登记（NN_EXPR_SCAN
 //  收集器 / expr_fuse_shapes.cpp）在本仓无对应物：录制段的复合 spec 若未在
@@ -113,6 +115,22 @@ Scalar max_abs_diff(const nn::Matrix& a, const nn::Matrix& b)
     for (std::size_t i = 0; i < as.size(); ++i)
     {
         const Scalar d = std::fabs(as[i] - bs[i]);
+        if (d > m) m = d;
+    }
+    return m;
+}
+
+// 归一化最大误差：max |a-b| / max(1, |a|)。exp(exp) 类大动态范围形状
+//（fold vecacc 的 CPU 左折叠 vs GPU 分片求和序差被逐级放大，history P2-2
+// 明示"对拍走容差"）必须用相对口径，绝对阈值会被量级淹没。
+Scalar norm_max_diff(const nn::Matrix& a, const nn::Matrix& b)
+{
+    Scalar m = 0.0f;
+    auto as = a.span(), bs = b.span();
+    if (as.size() != bs.size()) return 1e9f;
+    for (std::size_t i = 0; i < as.size(); ++i)
+    {
+        const Scalar d = std::fabs(as[i] - bs[i]) / std::fmax(Scalar{1}, std::fabs(as[i]));
         if (d > m) m = d;
     }
     return m;
@@ -613,6 +631,173 @@ int run_batch_dispatch(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
     return 0;
 }
 
+// ── 用例 9（P10-③）：fold 头 + 逐元素尾链融合 ────────────────────────────
+//   录制：s = fold_rowsum(x)（输出网格 (R,1)）→ y = s * row_broadcast(g)。
+//   期望融合为单 kernel（fold spec 顶层尾链，GLSL 'T' 上下文 / CPU eval_fold
+//   尾链同域求值）；对照 = CPU 逐节点（fold → 乘法）。
+int run_fold_tail(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
+{
+    const std::size_t R = 5;
+    const std::uint32_t K = 200; // 跨 EXPR_FOLD_BLOCK=128 → 多块流式
+    std::mt19937 rng(4242);
+    const nn::Tensor x = make_cpu_tensor(cpu, R, K, rng);
+    const nn::Tensor g = make_cpu_tensor(cpu, R, 1, rng);
+    const nn::Tensor xg = to_gpu(gpu, x);
+    const nn::Tensor gg = to_gpu(gpu, g);
+
+    // CPU 参考：逐节点（fold rowsum → *g）
+    auto c1 = nn::test_fuse::fold_sum_a(cpu, x, R, K);
+    if (!c1)
+    {
+        std::printf("[FAIL] CPU fold 参考求值失败: %s\n", c1.error().message.c_str());
+        return 1;
+    }
+    auto c2 = nn::test_fuse::fold_tail_b(cpu, *c1, g, R);
+    if (!c2)
+    {
+        std::printf("[FAIL] CPU tail 参考求值失败: %s\n", c2.error().message.c_str());
+        return 1;
+    }
+
+    CHECK(static_cast<bool>(gpu.begin_expr()), "begin_expr 成功");
+    auto g1 = nn::test_fuse::fold_sum_a(gpu, xg, R, K);
+    if (!g1)
+    {
+        std::printf("  [diag] fold node: %s\n", g1.error().message.c_str());
+        CHECK(false, "录制期 fold 返回占位");
+        return 1;
+    }
+    auto g2 = nn::test_fuse::fold_tail_b(gpu, *g1, gg, R);
+    if (!g2) std::printf("  [diag] tail node: %s\n", g2.error().message.c_str());
+    CHECK(static_cast<bool>(g2), "录制期 tail 返回占位");
+    auto eend = gpu.end_expr();
+    if (!eend) std::printf("  [diag] end_expr: %s\n", eend.error().message.c_str());
+    CHECK(static_cast<bool>(eend), "end_expr 融合执行成功");
+    if (!g2) return 1;
+
+    const Scalar err = max_abs_diff(matrix_of(*c2), matrix_of(*g2));
+    const bool ok = err < 1e-4f;
+    std::printf("[%s] P10-③ fold 头 + 尾链融合（K=%u 多块）  err=%.2e\n",
+                ok ? "PASS" : "FAIL", K, static_cast<double>(err));
+    if (!ok) return 1;
+
+    // ── 直派覆盖：GPU JIT 直接现编 v1+尾链 spec（不依赖融合是否命中）──────
+    nn::ExprSpec ts = nn::expr::make_fold_rowsum_tail(K);
+    auto ct = cpu.eval_expr(ts, std::vector<nn::Tensor>{x, g}, R, 1);
+    auto gt = gpu.eval_expr(ts, std::vector<nn::Tensor>{xg, gg}, R, 1);
+    if (!ct) std::printf("  [diag] CPU tail direct: %s\n", ct.error().message.c_str());
+    if (!gt) std::printf("  [diag] GPU tail direct: %s\n", gt.error().message.c_str());
+    CHECK(static_cast<bool>(ct) && static_cast<bool>(gt), "v1+尾链直派求值成功（CPU/GPU）");
+    if (!ct || !gt) return 1;
+    const Scalar derr = max_abs_diff(matrix_of(*ct), matrix_of(*gt));
+    const bool dok = derr < 1e-4f;
+    std::printf("[%s] P10-③ v1 尾链直派 GPU vs CPU（JIT 现编 'T' shader）  err=%.2e\n",
+                dok ? "PASS" : "FAIL", static_cast<double>(derr));
+    return dok ? 0 : 1;
+}
+
+// ── 用例 10（P10-③ v2）：双域 fold（mm 段 + vecacc）头 + 尾链录制融合 ──────
+//   录制：s = fold_mm_chain(A,B,V)（输出网格 (R,veclen)）→ y = s * 2。
+//   期望单 kernel：v2 尾链在 dd 步进循环内（'T' 上下文）发射、JIT 现编
+//   glslc 编译执行；对照 = CPU 逐节点（v2 fold → *2）。
+int run_fold_v2_tail(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
+{
+    const std::size_t R = 4;
+    const std::uint32_t fold_k = 16, mm_k = 16, veclen = 8;
+    std::mt19937 rng(4243);
+    const nn::Tensor a0 = make_cpu_tensor(cpu, R, mm_k, rng);
+    const nn::Tensor b0 = make_cpu_tensor(cpu, mm_k, fold_k, rng);
+    const nn::Tensor vv = make_cpu_tensor(cpu, fold_k, veclen, rng);
+    const nn::Tensor a0g = to_gpu(gpu, a0);
+    const nn::Tensor b0g = to_gpu(gpu, b0);
+    const nn::Tensor vvg = to_gpu(gpu, vv);
+
+    auto c1 = nn::test_fuse::fold_mm_a(cpu, a0, b0, vv, R, fold_k, mm_k, veclen);
+    if (!c1)
+    {
+        std::printf("[FAIL] CPU v2 fold 参考求值失败: %s\n", c1.error().message.c_str());
+        return 1;
+    }
+    auto c2 = nn::test_fuse::fold_mm_tail_b(cpu, *c1, R, veclen);
+    if (!c2)
+    {
+        std::printf("[FAIL] CPU v2 tail 参考求值失败: %s\n", c2.error().message.c_str());
+        return 1;
+    }
+
+    // ── 直派覆盖（先行）：GPU JIT 直接现编 v2+尾链 spec —— 隔离“发射/编译
+    //    错误”与“融合拼接错误”；同时保证 'T' shader 无条件被执行对拍 ─────
+    int fail = 0;
+    nn::ExprSpec ts = nn::test_fuse::make_fold_mm_chain(fold_k, mm_k, veclen);
+    ts.consts.push_back(Scalar{2.5f});
+    {
+        nn::ExprInstr ti;
+        ti.op = static_cast<uint8_t>(nn::ExprOp::Mul);
+        ti.dst = 6;
+        ti.a = nn::expr::reg(5);
+        ti.b = nn::expr::cst(1);
+        ts.instrs = {ti};
+        ts.num_regs = 7;
+    }
+    auto ct = cpu.eval_expr(ts, std::vector<nn::Tensor>{a0, b0, vv}, R, veclen);
+    auto gt = gpu.eval_expr(ts, std::vector<nn::Tensor>{a0g, b0g, vvg}, R, veclen);
+    if (!ct) std::printf("  [diag] CPU v2 tail direct: %s\n", ct.error().message.c_str());
+    if (!gt) std::printf("  [diag] GPU v2 tail direct: %s\n", gt.error().message.c_str());
+    CHECK(static_cast<bool>(ct) && static_cast<bool>(gt), "v2+尾链直派求值成功（CPU/GPU）");
+    Scalar derr = 1e30f;
+    if (ct && gt)
+    {
+        // ① 尾链不变量（GPU 侧自洽）：带尾链输出 ≡ 无尾链基线 × 2.5
+        //   ——隔离"尾链发射/求值正确性"与 CPU/GPU fold 求和序差（P2-2 已知
+        //   GPU 分片序 vs CPU 左折叠，exp(exp) 形状会放大为绝对大误差）。
+        auto gbase = gpu.eval_expr(nn::test_fuse::make_fold_mm_chain(fold_k, mm_k, veclen),
+                                   std::vector<nn::Tensor>{a0g, b0g, vvg}, R, veclen);
+        CHECK(static_cast<bool>(gbase), "v2 基线（无尾链）GPU 求值成功");
+        if (gbase)
+        {
+            nn::Matrix expect = matrix_of(*gbase);
+            for (auto& v : expect.span())
+                v *= Scalar{2.5f};
+            const Scalar inv = norm_max_diff(expect, matrix_of(*gt));
+            const bool inv_ok = inv < 1e-5f;
+            std::printf("[%s] P10-③ v2 GPU 尾链不变量（带尾链 == 基线×2.5）  err=%.2e\n",
+                        inv_ok ? "PASS" : "FAIL", static_cast<double>(inv));
+            if (!inv_ok) fail = 1;
+        }
+        // ② CPU/GPU 跨设备对拍（归一化相对口径，容差见 norm_max_diff 注释）
+        derr = norm_max_diff(matrix_of(*ct), matrix_of(*gt));
+        const bool dok = derr < 2e-3f;
+        std::printf("[%s] P10-③ v2 尾链直派 GPU vs CPU（JIT 现编 'T' shader，归一化）  "
+                    "err=%.2e\n",
+                    dok ? "PASS" : "FAIL", static_cast<double>(derr));
+        if (!dok) fail = 1;
+    }
+    else fail = 1;
+
+    // ── 录制融合 ───────────────────────────────────────────────────────────
+    CHECK(static_cast<bool>(gpu.begin_expr()), "begin_expr 成功");
+    auto g1 = nn::test_fuse::fold_mm_a(gpu, a0g, b0g, vvg, R, fold_k, mm_k, veclen);
+    if (!g1)
+    {
+        std::printf("  [diag] v2 fold node: %s\n", g1.error().message.c_str());
+        CHECK(false, "录制期 v2 fold 返回占位");
+        return 1;
+    }
+    auto g2 = nn::test_fuse::fold_mm_tail_b(gpu, *g1, R, veclen);
+    if (!g2) std::printf("  [diag] v2 tail node: %s\n", g2.error().message.c_str());
+    CHECK(static_cast<bool>(g2), "录制期 v2 tail 返回占位");
+    auto eend = gpu.end_expr();
+    if (!eend) std::printf("  [diag] end_expr: %s\n", eend.error().message.c_str());
+    CHECK(static_cast<bool>(eend), "end_expr v2 融合执行成功");
+    if (!g2) return 1;
+
+    const Scalar err = norm_max_diff(matrix_of(*c2), matrix_of(*g2));
+    const bool ok = err < 2e-3f;
+    std::printf("[%s] P10-③ v2 fold 头 + 尾链录制融合（mm+vecacc，归一化）  err=%.2e\n",
+                ok ? "PASS" : "FAIL", static_cast<double>(err));
+    return (ok && fail == 0) ? 0 : 1;
+}
+
 } // namespace
 
 int main()
@@ -639,6 +824,8 @@ int main()
     fail += run_rowreduce_broadcast(*cpu_engine, *gpu_engine);
     fail += run_non_recording(*cpu_engine, *gpu_engine);
     fail += run_adam_diamond(*cpu_engine, *gpu_engine);
+    fail += run_fold_tail(*cpu_engine, *gpu_engine);
+    fail += run_fold_v2_tail(*cpu_engine, *gpu_engine);
     fail += run_batch_dispatch(*cpu_engine, *gpu_engine);
     fail += run_contract_guard(*cpu_engine, *gpu_engine);
 

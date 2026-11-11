@@ -426,7 +426,11 @@ struct FoldSpec
 //   - matmul 段（可选）：若存在，先计算 C = op(A,B)（输出网格 (rows,cols)），
 //     逐元素链经 Matmul 操作数读取（matmul 不消耗逐元素寄存器）；
 //     instrs 可为空（输出 = matmul 结果本身）。
-//   - fold 段（可选）：见 FoldSpec；存在时 instrs 必须为空，输出 = fold 输出。
+//   - fold 段（可选）：见 FoldSpec；存在时输出 = fold 输出（向量域末状态），
+//     可选**顶层尾链**（instrs 非空 = P10-③「fold 后逐元素收尾」）：finalize
+//     之后在输出网格 (rows, out_cols) 上逐元素执行，输出 = instrs.back().dst
+//     （域规则见 validate_expr_spec 的 fold 段：无归约/无 Matmul 操作数/
+//     不读块内元素寄存器；融合器把消费链拼进这里，见 expr_graph try_append）。
 //   - extras（P2 多输出）：除主输出（instrs.back().dst）外**额外
 //     物化**的寄存器列表（槽序 = 输出槽 1..k）。IR-C 写穿物化用：图融合把
 //     状态量（如 Adam 的 m/v）连同其消费链拼进单 kernel 时，状态寄存器经
@@ -1081,7 +1085,7 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S = 8;
 [[nodiscard]] inline Result<void> validate_expr_spec(const ExprSpec& spec, std::size_t num_inputs)
 {
     // matmul 段或 fold 段存在时允许空指令表（输出 = 段结果本身；
-    //   fold 的 finalize 序列即其尾链）
+    //   fold 无尾链时输出 = finalize 末指令 dst）
     if (spec.instrs.empty() && !spec.matmul && !spec.fold)
         NN_FAIL("validate_expr_spec: empty instruction list");
     if (spec.instrs.size() > EXPR_MAX_INSTRS) NN_FAIL("validate_expr_spec: too many instructions");
@@ -1145,8 +1149,8 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S = 8;
         const FoldSpec& f = *spec.fold;
         if (spec.matmul)
             NN_FAIL("validate_expr_spec: fold + 顶层 matmul not allowed（fold 用自带段 f.matmul）");
-        if (!spec.instrs.empty())
-            NN_FAIL("validate_expr_spec: fold requires empty top-level instrs");
+        // 顶层 instrs = P10-③ fold 后逐元素尾链：域规则在下方 classify 之后
+        // 单独校验（finalize 之后在输出网格上执行；空 = 输出即 fold 输出）。
         if (f.num_state == 0 || f.num_state > FOLD_MAX_STATE ||
             f.inits.size() != static_cast<std::size_t>(f.num_state))
             NN_FAIL("validate_expr_spec: fold state count/init mismatch");
@@ -1352,6 +1356,96 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S = 8;
             NN_FAIL("validate_expr_spec: fold vecacc: scale_reg must be row-scalar class");
         // （跨迭代写后读污染已在上方 finalize 逐读检查中精确覆盖：被写状态在
         //   写前读 = 多列循环读到上一列输出 → 拒；链内临时 def-before-use → 许。）
+
+        // ── P10-③ 顶层尾链（fold 后逐元素收尾）─────────────────────────────
+        // 语义：finalize 之后在输出网格 (rows, out_cols) 上逐元素执行（emitter
+        // 'T' 上下文 / CPU eval_fold 尾链同域求值）；输出 = instrs.back().dst。
+        // 域规则（CPU/GPU/融合器三方同源）：
+        //   ① 仅逐元素指令——归约改变输出网格语义，且会让 expr_spec_reduce_axis
+        //      ≠ -1 把 spec 误路由进归约生成器；
+        //   ② dst 与 Reg/Fanout 读取必须是行标量类：块内元素寄存器（e[]/sreg）
+        //      在尾链上下文无定义；块归约 dst 的标量槽（rN）从未被 body 写入
+        //      （body 只写 red/sreg 归约槽，且值只覆盖最后一块）——两者一律拒；
+        //   ③ 读取许可 = 状态前缀 ∪ finalize 定义 ∪ 尾链内 def-before-use：
+        //      body 的非状态标量临时停在"最后一块"的取值（跨块中间量），对
+        //      尾链无稳定语义 → 一并拒（融合消费链只会读 finalize 输出）；
+        //      尾链跑在 finalize 之后 → finalize 写过的寄存器恒为本列新值，
+        //      无 finalize 的跨列污染问题；
+        //   ④ Reduce/Matmul 操作数由下方通用校验拒绝（fold spec 无顶层 matmul
+        //      段；无顶层归约指令 → Reduce 引用必空）；VecState 与 finalize
+        //      同域（单槽 + vec_state_len>0）；
+        //   ⑤ Input 视图：只放行**索引不内嵌 PC cols** 的种类——Linear /
+        //      HeadGroup / Transpose / RowBroadcast / ColBroadcast（+ 需
+        //      f.matmul 的 BatchMod/BatchCol 掩码钩子，与 body 同规则）。
+        //      fold 的 PC cols 槽 = fold_k（键长），而 RotateHalf/RowMod/
+        //      RowAccess/RowGather/GroupedReduce 的 GLSL 索引把 `cols` 当作
+        //      **输出网格行距**内嵌——在尾链里会拿 K 当 out_cols 静默错读；
+        //      归约视图（Row/ColReduce*）还缺 view_reduce 预计算（见①）。
+        //      被拒形态保持"独立 kernel 派发"（融合器 validate 失败即放弃拼接，
+        //      非错误）。
+        const auto tail_view_ok = [&](ExprViewKind vk) -> bool
+        {
+            if (vk == ExprViewKind::Linear || vk == ExprViewKind::HeadGroup ||
+                vk == ExprViewKind::Transpose || vk == ExprViewKind::RowBroadcast ||
+                vk == ExprViewKind::ColBroadcast)
+                return true;
+            if ((vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol) && has_mm)
+                return true;
+            return false;
+        };
+        // Row/Col/Batch 的尾链语义 = **输出网格坐标**（与正常逐元素主链同源：
+        // Row = r % m_per（无 f.matmul 时 = r）、Col = 输出列、Batch = r/m_per
+        // （无 f.matmul 时 = 0））——与 body 键域语义（Col = 全局收缩列）分域，
+        // 靠 emitter 上下文（'T' vs 'E'/'F'）区分。
+        std::vector<uint8_t> tail_def(spec.num_regs, 0);
+        for (const auto& ins : spec.instrs)
+        {
+            const ExprOp op = static_cast<ExprOp>(ins.op);
+            if (expr_op_is_reduce(op))
+                NN_FAIL("validate_expr_spec: fold tail: reduce instruction not allowed");
+            if (ins.dst >= spec.num_regs)
+                NN_FAIL("validate_expr_spec: fold tail dst out of range");
+            if ((*cls)[ins.dst])
+                NN_FAIL("validate_expr_spec: fold tail dst in body element register");
+            const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
+            const std::size_t nops = expr_instr_num_operands(op);
+            for (std::size_t oi = 0; oi < nops; ++oi)
+            {
+                const ExprOperand& opnd = *ops[oi];
+                const auto k = static_cast<ExprOperandKind>(opnd.kind);
+                if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout)
+                {
+                    if (opnd.idx >= spec.num_regs)
+                        NN_FAIL("validate_expr_spec: fold tail reg out of range");
+                    if ((*cls)[opnd.idx])
+                        NN_FAIL("validate_expr_spec: fold tail reads body element register");
+                    if (body_reduce_dst[opnd.idx])
+                        NN_FAIL("validate_expr_spec: fold tail reads block-reduce dst (red slot "
+                                "holds only the last block)");
+                    if (opnd.idx >= f.num_state && !fin_def[opnd.idx] && !tail_def[opnd.idx])
+                        NN_FAIL("validate_expr_spec: fold tail reads body temp (only states / "
+                                "finalize defs / tail defs are readable)");
+                }
+                else if (k == ExprOperandKind::Input)
+                {
+                    if (opnd.idx >= num_inputs)
+                        NN_FAIL("validate_expr_spec: fold tail input out of range");
+                    if (!tail_view_ok(static_cast<ExprViewKind>(spec.views[opnd.idx].kind)))
+                        NN_FAIL("validate_expr_spec: fold tail: view kind outside supported "
+                                "scope (see fold tail rules in validate_expr_spec)");
+                }
+                else if (k == ExprOperandKind::VecState)
+                {
+                    if (f.vec_state_len == 0)
+                        NN_FAIL("validate_expr_spec: fold tail: VecState without vec_state_len");
+                    if (opnd.idx != 0)
+                        NN_FAIL("validate_expr_spec: fold tail: VecState multi-slot unsupported");
+                }
+                // Const/RParam 界查在下方通用校验；Row/Col/Batch 无界可查；
+                // Matmul/Reduce 同上（通用校验拒绝）。
+            }
+            tail_def[ins.dst] = 1;
+        }
     }
     // 视图：RowGather 的标签槽（param）必须在输入范围内
     for (std::size_t k = 0; k < spec.views.size(); ++k)
