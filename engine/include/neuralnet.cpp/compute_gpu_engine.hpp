@@ -2514,8 +2514,9 @@ public:
         // NVI，故 f16 分量（成员 prec=F16 → 占位/输出全 f16）必须在此折回：
         // 输入抬 f32 → 自递归走全 f32 快路（V0 复合 kernel）→ f16 输出槽
         // cast_into 逐槽落回原存储（f32 槽直写）。与 NVI eval_expr_multi_into
-        // 的边界 cast、run_graph_kernel_into_（单输出 f16 图执行，C4 裁决）
-        // 同一口径；递归一次即全 f32，不会重入本分支。
+        // 的边界 cast 同一口径（多输出的 typed 签名不在生成器覆盖内；
+        // 单输出 f16 图执行优先 typed JIT，不可 typed 时才回退同款边界 cast）
+        // ；递归一次即全 f32，不会重入本分支。
         if (!all_f32(inputs) || !all_f32(outs))
         {
             auto in32 = to_f32_all(inputs);
@@ -3104,16 +3105,44 @@ private:
         }
         const std::string& key = *key_p;
         const nn::ExprPrecSig psig = nn::expr_prec_sig_of(inputs, out.precision());
-        // ── psig≠0（任一 f16 参与）→ 边界 cast（F2 语义，有据设计）──────────
-        // 输入抬 f32 → 递归走 V0（JIT 只现编 V0 f32 算术 kernel）→ cast_into
-        // 写回 out 的真实存储（与直求值同形态：eval_expr 分配输出 → cast_into）。
-        // C4 已裁决（2026-11-07）：四层对拍（输入位级 → to_f32_all → f32 eval →
-        // cast_into）证明历史 full-f16 NaN 与本路径无关——根因是融合内联了图外
-        // 持有的持久输出（pitfalls §2.6，已修）；边界 cast 链全程净，保留为
-        // f16 图执行的正确路径。「静态签名 JIT 直写 vs 边界 cast」的性能 A/B
-        // 不再依赖 C1，降级为可选优化项。
+        // ── psig≠0（任一 f16 参与）→ 先试 typed JIT 直通，不可则回退边界 cast ──
+        // C4 裁决（2026-11-07）确认边界 cast 链正确（四层对拍全程净，历史
+        // full-f16 NaN 根因是融合内联了图外持久输出，pitfalls §2.6，已修）；
+        // 2026-11-13 起图内单输出成员改走与 eval_expr_* 同源的 typed JIT：
+        // f16 直读直写、f32 算术、零边界副本。边界 cast 的 transient 正是
+        // 2026-11-12 基准 §8.3 残余（optimizer 小张量双 cast ~1.1 ms/step）。
+        // 不可 typed（16bit 存储缺失 / 生成器不支持该形态 / 建管或派发失败 /
+        // 负缓存命中）→ 回退边界 cast：输入抬 f32 → V0 kernel → cast_into 写回
+        // out 的真实存储（正确性保底路径不变）。
         if (psig != 0)
         {
+            auto out_gpu = import(out);
+            NN_TRY_CHECK(out_gpu);
+            std::optional<GpuTensor> out_view;
+            GpuTensor* out_override = nullptr;
+            if (out_gpu->precision() == Precision::F16)
+            {
+                if (!out_gpu->gpu_shared<Precision::F16>())
+                    NN_FAIL("run_graph_kernel_into: f16 占位缺少 f16 GPU 存储"
+                            "（precision 标签与存储不一致）");
+                out_view = f16_view(*out_gpu);
+                out_override = &*out_view;
+            }
+            else
+            {
+                if (!out_gpu->gpu_shared<Precision::F32>())
+                    NN_FAIL("run_graph_kernel_into: f32 占位缺少 f32 GPU 存储"
+                            "（precision 标签与存储不一致）");
+                out_override = &out_gpu->gpu_tensor();
+            }
+            NN_TRY(tj, typed_jit_eval_(spec, key, inputs, rows, cols, psig, vector_out,
+                                       out_override));
+            if (*tj)
+            {
+                // out 原为 CPU staging 时，import 上传了新 buffer → 替换 out
+                if (out.is_cpu()) out = std::move(*out_gpu);
+                return {};
+            }
             auto in32 = to_f32_all(inputs);
             NN_TRY_CHECK(in32);
             if (vector_out)
