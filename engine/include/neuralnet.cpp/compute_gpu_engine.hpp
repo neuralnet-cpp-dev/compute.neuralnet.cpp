@@ -37,9 +37,11 @@
 #ifdef NN_HAS_VULKAN
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdio>    // std::remove（.nnk 写失败时清理截断的 tmp）
 #include <fstream>
 #include <sstream>
@@ -112,6 +114,13 @@ private:
     };
     mutable std::shared_ptr<nn::fused::KernelCache> kernel_cache_;
     mutable JitGenerator jit_;
+
+    // typed JIT（in-kernel f16 直通）失败负缓存：结构级生成/建管线/派发失败
+    // 的键不再重试——否则"生成器不支持该形态"会在热路径上每次调用都重付
+    // shaderc 现编（量级 10–50 ms/次 × 数百次/步）。键 = .nnk 缓存 K；
+    // 首次插入时借 insert().second 打一条回退诊断（每键一次）。
+    std::unordered_set<std::string> typed_negative_;
+    std::mutex typed_negative_mu_;
 
     explicit GpuEngine(std::shared_ptr<GpuBackend> backend)
         : ComputeEngine(backend ? backend->identity() : 0), backend_(std::move(backend))
@@ -1865,6 +1874,107 @@ public:
         return spv;
     }
 
+    // ── typed JIT 直通（in-kernel f16；AOT typed 变体的运行期接替者）────────
+    // psig≠0 时按**具体签名**现编/命中 .nnk（键 = v<gen>.<结构键>#xxxx），f16
+    // 输入直接绑定、输出按签名位直写——零 f32 边界副本。边界 cast 的 transient
+    // 膨胀就是 2026-11-12 基准 `--f16` 显存 6972 MB 的根因（history「多精度
+    // Phase 2」同形态实测 2795→6687 MB / backward OOM）；11-08 删 AOT 注册表后
+    // 单表达式路径缺的那根线。与图路径 run_graph_kernel_into_ 的
+    // jit_compile_(…, psig) 同源（静态签名特化，f32 算术 + f16 存储）。
+    // 返回语义：
+    //   · Result 错误 = 硬失败（缓存/生成器/输入绑定——V0 同样跑不了）
+    //   · nullopt     = 该形态不可 typed（16bit 存储缺失 / 生成器不支持 /
+    //                   建管线或派发失败）→ 调用方回退边界 cast；键进负缓存
+    //                   （生成失败的 [kernelgen] 诊断由生成器自身打印，C5）
+    //   · Tensor      = 已执行（override 直写时为 run_fused_gpu 的返回值）
+    [[nodiscard]] Result<std::optional<Tensor>> typed_jit_eval_(
+        const nn::ExprSpec& spec, const std::string& key, std::span<const Tensor> inputs,
+        std::size_t rows, std::size_t cols, nn::ExprPrecSig psig, bool vector_out,
+        GpuTensor* output_override = nullptr)
+    {
+        if (!backend_->device().has_16bit_storage()) return std::nullopt;
+        // fold 档位键（#m<cap>；非 fold 恒等直通，与 jit_run_ 同源）
+        std::string vkey_storage;
+        const std::string& vkey = nn::expr_spec_fold_variant_key(spec, key, vkey_storage);
+        const std::string K = nn::fused::kernel_cache_key(vkey, psig);
+        {
+            std::lock_guard lk(typed_negative_mu_);
+            if (typed_negative_.contains(K)) return std::nullopt;
+        }
+        // SPIR-V：缓存命中直取；miss 现编。NNK_COMPILE_FAIL = 生成器不支持该
+        // 形态 → 负缓存 + 回退（不重试）。
+        NN_TRY(cc, ensure_cache_());
+        (void)cc;
+        std::vector<std::uint32_t> spv_owned;
+        const std::vector<std::uint32_t>* spv = kernel_cache_->hit(K);
+        if (spv == nullptr)
+        {
+            NN_TRY(gd, ensure_generator_());   // 生成器缺失 = 硬失败（V0 同需）
+            (void)gd;
+            const auto spec_bytes = nn::fused::encode_expr_spec(spec);
+            std::uint8_t* buf = nullptr;
+            std::size_t len = 0;
+            nnk_kernel_meta meta{};
+            const nnk_status st =
+                jit_.generate(spec_bytes.data(), spec_bytes.size(), psig, &meta, &buf, &len);
+            if (st != NNK_OK || buf == nullptr)
+            {
+                std::lock_guard lk(typed_negative_mu_);
+                typed_negative_.insert(K);
+                return std::nullopt;
+            }
+            spv_owned.assign(reinterpret_cast<const std::uint32_t*>(buf),
+                             reinterpret_cast<const std::uint32_t*>(buf) +
+                                 len / sizeof(std::uint32_t));
+            jit_.free(buf);
+            spv = &spv_owned;
+            NN_TRY(ins, kernel_cache_->insert(K, *spv));
+            (void)ins;
+            // 落盘失败只告警（同 jit_compile_：SPIR-V 已在内存可用）
+            if (auto pr = persist_cache_(); !pr)
+                std::fprintf(stderr, "[nnk] .nnk 缓存落盘失败（本次不写盘，继续执行）：%s\n",
+                             pr.error().message.c_str());
+        }
+        const nn::FusedKernelMeta meta = nn::fused_kernel_meta_of(spec);
+        auto neg = [this](const std::string& k, const char* msg)
+        {
+            std::lock_guard lk(typed_negative_mu_);
+            if (typed_negative_.insert(k).second)
+                std::fprintf(stderr, "[prec][typed-jit] %s 建管/派发失败，回退边界 cast：%s\n",
+                             k.c_str(), msg != nullptr ? msg : "");
+        };
+        auto ek = backend_->ensure_fused_kernel(K, *spv, meta, spec);
+        if (!ek)
+        {
+            neg(K, ek.error().message.c_str());
+            return std::nullopt;
+        }
+        auto fi = fused_buffers_(inputs);
+        NN_TRY_CHECK(fi);
+        const auto vp = nn::expr_spec_runtime_view_params(spec);
+        const bool out_f16 = (output_override == nullptr) && nn::expr_prec_sig_out_f16(psig);
+        auto run = backend_->run_fused_gpu(
+            K, fi->bufs, spec.consts, rows, cols, vector_out, vp, spec.rparams, output_override,
+            nn::expr_spec_runtime_matmul_k(spec), nn::expr_spec_runtime_matmul_batch(spec),
+            nn::expr_spec_runtime_matmul_trans(spec), nn::expr_spec_runtime_fold_k(spec), out_f16,
+            psig);
+        if (!run)
+        {
+            neg(K, run.error().message.c_str());
+            return std::nullopt;
+        }
+        if (out_f16)
+        {
+            // f16 输出按 2B/元素分配后重贴 GpuTensorF16；归约向量按归约轴收形
+            const int raxis = nn::expr_spec_reduce_axis(spec);
+            const std::size_t orows = vector_out ? ((raxis == 1) ? 1 : rows) : rows;
+            const std::size_t ocols = vector_out ? ((raxis == 1) ? cols : 1) : cols;
+            return std::optional<Tensor>(
+                Tensor::from_gpu(GpuTensorF16(run->shared_buffer(), orows, ocols)));
+        }
+        return std::optional<Tensor>(Tensor::from_gpu(std::move(*run)));
+    }
+
     // 完整 miss 路径：JIT 编译 V0（f32）→ 后端懒建 pipeline → 执行。
     // 调用方在 psig!=0 时已抬 f32 重入（eval_expr_impl 边界 cast 语义），故此处
     // 只 JIT V0 结构键；输出按 P 由调用方回贴（f16 → GpuTensorF16）。
@@ -1956,10 +2066,15 @@ public:
                 return Tensor::from_gpu(std::move(*out));
             }
 #endif
-            // 非 f32（输入或输出精度）却未命中变体 → 引擎内边界 cast 回退
-            // （抬 f32 重入；F2 修复后基类不再代劳）
+            // 非 f32（输入或输出精度）→ 先试 typed JIT 直通（fold 带类型生成，
+            // f16 直读直写）；不可 typed → 引擎内边界 cast 回退（抬 f32 重入；
+            // F2 修复后基类不再代劳）
             if (!all_f32(inputs) || P != Precision::F32)
             {
+                const nn::ExprPrecSig fpsig = nn::expr_prec_sig_of(inputs, P);
+                NN_TRY(tj, typed_jit_eval_(raw_spec, fkey, inputs, rows, cols, fpsig,
+                                           /*vector_out=*/false));
+                if (*tj) return std::move(**tj);
                 auto in32 = to_f32_all(inputs);
                 NN_TRY_CHECK(in32);
                 auto r = eval_expr_impl(raw_spec, *in32, rows, cols, Precision::F32);
@@ -2023,12 +2138,17 @@ public:
         }
 #endif
 
-        // 带类型变体未预生成（in-kernel f16 覆盖不足）→ **引擎内边界 cast 回退**：
-        // 输入抬 f32 → 重入本函数（psig==0，走 f32 融合 shader）→ 输出按 P 落回。
-        // 绝不把 f16 buffer 绑到 f32 shader 上（静默错值）。此前这段由基类 NVI
-        // 入口代为处理（能力查询 + 二次归因）；F2 修复后归因/选路只做一次。
+        // ── psig≠0：先试 typed JIT 直通（f16 直读直写、零边界副本）──────────
+        // 不可 typed（生成器不支持该形态 / 16bit 存储缺失 / 负缓存命中）→
+        // 回退**引擎内边界 cast**：输入抬 f32 → 重入本函数（psig==0，走 V0
+        // f32 kernel）→ 输出按 P 落回。绝不把 f16 buffer 绑到 f32 shader 上
+        //（静默错值）。此前这段由基类 NVI 入口代为处理；F2 修复后归因/选路
+        // 只做一次。
         if (psig != 0)
         {
+            NN_TRY(tj, typed_jit_eval_(spec, key, inputs, rows, cols, psig,
+                                       /*vector_out=*/false));
+            if (*tj) return std::move(**tj);
             if (prec_trace_enabled_()) trace_miss_(raw_spec, inputs, P);
             auto in32 = to_f32_all(inputs);
             NN_TRY_CHECK(in32);
@@ -2163,13 +2283,21 @@ public:
             return Tensor::from_gpu(std::move(*out));
         }
 #endif
-        // 变体未预生成 → 引擎内边界 cast 回退（抬 f32 重入；F2 修复）
+        // ── psig≠0：先试 typed JIT 直通（归约带类型生成，vector_out=1）──────
+        // 不可 typed → 引擎内边界 cast 回退（抬 f32 重入；F2 修复）。
+        // override 必须透传给递归：此前这里改调 eval_expr_reduce_impl（无
+        // override），f16 输入 + f32 目标的 reduce_into 会写出新张量而 dst
+        // 从未被写（静默 no-op）——本分支顺带修掉。
         if (psig != 0)
         {
+            NN_TRY(tj, typed_jit_eval_(spec, key, inputs, rows, cols, psig,
+                                       /*vector_out=*/true, output_override));
+            if (*tj) return std::move(**tj);
             if (prec_trace_enabled_()) trace_miss_(raw_spec, inputs, P);
             auto in32 = to_f32_all(inputs);
             NN_TRY_CHECK(in32);
-            auto r = eval_expr_reduce_impl(raw_spec, *in32, rows, cols, Precision::F32);
+            auto r = eval_expr_reduce_run_(raw_spec, *in32, rows, cols, Precision::F32,
+                                           output_override);
             NN_TRY_CHECK(r);
             return to_prec(std::move(*r), P);
         }
@@ -2271,10 +2399,39 @@ public:
             return {};
         }
 #endif
-        // 变体未预生成 → 引擎内边界 cast 回退（目标 f16：在 f32 空间求值后
-        // cast_into 写回 dst 原存储；F2 修复）
+        // ── psig≠0：先试 typed JIT 直通（结果直写 dst 既有存储，零临时槽）──
+        // f16 目标 = f16 视图绑定（与 AOT 命中路径同款）；不可 typed → 回退
+        // 边界 cast（目标 f16：在 f32 空间求值后 cast_into 写回 dst 原存储；F2）
         if (psig != 0)
         {
+            auto dst_gpu = import(dst);
+            NN_TRY_CHECK(dst_gpu);
+            std::optional<GpuTensor> dst_view;
+            GpuTensor* dst_override = nullptr;
+            if (dst_gpu->precision() == Precision::F16)
+            {
+                if (!dst_gpu->gpu_shared<Precision::F16>())
+                    NN_FAIL("eval_expr_into: f16 目标缺少 f16 GPU 存储"
+                            "（precision 标签与存储不一致）");
+                dst_view = f16_view(*dst_gpu);
+                dst_override = &*dst_view;
+            }
+            else
+            {
+                if (!dst_gpu->gpu_shared<Precision::F32>())
+                    NN_FAIL("eval_expr_into: f32 目标缺少 f32 GPU 存储"
+                            "（precision 标签与存储不一致）");
+                dst_override = &dst_gpu->gpu_tensor();
+            }
+            NN_TRY(tj, typed_jit_eval_(spec, key, inputs, rows, cols, psig,
+                                       /*vector_out=*/false, dst_override));
+            if (*tj)
+            {
+                // dst 原为 CPU staging 时，import 上传了新 buffer → 替换 dst
+                //（同 V0 直写路径语义）
+                if (dst.is_cpu()) dst = std::move(*dst_gpu);
+                return {};
+            }
             if (prec_trace_enabled_()) trace_miss_(raw_spec, inputs, dst.precision());
             auto in32 = to_f32_all(inputs);
             NN_TRY_CHECK(in32);
