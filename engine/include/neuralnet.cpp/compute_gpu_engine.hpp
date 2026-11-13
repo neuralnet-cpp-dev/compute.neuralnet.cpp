@@ -2640,6 +2640,21 @@ private:
         const std::uint64_t gkey = graph_cache_key(g);
         static thread_local std::vector<FusedKernel> kernels_scratch;
         std::vector<FusedKernel>& kernels = kernels_scratch;
+        // 退出期安全：`FusedKernelInput::external` 是图输入 Tensor 的强引用副本
+        //（keepalive 链通到 GpuBackend）。派发结束必须立刻释放——残留到线程退出
+        // 会把 backend 的最后一次析构推迟进 DLL 侧 TLS 析构（LdrShutdownProcess
+        // 阶段，loader/驱动已 detach → vkDestroyDevice 跳 0，Windows 退出期
+        // 0xc0000005）。容量复用不受影响：下次进入由 instantiate_plan_into 原位重填。
+        struct ExternalReleaseGuard
+        {
+            std::vector<FusedKernel>& ks;
+            ~ExternalReleaseGuard()
+            {
+                for (auto& k : ks)
+                    for (auto& in : k.inputs)
+                        in.external = Tensor{};
+            }
+        } external_release{kernels};
         const auto cit = gcache.find(gkey);
         if (cit != gcache.end())
         {
