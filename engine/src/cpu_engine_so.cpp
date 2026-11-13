@@ -36,3 +36,11 @@ const char* last_error()
 }
 
 } // namespace nn
+
+// ── 跨模块剖析器挂钩（core_profile.hpp 的状态分裂修复）──────────────────────
+// 宿主（主程序/测试 EXE）在**首次**进入剖析路径时按模块句柄 GetProcAddress
+// 本符号并调用——不经链接器直接引用（两引擎同名导出，import 符号会撞）。
+extern "C" void nn_prof_set_hooks(void* state_fn, void* stack_fn)
+{
+    ::nn::prof::detail::set_host_hooks(state_fn, stack_fn);
+}

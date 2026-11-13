@@ -12,6 +12,13 @@
 #include <neuralnet.cpp/compute_engine.hpp>     // MIT 抽象层接口（本 .so 实现它）
 #include <neuralnet.cpp/compute_gpu_engine.hpp> // 真实 GpuEngine 实现（编入本 .so）
 
+// ── 跨模块剖析器挂钩（core_profile.hpp 的状态分裂修复）──────────────────────
+// 同 cpu_engine_so.cpp：宿主按模块句柄 GetProcAddress 本符号（不经链接器）。
+extern "C" void nn_prof_set_hooks(void* state_fn, void* stack_fn)
+{
+    ::nn::prof::detail::set_host_hooks(state_fn, stack_fn);
+}
+
 #ifdef NN_HAS_VULKAN
 
 namespace

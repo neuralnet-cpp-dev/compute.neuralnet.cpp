@@ -50,6 +50,20 @@
 
 #include "core_env.hpp"   // RV-09：环境变量读取唯一入口
 
+// ── 跨模块挂钩的平台依赖 ───────────────────────────────────────────────────
+// attach_host_to_modules() 需要在**每个加载了本头的模块**里按已加载模块名
+// 取引擎导出（GetProcAddress / dlopen RTLD_NOLOAD）。NOMINMAX 必须先于
+// windows.h——本头被 compute_engine.hpp 广泛引入，min/max 宏会炸后续 TU 的
+// std::min/std::max（主仓此前无任何 TU 引入 windows.h，此处是唯一入口）。
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 namespace nn::prof
 {
 
@@ -112,13 +126,7 @@ struct State
     std::vector<Event> trace;
 };
 
-inline State& state()
-{
-    static State s;
-    return s;
-}
-
-// ── 计时帧栈（thread_local）────────────────────────────────────────────────
+// ── 计时帧栈的帧类型 ────────────────────────────────────────────────────────
 //   push 时记 start；stop 时 dur = now − start，把 dur 计入父帧 child_ns，
 //   自身 exclusive = dur − child_ns。嵌套调用（如 dsl::compute 内部过引擎
 //   入口）天然不重复计数。
@@ -130,10 +138,111 @@ struct Frame
     std::uint64_t child_ns;
 };
 
-inline std::vector<Frame>& stack()
+// ── 跨模块聚合挂钩（Windows DLL / ELF .so 状态分裂修复）────────────────────
+// state()/stack() 的 static/thread_local 在 PE 上**每模块各一份**：引擎 .so
+// 侧的 device_add / 嵌套 Op 写进自己的 State，主程序退出时 dump 只见宿主侧
+// → 设备表恒空、DLL 侧计数全部丢失（2026-11-12 基准 §4.2 的根因；与
+// C1-调查④「Windows/DLL TLS 独立」同类——方案 A 只修了录制状态，剖析器未修）。
+// 协议：首个启用剖析的模块把自己的 state()/stack() **路由访问器**注册给其它
+// 已加载模块（按模块名 GetProcAddress/dlsym 取引擎导出 nn_prof_set_hooks，
+// 不经链接器——两引擎同名导出不会撞 import 符号）；被注册模块此后全部读写
+// 宿主的同一份状态与帧栈（同线程内跨模块帧嵌套天然正确）。链式注册也能
+// 收敛到宿主：注册的是**路由**访问器（层层转发），宿主自身永不被注册，
+// 不会自指递归。
+using StateFn = State& (*)();
+using StackFn = std::vector<Frame>& (*)();
+
+inline StateFn& host_state_fn() noexcept
+{
+    static StateFn f = nullptr;
+    return f;
+}
+inline StackFn& host_stack_fn() noexcept
+{
+    static StackFn f = nullptr;
+    return f;
+}
+
+inline State& own_state()
+{
+    static State s;
+    return s;
+}
+inline std::vector<Frame>& own_stack()
 {
     thread_local std::vector<Frame> st;
     return st;
+}
+
+// 引擎 SO 导出面的实现（extern "C" nn_prof_set_hooks 定义在
+// cpu_engine_so.cpp / gpu_engine_so.cpp，宿主按模块句柄取址调用）。
+inline void set_host_hooks(void* state_fn, void* stack_fn) noexcept
+{
+    host_state_fn() = reinterpret_cast<StateFn>(state_fn);
+    host_stack_fn() = reinterpret_cast<StackFn>(stack_fn);
+}
+
+// 本模块首触时把**本模块的路由访问器**注册给其它已加载模块（幂等一次）。
+inline void attach_host_to_modules() noexcept;
+inline void attach_once() noexcept
+{
+    static std::once_flag once;
+    std::call_once(once, [] { attach_host_to_modules(); });
+}
+
+inline State& state()
+{
+    attach_once();
+    StateFn f = host_state_fn();
+    return f != nullptr ? f() : own_state();
+}
+
+inline std::vector<Frame>& stack()
+{
+    attach_once();
+    StackFn f = host_stack_fn();
+    return f != nullptr ? f() : own_stack();
+}
+
+inline void attach_host_to_modules() noexcept
+{
+#ifdef _WIN32
+    // 本模块句柄（按本函数地址识别 → 跳过自注册；UNCHANGED_REFCOUNT 防泄漏）
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&attach_host_to_modules), &self);
+    using SetFn = void (*)(void*, void*);
+    const wchar_t* names[] = {L"nn-cpu.dll", L"nn-gpu.dll"};
+    for (const wchar_t* name : names)
+    {
+        HMODULE h = GetModuleHandleW(name);
+        if (h == nullptr || h == self) continue;
+        auto fn = reinterpret_cast<SetFn>(GetProcAddress(h, "nn_prof_set_hooks"));
+        if (fn != nullptr)
+            fn(reinterpret_cast<void*>(&state), reinterpret_cast<void*>(&stack));
+    }
+#else
+    ::Dl_info self_info{};
+    void* self = nullptr;
+    if (::dladdr(reinterpret_cast<void*>(&attach_host_to_modules), &self_info) != 0)
+        self = self_info.dli_fbase;
+    using SetFn = void (*)(void*, void*);
+    const char* names[] = {"libnn-cpu.so", "libnn-gpu.so"};
+    for (const char* name : names)
+    {
+        void* h = ::dlopen(name, RTLD_NOW | RTLD_NOLOAD);
+        if (h == nullptr) continue;
+        auto fn = reinterpret_cast<SetFn>(::dlsym(h, "nn_prof_set_hooks"));
+        ::Dl_info fn_info{};
+        if (fn != nullptr && ::dladdr(reinterpret_cast<void*>(fn), &fn_info) != 0 &&
+            fn_info.dli_fbase != self)
+        {
+            fn(reinterpret_cast<void*>(&state), reinterpret_cast<void*>(&stack));
+        }
+        ::dlclose(h);
+    }
+#endif
 }
 
 [[nodiscard]] inline std::uint64_t now_ns() noexcept
