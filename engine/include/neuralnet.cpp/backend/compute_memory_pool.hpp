@@ -86,18 +86,25 @@ private:
         std::set<FreeRegion> free_regions;
         std::size_t allocation_count = 0;
         VkDevice owning_device = VK_NULL_HANDLE;
+        // 空闲龄期（release_idle_blocks 的 retain 分支）：最近一次从本块成功
+        // 子分配时的 release_epoch_。稳态训练的工作块每步都被分配 → 永不满足
+        // "自上次 release 以来未触碰" → 不参与归还（消除每步 vkFreeMemory +
+        // 下步 vkAllocate 的 WDDM 毫秒级抖动，见 release_idle_blocks 注释）。
+        std::uint64_t last_alloc_epoch = 0;
 
         Block() = default;
 
         Block(Block&& o) noexcept
             : memory(o.memory), size(o.size), memory_type_index(o.memory_type_index),
               property_flags(o.property_flags), free_regions(std::move(o.free_regions)),
-              allocation_count(o.allocation_count), owning_device(o.owning_device)
+              allocation_count(o.allocation_count), owning_device(o.owning_device),
+              last_alloc_epoch(o.last_alloc_epoch)
         {
             o.memory = VK_NULL_HANDLE;
             o.size = 0;
             o.allocation_count = 0;
             o.owning_device = VK_NULL_HANDLE;
+            o.last_alloc_epoch = 0;
         }
 
         // 禁用移动赋值，防止 vector 操作引发意外释放
@@ -141,6 +148,8 @@ private:
 
     // L2：整块归还时保留的最小空闲字节数（避免频繁整块释放/重建抖动）
     VkDeviceSize retain_free_bytes_ = 0;
+    // release 轮次计数（retain 分支的空闲龄期锚点，见 Block::last_alloc_epoch）
+    std::uint64_t release_epoch_ = 0;
 
     // 自适应阶梯上限（0 = 关闭，走固定 block_size_ 单类别路径）：
     // 启用时中等分配按"最小 2 的幂类别"分池，见 allocate()。
@@ -346,6 +355,7 @@ public:
             if (best)
             {
                 block.allocation_count++;
+                block.last_alloc_epoch = release_epoch_;
                 active_allocs_[{block.memory, best->first}] = alloc_size;
                 return Allocation{block.memory, best->first, alloc_size, block.property_flags};
             }
@@ -360,6 +370,7 @@ public:
         VkDeviceMemory mem = new_block->memory;
         VkMemoryPropertyFlags flags = new_block->property_flags;
         new_block->allocation_count++;
+        new_block->last_alloc_epoch = release_epoch_;
         active_allocs_[{mem, best->first}] = alloc_size;
         blocks_.push_back(std::move(new_block));
 
@@ -577,12 +588,23 @@ public:
             for (const auto& r : bp->free_regions)
                 total_free += r.size;
 
+        // 空闲龄期条件（2026-11-15）：只归还**自上次 release 以来未被子分配过**
+        // 的全闲块。稳态训练里工作块（~513MB）每步步末全闲、下步复用——原实现
+        // 仅按 total_free 阈值判，插入序把大工作块排前时会先释放它（remainder
+        // ≥ 阈值即放行）→ 下步重新 vkAllocate（WDDM 大块 5~17ms/次）纯抖动。
+        // A/B（40HX，2026-11-15，交错 3 轮）：默认阈值下 release 5.1~17.3
+        // ms/次 → 龄期后与"不释放"同档；墙钟 1125→1081 ms/20 步（−3.9%），
+        // 且消除单轮 17ms/次的尖峰（build/t5_retain_ab.txt 的 retain 臂）。
+        // 真正的多余块（整步未触碰）仍按阈值归还 → 工作负载收缩时照常回收。
         for (auto it = blocks_.begin(); it != blocks_.end();)
         {
             const auto& b = **it;
-            // 完全空闲：无活跃子分配，且整个 block 被单个空闲区覆盖
+            // 完全空闲：无活跃子分配，且整个 block 被单个空闲区覆盖。
+            // 龄期：release_epoch_==0（首次调用，含 infer 的一次性退出回收）
+            // 按旧行为全放；此后只放"上次 release 以来未触碰"的块。
             if (b.allocation_count == 0 && b.free_regions.size() == 1 &&
-                b.free_regions.begin()->offset == 0 && b.free_regions.begin()->size == b.size)
+                b.free_regions.begin()->offset == 0 && b.free_regions.begin()->size == b.size &&
+                (release_epoch_ == 0 || b.last_alloc_epoch < release_epoch_))
             {
                 // 仅当释放后总空闲仍 ≥ 保留目标时才释放（避免抖动）
                 if (total_free - b.size >= retain_free_bytes_)
@@ -596,6 +618,8 @@ public:
             }
             ++it;
         }
+        release_epoch_++;
+        return;
     }
 };
 
