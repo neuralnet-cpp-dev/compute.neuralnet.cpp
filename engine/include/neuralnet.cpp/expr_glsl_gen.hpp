@@ -663,6 +663,11 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
     // 界（g∈0..3 ^ 4 → 5 > [0,B/4)），越界读写 = 数值错乱（expr_gpu 17x65
     // 实测 err=4.1 的根因）。对 k 是 involution（写读同式）→ 快路径与回退的
     // 写集合、广播读语义、逐输出 K 累加序全部不变。
+    // mm_swz 新式（f=(a&3)<<1，SLOTS≥8 才合法）2026-11-15 在融合路径
+    // A/B（matmul_dsl，3 形状 × 3 轮）**中性**（sq4096 +0.5% / sq1024
+    // −1.8% / wideN +0.2%，噪声内；逐位 hash 全同）→ 维持旧式、不 bump
+    // genver（升式只换缓存零收益）。op 级 matmul_tiled 同日 A/B 曾 +24%
+    // 回退（1024³）。数据 build/t5_fused_dsl_ab.txt。
     const std::uint32_t swz_mask = (B / 4u) - 1u;
     const auto swz = [swz_mask](const std::string& k_expr, const std::string& g_expr)
     {
