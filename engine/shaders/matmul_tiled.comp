@@ -39,6 +39,9 @@
 
 #version 450
 
+// [[unroll]] 属性（WIDE R=8 写出路径）需要此扩展
+#extension GL_EXT_control_flow_attributes : enable
+
 
 // ── 精度变体（编译期开关：glslc -DNN_SHADER_F16=1）────────────────────────
 // 默认（无宏）= 全 f32（f32 分支宏展开与裸写 f32 代码逐字同形 →
@@ -70,31 +73,41 @@
 #define NN_WR(x) x
 #endif
 
-// ── 网格粒度变体（编译期开关：glslc -DNN_MM_FINE=1）────────────────────────
-// 默认 = 64×64 输出块（16×16 线程，每线程 4×4 寄存器分块）；
-// NN_MM_FINE = 16×16 输出块（**8×8 线程、每线程 2×2 输出 R=2**）——同一份
-// 代码按 BM/BN/T 参数化，逐输出元素的 K 累加序不变（逐 k 标量升序乘加）
-// → 逐位一致。
-// 动机（P0 wgrad 网格饥饿）：反传 wgrad 形状 M,N=64..256 × K=16384 在
-// 64-tile 下只派 ceil(N/64)×ceil(M/64) = 1~4 个工作组，40HX（34 SM）
-// 大面积空转（实测 208~278 GFLOPS vs 同卡方形 2489）。
-// ⚠ R 的取舍（A/B 实测定案，见 expr_spec EXPR_MATMUL_BLOCK_FINE 注释）：
-//   · R=4 缩块不缩线程（16×16 块/4×4 线程）→ 线程数不变、半 warp 工作组
-//     占用崩 → 169 GFLOPS 比不修还差；
-//   · R=1（16×16 线程，M×N 线程）→ 摊满了但每线程 1 条 K 链、指令/输出
-//     2× 于 R=2 → 305~439；
-//   · R=2 = 摊铺（网格仍 16×16 块 → 48 WG ≥ SM 数）× 线程内 ILP=4 的甜点。
-// 后端按 64-tile 网格工作组数低于 EXPR_MATMUL_FINE_MIN_WGS 选本变体。
+// ── 网格粒度变体（编译期开关：-DNN_MM_FINE=1 / -DNN_MM_WIDE=1）─────────────
+// 默认 = 64×64 输出块（16×16 线程，每线程 4×4 寄存器分块，BK=16）；
+// NN_MM_FINE = 16×16 输出块（8×8 线程、每线程 2×2 输出 R=2，BK=16）——
+//   动机（P0 wgrad 网格饥饿）：64-tile 网格 < EXPR_MATMUL_FINE_MIN_WGS 时换本变体。
+//   ⚠ R 取舍见 expr_spec EXPR_MATMUL_BLOCK_FINE 注释（R=2 甜点，R=4 缩块回退）。
+// NN_MM_WIDE = 128×128 输出块（16×16 线程、每线程 8×8 输出 R=8，BK=8）——
+//   256 线程、共享 16KB（与 64-tile 同占用率）、每线程 16 个 vec4 累加器。
+//   每 k：4 次 LDS.128 + 16 次向量 FFMA → LDS/浮点比是 64-tile 的 1/2。
+//   K 累加序仍为 k 升序标量乘加 → 与 64-tile/fine **逐位一致**。
+//   后端门槛：128-tile 网格 WG 数 ≥ EXPR_MATMUL_WIDE_MIN_WGS 且 min(M,N)≥128。
+//   ⚠ BK=8 ⇒ transB=1 装载分组必须按 KGRP=BK/4 参数化（写死 /4 会越界）。
+#if defined(NN_MM_FINE) && defined(NN_MM_WIDE)
+#error "NN_MM_WIDE(128x128/8x8) 与 NN_MM_FINE(16x16/2x2) 互斥"
+#endif
 #if defined(NN_MM_FINE)
 #define NN_MM_T    8
 #define NN_MM_TU   8u
 #define NN_MM_BM   16u
 #define NN_MM_BN   16u
+#define NN_MM_BK   16u
+#define NN_MM_R    2
+#elif defined(NN_MM_WIDE)
+#define NN_MM_T    16
+#define NN_MM_TU   16u
+#define NN_MM_BM   128u
+#define NN_MM_BN   128u
+#define NN_MM_BK   8u
+#define NN_MM_R    8
 #else
-#define NN_MM_T   16
-#define NN_MM_TU  16u
-#define NN_MM_BM  64u
-#define NN_MM_BN  64u
+#define NN_MM_T    16
+#define NN_MM_TU   16u
+#define NN_MM_BM   64u
+#define NN_MM_BN   64u
+#define NN_MM_BK   16u
+#define NN_MM_R    4
 #endif
 
 layout(local_size_x = NN_MM_T, local_size_y = NN_MM_T) in;
@@ -114,18 +127,37 @@ layout(push_constant) uniform PushConstants {
     uint M;      // C 的行数
     uint N;      // C 的列数
     uint K;      // 求和维度
-    uint transA; // 1 = A 存储为 (K,M)，按 A^T 使用
-    uint transB; // 1 = B 存储为 (N,K)，按 B^T 使用
+    uint transA; // 与 SC_TRANS_A 同值（PC↔SC 一致性守卫；后端复用同一 PC 布局）
+    uint transB; // 与 SC_TRANS_B 同值
 };
 
-// 分块维度常量（NN_MM_FINE 变体 = 16×16 输出块，见文件头开关注释）
+// ── 特化常量（VkSpecializationInfo，建 pipeline 时烘进 SPIR-V）──────────────
+// dispatch 时已知的 uniform 标志：转置方向 + 形状对齐。常量折叠后 fetch/commit
+// 热路径无运行时方向分支（死代码整段消除）。默认值 = 0（plain/对齐）——
+// **与 PC 不一致时 main 入口直接 return**，防 pipeline cache 串 key 静默错值。
+// ⚠ 后端必须为每个 (transA,transB,K%4,M%4,N%4) 组合建特化 pipeline，
+//   且 cache key 必须含这 5 个值。f32 SPIR-V 不再与无特化版字节零差异
+//   （OpSpecConstant vs OpConstant）；**数值仍逐位一致**。
+layout(constant_id = 0) const uint SC_TRANS_A = 0u;
+layout(constant_id = 1) const uint SC_TRANS_B = 0u;
+layout(constant_id = 2) const uint SC_KMOD4   = 0u;   // K & 3
+layout(constant_id = 3) const uint SC_MMOD4   = 0u;   // M & 3
+layout(constant_id = 4) const uint SC_NMOD4   = 0u;   // N & 3
+
+const bool K_ALIGNED = (SC_KMOD4 == 0u);
+const bool M_ALIGNED = (SC_MMOD4 == 0u);
+const bool N_ALIGNED = (SC_NMOD4 == 0u);
+
+// 分块维度常量（见文件头 FINE/WIDE/默认 三档开关注释）
 const uint BM = NN_MM_BM;  // 输出块行数
 const uint BN = NN_MM_BN;  // 输出块列数
 // BK=16 + 双缓冲：Ash[2][16][16]vec4 8KB + Bsh 8KB = 16KB 共享，保占用率
-//   （BK=32 双缓冲需 32KB，每 SM 只驻 2 个 WG，浅深网格都被占用率卡死——
-//   四点实测全回退：512³ +9%、1024³ +26%、4096³ +29%、batched b8 +29%，
-//   3 样本 best）；OP 级恒取 16，改 BK 前须四点复测。
-const uint BK = 16u; // K 维度分块宽度
+//   （BK=32 双缓冲需 32KB，每 SM 只驻 2 个 WG——四点实测全回退，见 history）；
+//   WIDE 档 BK=8：Ash[2][8][32]+Bsh 同样 16KB。
+const uint BK = NN_MM_BK; // K 维度分块宽度（16 默认/FINE，8 WIDE）
+// transB=1 装载分组：每个 n 上的 4-k 组数。写死 /4 ⇔ BK==16；
+// BK=8（WIDE）时必须 =2，否则 half-tile 越界写（复核坑①）。
+const uint KGRP = BK / 4u;
 
 // 每线程协作加载元素数（BM*BK/T² 线程）。下方按 4 元素组取 groups=EPT/4：
 // 默认 64×16/16² → EPT=4（groups=1）；细 tile 16×16/8² → EPT=4（groups=1，
@@ -173,8 +205,8 @@ vec4 mm_sB;
 void fetch_A_tile(uint t, uint tid, uint block_row)
 {
     const uint a_base_col = t * BK;
-    const bool k_contig = (transA == 0u);
-    const bool aligned = k_contig ? ((K & 3u) == 0u) : ((M & 3u) == 0u);
+    const bool k_contig = (SC_TRANS_A == 0u);
+    const bool aligned = k_contig ? K_ALIGNED : M_ALIGNED;
     mm_sA = vec4(0.0);
     for (uint vv = 0u; vv < MM_GROUPS_A; ++vv)
     {
@@ -209,7 +241,7 @@ void fetch_A_tile(uint t, uint tid, uint block_row)
 
 void commit_A_tile(uint stage, uint tid, uint block_row)
 {
-    const bool k_contig = (transA == 0u);
+    const bool k_contig = (SC_TRANS_A == 0u);
     for (uint vv = 0u; vv < MM_GROUPS_A; ++vv)
     {
         const uint g = tid * MM_GROUPS_A + vv;
@@ -235,8 +267,8 @@ void commit_A_tile(uint stage, uint tid, uint block_row)
 void fetch_B_tile(uint t, uint tid, uint block_col)
 {
     const uint b_base_row = t * BK;
-    const bool n_contig = (transB == 0u);
-    const bool aligned = n_contig ? ((N & 3u) == 0u) : ((K & 3u) == 0u);
+    const bool n_contig = (SC_TRANS_B == 0u);
+    const bool aligned = n_contig ? N_ALIGNED : K_ALIGNED;
     mm_sB = vec4(0.0);
     for (uint vv = 0u; vv < MM_GROUPS_B; ++vv)
     {
@@ -256,8 +288,8 @@ void fetch_B_tile(uint t, uint tid, uint block_col)
         }
         else
         {
-            const uint n  = g / 4u;
-            const uint k0 = (g % 4u) * 4u;
+            const uint n  = g / KGRP;
+            const uint k0 = (g % KGRP) * 4u;
             const uint gc = block_col + n;
             const uint gr = b_base_row + k0;
             if (aligned && gc < N && gr < K)
@@ -274,7 +306,7 @@ void fetch_B_tile(uint t, uint tid, uint block_col)
 
 void commit_B_tile(uint stage, uint tid, uint block_col)
 {
-    const bool n_contig = (transB == 0u);
+    const bool n_contig = (SC_TRANS_B == 0u);
     for (uint vv = 0u; vv < MM_GROUPS_B; ++vv)
     {
         const uint g = tid * MM_GROUPS_B + vv;
@@ -288,8 +320,8 @@ void commit_B_tile(uint stage, uint tid, uint block_col)
         }
         else
         {
-            const uint n  = g / 4u;
-            const uint k0 = (g % 4u) * 4u;
+            const uint n  = g / KGRP;
+            const uint k0 = (g % KGRP) * 4u;
             for (uint j = 0u; j < 4u; ++j)
                 Bsh[stage][k0 + j][SWZ_B(k0 + j, n >> 2)][n & 3u] = mm_sB[j];
         }
@@ -298,6 +330,12 @@ void commit_B_tile(uint stage, uint tid, uint block_col)
 
 void main()
 {
+    // PC↔SC 一致性守卫：pipeline cache key 串了（或后端漏传特化值）时
+    // 直接退出 → 对拍当场失败，而不是静默算错。
+    if (transA != SC_TRANS_A || transB != SC_TRANS_B ||
+        (K & 3u) != SC_KMOD4 || (M & 3u) != SC_MMOD4 || (N & 3u) != SC_NMOD4)
+        return;
+
     const uint tx = gl_LocalInvocationID.x;   // 0..T-1
     const uint ty = gl_LocalInvocationID.y;   // 0..T-1
     const uint tid = ty * NN_MM_TU + tx;      // 线性线程 ID 0..T²-1
@@ -307,10 +345,16 @@ void main()
     const uint block_col = gl_WorkGroupID.x * BN;
 
     // ── 寄存器分块 ────────────────────────────────────────────────────
-#if defined(NN_MM_FINE)
-    // 细 tile：R=2，每线程 2×2 输出（4 条独立 K 链 = 线程内 ILP；
-    // 网格仍 16×16 块 → 48 WG 摊满 SM；逐 k 标量升序乘加与 64-tile 逐位同序）
+#if NN_MM_R == 2
+    // 细 tile：R=2，每线程 2×2 输出（4 条独立 K 链 = 线程内 ILP）
     float a00 = 0.0, a01 = 0.0, a10 = 0.0, a11 = 0.0;
+#elif NN_MM_R == 8
+    // WIDE：acc[行半][列半][块内行]——行 = rh*64 + ty*4 + i，列 = ch*64 + tx*4 + ·
+    vec4 acc[2][2][4];
+    for (uint rh = 0u; rh < 2u; ++rh)
+        for (uint ch = 0u; ch < 2u; ++ch)
+            for (uint i = 0u; i < 4u; ++i)
+                acc[rh][ch][i] = vec4(0.0);
 #else
     // 4×4 累加器（vec4 数组）
     vec4 acc[4];
@@ -350,7 +394,7 @@ void main()
         #pragma unroll 4
         for (uint k = 0u; k < BK; ++k)
         {
-#if defined(NN_MM_FINE)
+#if NN_MM_R == 2
             // R=2：行对 ty*2、ty*2+1 → 共享行组 (ty*2)>>2 = ty>>1、组内
             // 基 (ty*2)&3 = (ty&1)*2；列对同构。2 次 vec4 LDS + 4 标量 FMA。
             // 读侧同式 swizzle（involution）→ 与 load 写集合一致。
@@ -365,6 +409,22 @@ void main()
             a01 += ar0 * bc1;
             a10 += ar1 * bc0;
             a11 += ar1 * bc1;
+#elif NN_MM_R == 8
+            // WIDE R=8：行半 ty / ty+16、列半 tx / tx+16 → 4 次 vec4 LDS + 64 FMA
+            const vec4 a0 = Ash[stage][k][SWZ_A(k, ty)];
+            const vec4 a1 = Ash[stage][k][SWZ_A(k, ty + 16u)];
+            const vec4 b0 = Bsh[stage][k][SWZ_B(k, tx)];
+            const vec4 b1 = Bsh[stage][k][SWZ_B(k, tx + 16u)];
+            #define OUTER(dst, av, bv) \
+                (dst)[0] += (av).x * (bv); \
+                (dst)[1] += (av).y * (bv); \
+                (dst)[2] += (av).z * (bv); \
+                (dst)[3] += (av).w * (bv)
+            OUTER(acc[0][0], a0, b0);
+            OUTER(acc[0][1], a0, b1);
+            OUTER(acc[1][0], a1, b0);
+            OUTER(acc[1][1], a1, b1);
+            #undef OUTER
 #else
             // 本线程负责的 4 行（ty*4..ty*4+3）与 4 列（tx*4..tx*4+3）
             // vec4 外积累加：2 次 vec4 LDS + 16 FMA = 8:1
@@ -389,7 +449,7 @@ void main()
     }
 
     // ── 写入结果 ──────────────────────────────────────────────────────
-#if defined(NN_MM_FINE)
+#if NN_MM_R == 2
     // 细 tile：R=2 逐标量写出（线程 (ty,tx) ↔ 输出块内 2×2；warp 内相邻
     // 列 → 128B 合并写。fine 仅 f32 构建，NN_WR 仍走宏保同形）
     {
@@ -405,6 +465,39 @@ void main()
                     C[out_row * N + out_col] = NN_WR(accs[i * 2u + j]);
             }
     }
+#elif NN_MM_R == 8
+    // WIDE R=8 写出：行半 rh / 列半 ch，每线程 8×8 输出
+    [[unroll]] for (uint rh = 0u; rh < 2u; ++rh)
+        [[unroll]] for (uint i = 0u; i < 4u; ++i)
+        {
+            const uint out_row = block_row + rh * 64u + ty * 4u + i;
+            if (out_row >= M) continue;
+            [[unroll]] for (uint ch = 0u; ch < 2u; ++ch)
+            {
+                const uint out_col0 = block_col + ch * 64u + tx * 4u;
+#if defined(NN_SHADER_F16)
+                if (out_col0 >= N) continue;
+                C[out_row * N + out_col0 + 0u] = NN_WR(acc[rh][ch][i].x);
+                if (out_col0 + 1u < N) C[out_row * N + out_col0 + 1u] = NN_WR(acc[rh][ch][i].y);
+                if (out_col0 + 2u < N) C[out_row * N + out_col0 + 2u] = NN_WR(acc[rh][ch][i].z);
+                if (out_col0 + 3u < N) C[out_row * N + out_col0 + 3u] = NN_WR(acc[rh][ch][i].w);
+#else
+                const bool c_vec4 = N_ALIGNED;
+                if (c_vec4)
+                {
+                    if (out_col0 < N) Cv4[(out_row * N + out_col0) >> 2u] = acc[rh][ch][i];
+                }
+                else
+                {
+                    if (out_col0 >= N) continue;
+                    C[out_row * N + out_col0 + 0u] = acc[rh][ch][i].x;
+                    if (out_col0 + 1u < N) C[out_row * N + out_col0 + 1u] = acc[rh][ch][i].y;
+                    if (out_col0 + 2u < N) C[out_row * N + out_col0 + 2u] = acc[rh][ch][i].z;
+                    if (out_col0 + 3u < N) C[out_row * N + out_col0 + 3u] = acc[rh][ch][i].w;
+                }
+#endif
+            }
+        }
 #elif defined(NN_SHADER_F16)
     // f16 输出：逐标量写出（C 无 vec4 别名视图），与 f32 的 N%4!=0 分支同构
     for (uint i = 0u; i < 4u; ++i)

@@ -41,6 +41,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <neuralnet.cpp/core_errors.hpp>
@@ -71,7 +72,7 @@
 #define NN_SPV_GETTER_LIST(X)                                                                      \
     X(matmul)                                                                                      \
     X(matmul_tiled) X(matmul_gemv) X(matmul_gemv_f16) X(batched_matmul) X(batched_matmul_f16)      \
-        X(matmul_tiled_f16) X(matmul_tiled_fine) X(rearrange_3d) X(elementwise_v2) X(reduce)       \
+        X(matmul_tiled_f16) X(matmul_tiled_fine) X(matmul_tiled_wide) X(rearrange_3d) X(elementwise_v2) X(reduce) \
             X(reduce_f16) X(transpose) X(im2col) X(im2col_f16) X(col2im) X(col2im_f16)             \
                 X(group_reduce) X(group_reduce_f16) X(gather) X(transpose_f16) X(rearrange_3d_f16) \
                     X(gather_f16) X(elementwise_v2_f16) X(scatter_add) X(scatter_add_f16)          \
@@ -143,6 +144,14 @@
 #define NN_SPV_FN_matmul_tiled_fine nn_matmul_tiled_fine_spirv_bytecode
 #else
 #define NN_SPV_FN_matmul_tiled_fine NN_SPV_FN_MISSING
+#endif
+
+// WIDE：128×128 输出块 / R=8 / BK=8（f32 only；K 累加序与 64-tile 逐位一致）
+#if __has_include("matmul_tiled_wide_spv.hpp")
+#include "matmul_tiled_wide_spv.hpp"
+#define NN_SPV_FN_matmul_tiled_wide nn_matmul_tiled_wide_spirv_bytecode
+#else
+#define NN_SPV_FN_matmul_tiled_wide NN_SPV_FN_MISSING
 #endif
 
 #if __has_include("rearrange_3d_spv.hpp")
@@ -594,6 +603,41 @@ private:
     // P3 批量派发观测计数（测试/诊断用：确认批量路径真的走到、而非静默降级
     // 为逐 kernel 后 A/B 自比恒真）
     std::uint64_t fused_batch_dispatches_ = 0;
+
+    // ── matmul 特化 pipeline 缓存（VkSpecializationInfo）──────────────────
+    // matmul_tiled 族（base/fine/wide/f16）的 SC_TRANS_A/B + K/M/N%4 在建
+    // pipeline 时烘进 SPIR-V；同一 base 变体按 5 元组懒建，cache key 必含
+    // 这 5 个值（PC↔SC 守卫防串 key）。miss 时 create_generic(spec=…)，
+    // 与 init 预建的无特化默认（SC 全 0）并存——默认仅服务 plain/对齐形状。
+    struct MmSpecKey
+    {
+        PipelineId base;
+        std::uint32_t trans_a, trans_b, kmod4, mmod4, nmod4;
+        bool operator==(const MmSpecKey& o) const noexcept
+        {
+            return base == o.base && trans_a == o.trans_a && trans_b == o.trans_b &&
+                   kmod4 == o.kmod4 && mmod4 == o.mmod4 && nmod4 == o.nmod4;
+        }
+    };
+    struct MmSpecKeyHash
+    {
+        std::size_t operator()(const MmSpecKey& k) const noexcept
+        {
+            std::size_t h = static_cast<std::size_t>(k.base);
+            h = h * 31u + k.trans_a;
+            h = h * 31u + k.trans_b;
+            h = h * 31u + k.kmod4;
+            h = h * 31u + k.mmod4;
+            h = h * 31u + k.nmod4;
+            return h;
+        }
+    };
+    std::unordered_map<MmSpecKey, VulkanPipeline, MmSpecKeyHash> mm_spec_pipelines_;
+    std::mutex mm_spec_mutex_;
+    // 懒建失败负缓存（与 mm_variants_attempted_ 同策略：失败不重试）
+    std::unordered_set<std::string> mm_spec_failed_;
+    // get_mm_specialized 定义在 compute_vk_backend_pipelines.inc（class 体内
+    // #include，定义即声明——此处不可再前置声明，否则 -Wmicrosoft-extra-qualification）。
 
     std::unique_ptr<MemoryPool> memory_pool_;
     // 第二阶段：瞬态/持久分池。batch 录制期（batch_mode_=true）创建的

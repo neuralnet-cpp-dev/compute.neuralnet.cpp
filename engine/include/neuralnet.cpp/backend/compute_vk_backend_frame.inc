@@ -636,6 +636,7 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
     // f16 版），GEMV（N≤8）与 naive 兜底不受影响。
     bool use_fine = false;
     bool use_naive_fine = false;
+    bool use_wide = false;
     if (use_tiled && !use_f16 && !mm_fine_disabled())
     {
         const std::uint64_t wg64 = static_cast<std::uint64_t>((N + 63u) / 64u) * ((M + 63u) / 64u);
@@ -647,14 +648,23 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
                 mm_fine_naive() && pipelines_.get(PipelineId::matmul).handle() != VK_NULL_HANDLE;
             use_fine = !use_naive_fine && has(PipelineId::matmul_tiled_fine);
         }
+        else if (!mm_wide_disabled() && has(PipelineId::matmul_tiled_wide) &&
+                 (M >= nn::EXPR_MATMUL_BLOCK_WIDE) && (N >= nn::EXPR_MATMUL_BLOCK_WIDE))
+        {
+            // WIDE：128-tile 网格 WG 数 ≥ 阈值且 min(M,N)≥128（防瘦形状半块空转）
+            const std::uint64_t wg128 =
+                static_cast<std::uint64_t>((N + 127u) / 128u) * ((M + 127u) / 128u);
+            if (wg128 >= nn::EXPR_MATMUL_WIDE_MIN_WGS) use_wide = true;
+        }
     }
-    const auto& pipeline = use_gemv         ? (use_f16 ? pipelines_.get(PipelineId::matmul_gemv_f16)
-                                                       : pipelines_.get(PipelineId::matmul_gemv))
-                           : use_f16        ? pipelines_.get(PipelineId::matmul_tiled_f16)
-                           : use_naive_fine ? pipelines_.get(PipelineId::matmul)
-                           : use_fine       ? pipelines_.get(PipelineId::matmul_tiled_fine)
-                           : use_tiled      ? pipelines_.get(PipelineId::matmul_tiled)
-                                            : pipelines_.get(PipelineId::matmul);
+    const auto& pipeline = use_gemv          ? (use_f16 ? pipelines_.get(PipelineId::matmul_gemv_f16)
+                                                        : pipelines_.get(PipelineId::matmul_gemv))
+                           : use_f16         ? get_mm_specialized(PipelineId::matmul_tiled_f16, M, N, K, transA, transB)
+                           : use_naive_fine  ? pipelines_.get(PipelineId::matmul)
+                           : use_fine        ? get_mm_specialized(PipelineId::matmul_tiled_fine, M, N, K, transA, transB)
+                           : use_wide        ? get_mm_specialized(PipelineId::matmul_tiled_wide, M, N, K, transA, transB)
+                           : use_tiled       ? get_mm_specialized(PipelineId::matmul_tiled, M, N, K, transA, transB)
+                                             : pipelines_.get(PipelineId::matmul);
 
     // 3. 复用通用 dispatch：2 输入 + 1 输出，push {M,N,K,transA,transB}
     //   Dispatch：按 shader 输出块尺寸计算工作组数
@@ -671,12 +681,13 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
 
     std::vector<GpuTensor> inputs{A, B};
     // 设备侧计时 detail：把 matmul 的 pipeline 变体带进 per-key 表
-    // （gemv / tiled / tiled_f16 / fine / naive_fine / naive）
-    const char* mm_variant = use_gemv         ? (use_f16 ? "gemv_f16" : "gemv")
-                             : use_naive_fine ? "naive_fine"
-                             : use_fine       ? "fine"
-                             : use_tiled      ? (use_f16 ? "tiled_f16" : "tiled")
-                                              : "naive";
+    // （gemv / tiled / tiled_f16 / fine / wide / naive_fine / naive）
+    const char* mm_variant = use_gemv          ? (use_f16 ? "gemv_f16" : "gemv")
+                             : use_naive_fine  ? "naive_fine"
+                             : use_fine        ? "fine"
+                             : use_wide        ? "wide"
+                             : use_tiled       ? (use_f16 ? "tiled_f16" : "tiled")
+                                               : "naive";
     if (use_gemv)
     {
         auto r = dispatch_compute(pipeline, inputs, C, pc, (M + GEMV_ROWS - 1u) / GEMV_ROWS, 1u, 1u,
@@ -684,7 +695,8 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
         NN_TRY_CHECK(r);
         return C;
     }
-    const uint32_t tile = (use_fine || use_naive_fine) ? 16u : use_tiled ? 64u : 16u;
+    const uint32_t tile =
+        (use_fine || use_naive_fine) ? 16u : use_wide ? 128u : use_tiled ? 64u : 16u;
     auto r = dispatch_compute(pipeline, inputs, C, pc, (N + tile - 1u) / tile,
                               (M + tile - 1u) / tile, 1u, "matmul", mm_variant);
     NN_TRY_CHECK(r);

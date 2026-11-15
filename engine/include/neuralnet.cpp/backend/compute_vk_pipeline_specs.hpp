@@ -28,6 +28,9 @@ inline std::span<const PipelineSpec> GpuBackend::pipeline_specs()
         // 细 tile（16×16 输出块，wgrad 网格饥饿；f32 only）
         {PipelineId::matmul_tiled_fine, "matmul_tiled_fine", get_matmul_tiled_fine_spirv, 3,
          5 * sizeof(std::uint32_t), R::always},
+        // WIDE（128×128 输出块 / R=8 / BK=8，大方阵；f32 only）
+        {PipelineId::matmul_tiled_wide, "matmul_tiled_wide", get_matmul_tiled_wide_spirv, 3,
+         5 * sizeof(std::uint32_t), R::always},
         {PipelineId::matmul_gemv, "matmul_gemv", get_matmul_gemv_spirv, 3,
          5 * sizeof(std::uint32_t), R::always},
         {PipelineId::matmul_gemv_f16, "matmul_gemv_f16", get_matmul_gemv_f16_spirv, 3,

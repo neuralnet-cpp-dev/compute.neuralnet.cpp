@@ -1,4 +1,4 @@
-﻿# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 #  compute.neuralnet.cpp — 计算引擎（引擎 LGPL + 抽象层 MIT）
 #
 #  目标：引擎实现编进独立 .so（libnn-cpu.so / libnn-gpu.so），以抽象层（MIT）
@@ -159,6 +159,7 @@ if(NN_ENABLE_GPU)
         nn_embed_shader(batched_matmul_f16 ${SHADER_DIR}/batched_matmul.comp -DNN_SHADER_F16=1)
         nn_embed_shader(matmul_tiled_f16 ${SHADER_DIR}/matmul_tiled.comp -DNN_SHADER_F16=1)
         nn_embed_shader(matmul_tiled_fine ${SHADER_DIR}/matmul_tiled.comp -DNN_MM_FINE=1)
+        nn_embed_shader(matmul_tiled_wide ${SHADER_DIR}/matmul_tiled.comp -DNN_MM_WIDE=1)
         nn_embed_shader(matmul_gemv_f16 ${SHADER_DIR}/matmul_gemv.comp --target-env=vulkan1.2 -DNN_SHADER_F16=1)
         nn_embed_shader(matmul_q_i8_f16 ${SHADER_DIR}/matmul_q_i8.comp -DNN_SHADER_F16=1)
         nn_embed_shader(scan_prefix_outer_f16 ${SHADER_DIR}/scan_prefix_outer.comp -DNN_SHADER_F16=1)

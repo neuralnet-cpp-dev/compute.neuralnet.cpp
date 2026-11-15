@@ -597,11 +597,15 @@ public:
     }
 
     // 创建通用 pipeline（可变 binding 数和 push constant 大小）
-    // 用于 elementwise_v2 / reduce / broadcast 等纯原语着色器
-    [[nodiscard]] static Result<VulkanPipeline> create_generic(VkDevice device,
-                                                               std::span<const uint32_t> spirv_code,
-                                                               uint32_t num_bindings,
-                                                               uint32_t push_constant_size)
+    // 用于 elementwise_v2 / reduce / broadcast 等纯原语着色器。
+    // spec_entries/data/data_size 可选：VkSpecializationInfo（特化常量）；
+    // 传空 = 用 shader 默认值（SC_* 全 0）。
+    [[nodiscard]] static Result<VulkanPipeline>
+    create_generic(VkDevice device, std::span<const uint32_t> spirv_code,
+                   uint32_t num_bindings, uint32_t push_constant_size,
+                   const VkSpecializationMapEntry* spec_entries = nullptr,
+                   uint32_t spec_entry_count = 0, const void* spec_data = nullptr,
+                   uint32_t spec_data_size = 0)
     {
         VulkanPipeline pl;
         pl.device_ = device;
@@ -652,13 +656,25 @@ public:
             vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_),
             __FILE__, __LINE__);
         NN_TRY_CHECK(r);
-        // 创建 compute pipeline
+        // 创建 compute pipeline（可选特化常量）
+        VkSpecializationInfo spec_info{};
+        VkSpecializationInfo* spec_ptr = nullptr;
+        if (spec_entries != nullptr && spec_entry_count > 0)
+        {
+            spec_info.mapEntryCount = spec_entry_count;
+            spec_info.pMapEntries = spec_entries;
+            spec_info.dataSize = spec_data_size;
+            spec_info.pData = spec_data;
+            spec_ptr = &spec_info;
+        }
+
         VkComputePipelineCreateInfo pipeline_info{};
         pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipeline_info.stage.module = pl.shader_module_;
         pipeline_info.stage.pName = "main";
+        pipeline_info.stage.pSpecializationInfo = spec_ptr;
         pipeline_info.layout = pl.pipeline_layout_;
 
         r = detail::vk_check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,

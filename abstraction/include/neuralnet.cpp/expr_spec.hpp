@@ -1077,6 +1077,14 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK_FINE = 16;
 // 64-tile 的每 WG 效率优势占优（细 tile 每输出 LDS/共享足迹更高）。
 // 设备无关的固定阈值（Vulkan 不暴露 SM 数）。
 inline constexpr std::uint32_t EXPR_MATMUL_FINE_MIN_WGS = 32;
+// ── matmul WIDE 变体（128×128 输出块 / R=8 / BK=8，op 级 matmul_tiled）────
+// 大方阵主攻：每 k 4 次 LDS.128 + 16 向量 FFMA（LDS/浮点比 64-tile 的 1/2），
+// 共享仍 16KB。K 累加序不变 → 与 64-tile 逐位一致。
+// 选型：128-tile 网格 WG 数 ≥ 本阈值 **且** min(M,N) ≥ 128（避免瘦形状
+// 半块空转）。64 ≈ 2×SM×驻留（40HX 34 SM）；不足则回 64-tile/fine。
+// 运行期 NN_MM_NO_WIDE=1 关闭（A/B 对照）。
+inline constexpr std::uint32_t EXPR_MATMUL_WIDE_MIN_WGS = 64;
+inline constexpr std::uint32_t EXPR_MATMUL_BLOCK_WIDE = 128;
 // ── matmul K 切分（键后缀 #ks/#kr，wgrad 二次归约）────────────────────────
 // 细 tile 网格（M×N/256 个 WG）仍低于该阈值 → 把 K 切成 S 段、网格 × S。
 // 256 ≈ 8×40HX SM 数：细 tile 的 48~64 WG 每 SM 只摊 1~2 个，K 长循环

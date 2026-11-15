@@ -37,6 +37,7 @@ enum class PipelineId : std::uint8_t
     matmul,
     matmul_tiled,
     matmul_tiled_fine,
+    matmul_tiled_wide,
     matmul_gemv,
     matmul_gemv_f16,
     batched_matmul,

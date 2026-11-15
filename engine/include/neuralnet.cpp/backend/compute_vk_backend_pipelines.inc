@@ -409,6 +409,17 @@ static bool attach_upload_signal(VkSubmitInfo& si, StagingRing& ring, std::size_
     return off;
 }
 
+// ── WIDE（128×128）逃生阀：NN_MM_NO_WIDE=1 关闭（A/B 对照）────────────────
+[[nodiscard]] static bool mm_wide_disabled()
+{
+    static const bool off = []()
+    {
+        const std::string v = VulkanDevice::get_env("NN_MM_NO_WIDE");
+        return !v.empty() && v[0] != '0';
+    }();
+    return off;
+}
+
 // ── P0 细粒度实验阀：NN_MM_FINE_NAIVE=1 → 饥饿形状改派 naive
 //    （matmul.comp：16×16 线程、每线程 1 输出、无 shared/barrier——
 //    线程数 = M×N（细 tiled 的 16×），靠 warp 切换吃满延迟）。
@@ -469,6 +480,73 @@ static bool attach_upload_signal(VkSubmitInfo& si, StagingRing& ring, std::size_
         return n >= 2 ? static_cast<std::uint32_t>(n) : 0u;
     }();
     return s;
+}
+
+// ── matmul 特化 pipeline 懒建（VkSpecializationInfo，SC_* 五元组）──────────
+// cache key = (base, transA, transB, K%4, M%4, N%4)——**必须含这 5 个值**
+// （shader PC↔SC 守卫会拦下串 key）。miss 时用 base 变体的 SPIR-V +
+// create_generic(spec=…) 建新 pipeline；失败负缓存（不重试，防热路径重付）。
+// 与 init 预建的无特化默认（SC 全 0 = plain/对齐）并存：五元组全 0 时
+// 直接命中默认，零额外创建。
+[[nodiscard]] const VulkanPipeline&
+get_mm_specialized(PipelineId base, std::uint32_t M, std::uint32_t N, std::uint32_t K,
+                   std::uint32_t transA, std::uint32_t transB)
+{
+    const MmSpecKey key{base, transA, transB, K & 3u, M & 3u, N & 3u};
+    // 全 0（plain + 三对齐）= init 预建的无特化默认
+    if (key.trans_a == 0u && key.trans_b == 0u && key.kmod4 == 0u && key.mmod4 == 0u &&
+        key.nmod4 == 0u)
+        return pipelines_.get(base);
+
+    std::lock_guard<std::mutex> lock(mm_spec_mutex_);
+    auto it = mm_spec_pipelines_.find(key);
+    if (it != mm_spec_pipelines_.end()) return it->second;
+
+    // 失败负缓存：键 = base + 5 元组的紧凑串
+    std::string fkey = std::to_string(static_cast<int>(base)) + ':' +
+                       std::to_string(transA) + std::to_string(transB) +
+                       std::to_string(key.kmod4) + std::to_string(key.mmod4) +
+                       std::to_string(key.nmod4);
+    if (mm_spec_failed_.count(fkey) != 0)
+        return pipelines_.get(base); // 回退默认（守卫会拦 → 对拍失败可见）
+
+    // 取 base 变体 SPIR-V + 布局（tiled 族统一：3 binding / 5×uint PC）
+    const std::vector<std::uint32_t>* spirv = nullptr;
+    switch (base)
+    {
+    case PipelineId::matmul_tiled: spirv = &get_matmul_tiled_spirv(); break;
+    case PipelineId::matmul_tiled_fine: spirv = &get_matmul_tiled_fine_spirv(); break;
+    case PipelineId::matmul_tiled_wide: spirv = &get_matmul_tiled_wide_spirv(); break;
+    case PipelineId::matmul_tiled_f16: spirv = &get_matmul_tiled_f16_spirv(); break;
+    default: return pipelines_.get(base);
+    }
+    if (spirv->empty())
+    {
+        mm_spec_failed_.insert(fkey);
+        return pipelines_.get(base);
+    }
+
+    // VkSpecializationInfo：constant_id 0..4 ↔ SC_TRANS_A/B/KMOD4/MMOD4/NMOD4
+    // （与 matmul_tiled.comp 的 layout(constant_id=…) 逐一对齐）
+    static constexpr VkSpecializationMapEntry entries[5] = {
+        {0, 0, sizeof(std::uint32_t)}, // SC_TRANS_A
+        {1, 4, sizeof(std::uint32_t)}, // SC_TRANS_B
+        {2, 8, sizeof(std::uint32_t)}, // SC_KMOD4
+        {3, 12, sizeof(std::uint32_t)},// SC_MMOD4
+        {4, 16, sizeof(std::uint32_t)},// SC_NMOD4
+    };
+    const std::uint32_t data[5] = {transA, transB, key.kmod4, key.mmod4, key.nmod4};
+
+    auto created = VulkanPipeline::create_generic(
+        device_.device(), *spirv, 3u, 5u * sizeof(std::uint32_t), entries, 5, data, sizeof(data));
+    if (!created)
+    {
+        mm_spec_failed_.insert(fkey);
+        return pipelines_.get(base);
+    }
+    auto [pos, ok] = mm_spec_pipelines_.emplace(key, std::move(*created));
+    (void)ok;
+    return pos->second;
 }
 
 // ── 设备侧计时 helper（口径见成员注释）────────────────────────────
