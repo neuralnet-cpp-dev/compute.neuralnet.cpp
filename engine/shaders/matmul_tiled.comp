@@ -39,6 +39,7 @@
 
 #version 450
 
+
 // ── 精度变体（编译期开关：glslc -DNN_SHADER_F16=1）────────────────────────
 // 默认（无宏）= 全 f32（f32 分支宏展开与裸写 f32 代码逐字同形 →
 //   SPIR-V 字节零差异）。
@@ -142,141 +143,155 @@ const uint TILE_V4_B = (BK * BN) / 4u;
 shared vec4 Ash[2][BK][BM / 4];
 shared vec4 Bsh[2][BK][BN / 4];
 
-// ── Bank swizzle（与融合生成器 generate_glsl_matmul 的 P1 同式）────────────
-// vec4 数组的 k 维步长 ≡ 0 (mod 32 bank) → 标量散布写的 bank 与 k 无关：
-// 同 slot、kAL=0/4/8/12 的四个写者撞同一 bank（4 路冲突）。物理槽 =
-// 逻辑槽 ^ ((k>>2) & 槽位掩码)；对 k 是 involution → 写读同式、广播读语义
-// 与逐输出 K 累加序全部不变。掩码 = 槽位位宽-1（BM/4-1 或 BN/4-1），
-// 保证 XOR 结果仍在 [0, BM/4) / [0, BN/4)。
+// ── Bank swizzle（P1 旧式；新式 mm_swz 2026-11-15 A/B 否决）──────────────
+// 新式 f(a)=(a&3)<<1 理论 2→1 way，但方阵 4096 中性、1024³ 回退 ~24%，
+// 实测不采信 → 维持旧式。写读同式 involution → K 累加序不变。
+// （mm_swz.glsl 仍被 batched_matmul 使用；本文件不再 include。）
 #define SWZ_A(k, slot) ((slot) ^ (((k) >> 2) & (BM / 4u - 1u)))
 #define SWZ_B(k, slot) ((slot) ^ (((k) >> 2) & (BN / 4u - 1u)))
 
-// ── 协作加载 A 分块 BM×BK → 指定 stage ────────────────────────────────────
+// ── 协作加载 A 分块 BM×BK ──────────────────────────────────────────────────
 // 线程分组：EPT_A/4 个「4 元素组」，组索引 g = tid*(EPT_A/4) + vv。
 // 按 transA 选连续维（全局地址连续 ⇒ vec4 快路径）：
 //   transA=0：A[m][k] 行主序，组 = 同行连续 4 个 k（g ↔ m=(4g)/BK, k0=(4g)%BK）
 //   transA=1：A 存储 (K,M)，组 = 同 k 连续 4 个 m（g ↔ k=g/(BM/4), mq=g%(BM/4)）
 // 未对齐/边界回退走**同一分组**的标量循环 → 覆盖恰好一致。
-void load_A_tile(uint t, uint stage, uint tid, uint block_row)
+//
+// 【fetch/commit 流水】LDG 只落寄存器（fetch），compute(t) 与 t+1 的 LDG
+// 重叠，LDG 回来后再 STS（commit）。原实现 load 内 LDG→STS 相邻，warp 按序
+// 发射会停在 STS 等全局数据，compute(t) 被推到 LDG 之后——能否掩盖延迟完全
+// 取决于驱动调度器是否把 STS 下沉。累加序 / 共享内容 / barrier 次数不变。
+// 暂存代价：每线程 1 个 A vec4 + 1 个 B vec4 = 8 寄存器（EPT=4 ⇒ groups=1）。
+const uint MM_GROUPS_A = (EPT_A >= 4u) ? (EPT_A / 4u) : 1u;
+const uint MM_GROUPS_B = (EPT_B >= 4u) ? (EPT_B / 4u) : 1u;
+
+// fetch 结果（groups=1 时每线程恰 1 组；多组时循环内复用同一槽——
+// 当前 BM/BK/T 组合下 groups 恒为 1）
+vec4 mm_sA;
+vec4 mm_sB;
+
+void fetch_A_tile(uint t, uint tid, uint block_row)
 {
     const uint a_base_col = t * BK;
     const bool k_contig = (transA == 0u);
-    // vec4 元素下标 %4==0 的形状条件（uniform 分支）：
-    //   沿 k 连续：gr*K%4==0 ∀gr ⇔ K%4==0；沿 m 连续：k*M%4==0 ∀k ⇔ M%4==0
     const bool aligned = k_contig ? ((K & 3u) == 0u) : ((M & 3u) == 0u);
-    const uint groups = (EPT_A >= 4u) ? (EPT_A / 4u) : 1u;
-
-    for (uint vv = 0u; vv < groups; ++vv)
+    mm_sA = vec4(0.0);
+    for (uint vv = 0u; vv < MM_GROUPS_A; ++vv)
     {
-        const uint g = tid * groups + vv;
-        if (g >= TILE_V4_A) continue;   // 细 tile：tid ≥ tile vec4 数不加载
+        const uint g = tid * MM_GROUPS_A + vv;
+        if (g >= TILE_V4_A) continue;
         if (k_contig)
         {
-            // ── 沿 k 连续：4 个连续 k，同一行 m ──────────────────────────
             const uint m  = (4u * g) / BK;
             const uint k0 = (4u * g) % BK;
             const uint gr = block_row + m;
-            const uint gc = a_base_col + k0;   // k0%4==0、a_base_col%4==0 ⇒ gc%4==0
+            const uint gc = a_base_col + k0;
             if (aligned && gr < M && gc < K)
-            {
-                // K%4==0 且 gc<K ⇒ gc+3<K，vec4 整组在行内；下标 %4==0 ⇒ 16B 对齐
-                const vec4 v = NN_LOADV4(Av4, (gr * K + gc) >> 2);
-                Ash[stage][k0    ][SWZ_A(k0,     m >> 2)][m & 3u] = v.x;
-                Ash[stage][k0 + 1u][SWZ_A(k0 + 1u, m >> 2)][m & 3u] = v.y;
-                Ash[stage][k0 + 2u][SWZ_A(k0 + 2u, m >> 2)][m & 3u] = v.z;
-                Ash[stage][k0 + 3u][SWZ_A(k0 + 3u, m >> 2)][m & 3u] = v.w;
-            }
+                mm_sA = NN_LOADV4(Av4, (gr * K + gc) >> 2);
             else
-            {
                 for (uint j = 0u; j < 4u; ++j)
-                {
-                    const float v = (gr < M && gc + j < K) ? NN_RD(A[gr * K + gc + j]) : 0.0;
-                    Ash[stage][k0 + j][SWZ_A(k0 + j, m >> 2)][m & 3u] = v;
-                }
-            }
+                    mm_sA[j] = (gr < M && gc + j < K) ? NN_RD(A[gr * K + gc + j]) : 0.0;
         }
         else
         {
-            // ── 沿 m 连续（A 存储 K×M）：4 个连续 m，同一 k ─────────────
             const uint mq = g % (BM / 4u);
             const uint k  = g / (BM / 4u);
             const uint gc = a_base_col + k;
-            const uint gr = block_row + mq * 4u;  // block_row%4==0（BM%4==0）
+            const uint gr = block_row + mq * 4u;
             if (aligned && gc < K && gr < M)
-            {
-                // M%4==0 且 gr<M ⇒ gr+3<M；下标 = gc*M+gr，两因子均 %4==0
-                Ash[stage][k][SWZ_A(k, mq)] = NN_LOADV4(Av4, (gc * M + gr) >> 2);
-            }
+                mm_sA = NN_LOADV4(Av4, (gc * M + gr) >> 2);
             else
-            {
                 for (uint j = 0u; j < 4u; ++j)
-                {
-                    const float v = (gr + j < M && gc < K) ? NN_RD(A[gc * M + gr + j]) : 0.0;
-                    Ash[stage][k][SWZ_A(k, mq)][j] = v;
-                }
-            }
+                    mm_sA[j] = (gr + j < M && gc < K) ? NN_RD(A[gc * M + gr + j]) : 0.0;
         }
     }
 }
 
-// ── 协作加载 B 分块 BK×BN → 指定 stage ────────────────────────────────────
-// 按 transB 选连续维：
-//   transB=0：B[k][n] 行主序，组 = 同 k 连续 4 个 n（g ↔ k=(4g)/BN, n0=(4g)%BN）
-//   transB=1：B 存储 (N,K)，组 = 同 n 连续 4 个 k（g ↔ n=g/4, k0=(g%4)*4）
-void load_B_tile(uint t, uint stage, uint tid, uint block_col)
+void commit_A_tile(uint stage, uint tid, uint block_row)
 {
-    const uint b_base_row = t * BK;
-    const bool n_contig = (transB == 0u);
-    // 沿 n 连续：k*N%4==0 ∀k ⇔ N%4==0；沿 k 连续：n*K%4==0 ∀n ⇔ K%4==0
-    const bool aligned = n_contig ? ((N & 3u) == 0u) : ((K & 3u) == 0u);
-    const uint groups = (EPT_B >= 4u) ? (EPT_B / 4u) : 1u;
-
-    for (uint vv = 0u; vv < groups; ++vv)
+    const bool k_contig = (transA == 0u);
+    for (uint vv = 0u; vv < MM_GROUPS_A; ++vv)
     {
-        const uint g = tid * groups + vv;
-        if (g >= TILE_V4_B) continue;   // 细 tile：tid ≥ tile vec4 数不加载
-        if (n_contig)
+        const uint g = tid * MM_GROUPS_A + vv;
+        if (g >= TILE_V4_A) continue;
+        if (k_contig)
         {
-            // ── 沿 n 连续：4 个连续 n，同一行 k ──────────────────────────
-            const uint k  = (4u * g) / BN;
-            const uint n0 = (4u * g) % BN;
-            const uint gr = b_base_row + k;
-            const uint gc = block_col + n0;     // n0%4==0、block_col%4==0 ⇒ gc%4==0
-            if (aligned && gr < K && gc < N)
-            {
-                const vec4 v = NN_LOADV4(Bv4, (gr * N + gc) >> 2);
-                Bsh[stage][k][SWZ_B(k, n0 >> 2)] = v;   // vec4 沿 n ↔ [k][n>>2] 整槽
-            }
-            else
-            {
-                for (uint j = 0u; j < 4u; ++j)
-                {
-                    const float v = (gr < K && gc + j < N) ? NN_RD(B[gr * N + gc + j]) : 0.0;
-                    Bsh[stage][k][SWZ_B(k, (n0 + j) >> 2)][(n0 + j) & 3u] = v;
-                }
-            }
+            const uint m  = (4u * g) / BK;
+            const uint k0 = (4u * g) % BK;
+            Ash[stage][k0    ][SWZ_A(k0,     m >> 2)][m & 3u] = mm_sA.x;
+            Ash[stage][k0 + 1u][SWZ_A(k0 + 1u, m >> 2)][m & 3u] = mm_sA.y;
+            Ash[stage][k0 + 2u][SWZ_A(k0 + 2u, m >> 2)][m & 3u] = mm_sA.z;
+            Ash[stage][k0 + 3u][SWZ_A(k0 + 3u, m >> 2)][m & 3u] = mm_sA.w;
         }
         else
         {
-            // ── 沿 k 连续（B 存储 N×K）：4 个连续 k，同一 n ─────────────
+            const uint mq = g % (BM / 4u);
+            const uint k  = g / (BM / 4u);
+            Ash[stage][k][SWZ_A(k, mq)] = mm_sA;   // 整槽 STS.128
+        }
+    }
+}
+
+void fetch_B_tile(uint t, uint tid, uint block_col)
+{
+    const uint b_base_row = t * BK;
+    const bool n_contig = (transB == 0u);
+    const bool aligned = n_contig ? ((N & 3u) == 0u) : ((K & 3u) == 0u);
+    mm_sB = vec4(0.0);
+    for (uint vv = 0u; vv < MM_GROUPS_B; ++vv)
+    {
+        const uint g = tid * MM_GROUPS_B + vv;
+        if (g >= TILE_V4_B) continue;
+        if (n_contig)
+        {
+            const uint k  = (4u * g) / BN;
+            const uint n0 = (4u * g) % BN;
+            const uint gr = b_base_row + k;
+            const uint gc = block_col + n0;
+            if (aligned && gr < K && gc < N)
+                mm_sB = NN_LOADV4(Bv4, (gr * N + gc) >> 2);
+            else
+                for (uint j = 0u; j < 4u; ++j)
+                    mm_sB[j] = (gr < K && gc + j < N) ? NN_RD(B[gr * N + gc + j]) : 0.0;
+        }
+        else
+        {
             const uint n  = g / 4u;
             const uint k0 = (g % 4u) * 4u;
             const uint gc = block_col + n;
-            const uint gr = b_base_row + k0;    // b_base_row%4==0（t*BK%4==0）
+            const uint gr = b_base_row + k0;
             if (aligned && gc < N && gr < K)
             {
                 const vec4 v = NN_LOADV4(Bv4, (gc * K + gr) >> 2);
-                for (uint j = 0u; j < 4u; ++j)
-                    Bsh[stage][k0 + j][SWZ_B(k0 + j, n >> 2)][n & 3u] = v[j];
+                mm_sB = v;
             }
             else
-            {
                 for (uint j = 0u; j < 4u; ++j)
-                {
-                    const float v = (gr + j < K && gc < N) ? NN_RD(B[gc * K + gr + j]) : 0.0;
-                    Bsh[stage][k0 + j][SWZ_B(k0 + j, n >> 2)][n & 3u] = v;
-                }
-            }
+                    mm_sB[j] = (gr + j < K && gc < N) ? NN_RD(B[gc * K + gr + j]) : 0.0;
+        }
+    }
+}
+
+void commit_B_tile(uint stage, uint tid, uint block_col)
+{
+    const bool n_contig = (transB == 0u);
+    for (uint vv = 0u; vv < MM_GROUPS_B; ++vv)
+    {
+        const uint g = tid * MM_GROUPS_B + vv;
+        if (g >= TILE_V4_B) continue;
+        if (n_contig)
+        {
+            const uint k  = (4u * g) / BN;
+            const uint n0 = (4u * g) % BN;
+            // 整槽：n0%4==0 ⇒ 4 元素恰为 slot (n0>>2) 的 .x..w
+            Bsh[stage][k][SWZ_B(k, n0 >> 2)] = mm_sB;
+        }
+        else
+        {
+            const uint n  = g / 4u;
+            const uint k0 = (g % 4u) * 4u;
+            for (uint j = 0u; j < 4u; ++j)
+                Bsh[stage][k0 + j][SWZ_B(k0 + j, n >> 2)][n & 3u] = mm_sB[j];
         }
     }
 }
@@ -305,14 +320,16 @@ void main()
 
     const uint num_tiles = (K + BK - 1u) / BK;
 
-    // ── 前奏：加载 tile 0 → stage 0，同步一次 ───────────────────────
-    load_A_tile(0u, 0u, tid, block_row);
-    load_B_tile(0u, 0u, tid, block_col);
+    // ── 前奏：fetch tile 0 → 寄存器 → commit → stage 0，同步一次 ─────────
+    fetch_A_tile(0u, tid, block_row);
+    fetch_B_tile(0u, tid, block_col);
+    commit_A_tile(0u, tid, block_row);
+    commit_B_tile(0u, tid, block_col);
     barrier();
 
-    // ── 流水循环：发射 tile t+1 的加载（stage^1），同时计算 tile t ────
+    // ── 流水：fetch(t+1) 只发 LDG → compute(t) → commit(t+1) STS ─────────
     //   每 tile 仅 1 次 barrier；barrier 同时保证
-    //   ① tile t+1 的全局加载在下一迭代被读取前完成
+    //   ① tile t+1 的 STS 在下一迭代被读取前完成
     //   ② tile t 的计算在 stage^1 被覆盖前完成（与 ①天然错开 stage）
     uint stage = 0u;
     for (uint t = 0u; t < num_tiles; ++t)
@@ -321,11 +338,11 @@ void main()
         const uint nstage = stage ^ 1u;
         if (nxt < num_tiles)
         {
-            load_A_tile(nxt, nstage, tid, block_row);
-            load_B_tile(nxt, nstage, tid, block_col);
+            fetch_A_tile(nxt, tid, block_row);   // 只发 LDG，落 mm_sA/mm_sB
+            fetch_B_tile(nxt, tid, block_col);
         }
 
-        // ── 累加（每 k：2 次 LDS + FMA）──────────────────────────────
+        // ── 累加（每 k：2 次 LDS + FMA）——与 t+1 的 LDG 在途重叠 ──────
         // ⚠ 曾试「k+1 预取软件流水」（把 k+1 的 LDS 提到 k 的 FMA 前）：
         // 细 tile 实测 1.33→2.13ms（+60%，寄存器/复制链反而拖累）、64-tile
         // 持平——**该路径不要加预取**（fold 生成器能加是因为其归约域是
@@ -359,6 +376,12 @@ void main()
             acc[2] += a_vec.z * b_vec;
             acc[3] += a_vec.w * b_vec;
 #endif
+        }
+
+        if (nxt < num_tiles)
+        {
+            commit_A_tile(nstage, tid, block_row);  // LDG 已回，STS 不停顿
+            commit_B_tile(nstage, tid, block_col);
         }
 
         barrier();
