@@ -529,7 +529,7 @@ namespace fused
         // ⚠ 寄存器偏移必须用 A.num_regs（A 占用的寄存器数），而非 A 的指令数。
         // canonical 后指令数与寄存器数可能不同（liveness 复用），用指令数会产生
         // 寄存器空洞（A 的寄存器 0..num_regs-1 之后空出 instrs.size()-num_regs 个号），
-        // 浪费寄存器并可能使本可融合的表达式超出 EXPR_MAX_REGS=16 而被放弃。
+        // 浪费寄存器并可能使本可融合的表达式超出 EXPR_MAX_REGS 而被放弃。
         for (const auto& ins : Bs.instrs)
             if (static_cast<std::size_t>(ins.dst) + A.num_regs >= 256) return false;
 

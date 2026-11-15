@@ -437,6 +437,22 @@ static bool attach_upload_signal(VkSubmitInfo& si, StagingRing& ring, std::size_
     return off;
 }
 
+// ── 实验开关：NN_MM_KSPLIT_ATOMIC=1 → K 切分改**单遍原子**（键 #ksa）────────
+// 段部分和经 CAS 累加进已清零的最终输出（run_fused_gpu 录制期 fill0），
+// 免部分和缓冲与 #kr 二段。仅对已注册 #ksa 的结构生效（= 无尾链纯 matmul
+// V0 + 输出为本调用自有分配），其余形态自动回落两段式。
+// ⚠ 原子完成序不定 → **破坏运行间确定性**（ML 可接受，故列为实验面）；
+//   与 NN_MM_NO_KSPLIT/NN_MM_KSPLIT_S 同窗 A/B 口径 → 进程内静态缓存。
+[[nodiscard]] static bool mm_ksplit_atomic_enabled()
+{
+    static const bool on = []()
+    {
+        const std::string v = VulkanDevice::get_env("NN_MM_KSPLIT_ATOMIC");
+        return !v.empty() && v[0] != '0';
+    }();
+    return on;
+}
+
 [[nodiscard]] static std::uint32_t mm_ksplit_forced_s()
 {
     static const std::uint32_t s = []() -> std::uint32_t

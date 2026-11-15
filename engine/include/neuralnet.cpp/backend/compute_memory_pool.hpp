@@ -562,7 +562,7 @@ public:
                 if (b.allocation_count == 0 && b.free_regions.size() == 1 &&
                     b.free_regions.begin()->offset == 0 && b.free_regions.begin()->size == b.size)
                 {
-                    it = blocks_.erase(it);
+                    it = blocks_.erase(it);   // Block 析构 → vkFreeMemory
                     c_blocks_released_++;
                     continue;
                 }

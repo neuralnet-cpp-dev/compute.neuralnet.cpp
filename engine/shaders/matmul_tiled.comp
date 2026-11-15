@@ -14,6 +14,8 @@
 //   - vec4 共享内存：Ash[k][m]（A 转置）/ Bsh[k][n]，每线程每 k 仅 2 次
 //     vec4 LDS + 16 FMA（8:1 计算:加载比），vec4 读沿 lane 连续、消除
 //     标量读的 bank 冲突
+//   - bank swizzle（与融合生成器 P1 同式）：物理槽 = 逻辑槽 ^ ((k>>2) &
+//     槽位掩码)，消标量散布写的 4 路 bank 冲突；写读同式 involution
 //   - vec4 累加器：acc[4]（4×4 = 16 个累加值），寄存器常驻
 //
 // 双缓冲流水（BK=16）：Ash/Bsh 各分 2 个 stage，tile t+1 的全局加载与
@@ -140,6 +142,15 @@ const uint TILE_V4_B = (BK * BN) / 4u;
 shared vec4 Ash[2][BK][BM / 4];
 shared vec4 Bsh[2][BK][BN / 4];
 
+// ── Bank swizzle（与融合生成器 generate_glsl_matmul 的 P1 同式）────────────
+// vec4 数组的 k 维步长 ≡ 0 (mod 32 bank) → 标量散布写的 bank 与 k 无关：
+// 同 slot、kAL=0/4/8/12 的四个写者撞同一 bank（4 路冲突）。物理槽 =
+// 逻辑槽 ^ ((k>>2) & 槽位掩码)；对 k 是 involution → 写读同式、广播读语义
+// 与逐输出 K 累加序全部不变。掩码 = 槽位位宽-1（BM/4-1 或 BN/4-1），
+// 保证 XOR 结果仍在 [0, BM/4) / [0, BN/4)。
+#define SWZ_A(k, slot) ((slot) ^ (((k) >> 2) & (BM / 4u - 1u)))
+#define SWZ_B(k, slot) ((slot) ^ (((k) >> 2) & (BN / 4u - 1u)))
+
 // ── 协作加载 A 分块 BM×BK → 指定 stage ────────────────────────────────────
 // 线程分组：EPT_A/4 个「4 元素组」，组索引 g = tid*(EPT_A/4) + vv。
 // 按 transA 选连续维（全局地址连续 ⇒ vec4 快路径）：
@@ -170,17 +181,17 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row)
             {
                 // K%4==0 且 gc<K ⇒ gc+3<K，vec4 整组在行内；下标 %4==0 ⇒ 16B 对齐
                 const vec4 v = NN_LOADV4(Av4, (gr * K + gc) >> 2);
-                Ash[stage][k0    ][m >> 2][m & 3u] = v.x;
-                Ash[stage][k0 + 1u][m >> 2][m & 3u] = v.y;
-                Ash[stage][k0 + 2u][m >> 2][m & 3u] = v.z;
-                Ash[stage][k0 + 3u][m >> 2][m & 3u] = v.w;
+                Ash[stage][k0    ][SWZ_A(k0,     m >> 2)][m & 3u] = v.x;
+                Ash[stage][k0 + 1u][SWZ_A(k0 + 1u, m >> 2)][m & 3u] = v.y;
+                Ash[stage][k0 + 2u][SWZ_A(k0 + 2u, m >> 2)][m & 3u] = v.z;
+                Ash[stage][k0 + 3u][SWZ_A(k0 + 3u, m >> 2)][m & 3u] = v.w;
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
                     const float v = (gr < M && gc + j < K) ? NN_RD(A[gr * K + gc + j]) : 0.0;
-                    Ash[stage][k0 + j][m >> 2][m & 3u] = v;
+                    Ash[stage][k0 + j][SWZ_A(k0 + j, m >> 2)][m & 3u] = v;
                 }
             }
         }
@@ -194,14 +205,14 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row)
             if (aligned && gc < K && gr < M)
             {
                 // M%4==0 且 gr<M ⇒ gr+3<M；下标 = gc*M+gr，两因子均 %4==0
-                Ash[stage][k][mq] = NN_LOADV4(Av4, (gc * M + gr) >> 2);
+                Ash[stage][k][SWZ_A(k, mq)] = NN_LOADV4(Av4, (gc * M + gr) >> 2);
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
                     const float v = (gr + j < M && gc < K) ? NN_RD(A[gc * M + gr + j]) : 0.0;
-                    Ash[stage][k][mq][j] = v;
+                    Ash[stage][k][SWZ_A(k, mq)][j] = v;
                 }
             }
         }
@@ -234,14 +245,14 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col)
             if (aligned && gr < K && gc < N)
             {
                 const vec4 v = NN_LOADV4(Bv4, (gr * N + gc) >> 2);
-                Bsh[stage][k][n0 >> 2] = v;     // vec4 沿 n ↔ [k][n>>2] 整槽
+                Bsh[stage][k][SWZ_B(k, n0 >> 2)] = v;   // vec4 沿 n ↔ [k][n>>2] 整槽
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
                     const float v = (gr < K && gc + j < N) ? NN_RD(B[gr * N + gc + j]) : 0.0;
-                    Bsh[stage][k][(n0 + j) >> 2][(n0 + j) & 3u] = v;
+                    Bsh[stage][k][SWZ_B(k, (n0 + j) >> 2)][(n0 + j) & 3u] = v;
                 }
             }
         }
@@ -256,14 +267,14 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col)
             {
                 const vec4 v = NN_LOADV4(Bv4, (gc * K + gr) >> 2);
                 for (uint j = 0u; j < 4u; ++j)
-                    Bsh[stage][k0 + j][n >> 2][n & 3u] = v[j];
+                    Bsh[stage][k0 + j][SWZ_B(k0 + j, n >> 2)][n & 3u] = v[j];
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
                     const float v = (gr + j < K && gc < N) ? NN_RD(B[gc * K + gr + j]) : 0.0;
-                    Bsh[stage][k0 + j][n >> 2][n & 3u] = v;
+                    Bsh[stage][k0 + j][SWZ_B(k0 + j, n >> 2)][n & 3u] = v;
                 }
             }
         }
@@ -325,8 +336,9 @@ void main()
 #if defined(NN_MM_FINE)
             // R=2：行对 ty*2、ty*2+1 → 共享行组 (ty*2)>>2 = ty>>1、组内
             // 基 (ty*2)&3 = (ty&1)*2；列对同构。2 次 vec4 LDS + 4 标量 FMA。
-            const vec4 a_vec = Ash[stage][k][ty >> 1u];
-            const vec4 b_vec = Bsh[stage][k][tx >> 1u];
+            // 读侧同式 swizzle（involution）→ 与 load 写集合一致。
+            const vec4 a_vec = Ash[stage][k][SWZ_A(k, ty >> 1u)];
+            const vec4 b_vec = Bsh[stage][k][SWZ_B(k, tx >> 1u)];
             const float ar0 = a_vec[(ty & 1u) * 2u];
             const float ar1 = a_vec[(ty & 1u) * 2u + 1u];
             const float bc0 = b_vec[(tx & 1u) * 2u];
@@ -339,8 +351,8 @@ void main()
 #else
             // 本线程负责的 4 行（ty*4..ty*4+3）与 4 列（tx*4..tx*4+3）
             // vec4 外积累加：2 次 vec4 LDS + 16 FMA = 8:1
-            const vec4 a_vec = Ash[stage][k][ty];
-            const vec4 b_vec = Bsh[stage][k][tx];
+            const vec4 a_vec = Ash[stage][k][SWZ_A(k, ty)];
+            const vec4 b_vec = Bsh[stage][k][SWZ_B(k, tx)];
 
             acc[0] += a_vec.x * b_vec;
             acc[1] += a_vec.y * b_vec;

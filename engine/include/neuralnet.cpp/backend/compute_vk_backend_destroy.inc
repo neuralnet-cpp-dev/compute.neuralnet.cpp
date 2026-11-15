@@ -568,8 +568,26 @@ void retire_reduce_partial_()
 // ── 显存回收（L2）：先非阻塞收割已完成帧，再归还完全空闲的池底材 ──
 // 调用时机：step 边界（end_batch 提交完成、延迟销毁已收割之后）。
 // 未完成的帧留给环槽复用 / 下次 reap——不在 step 边界阻塞流水线。
+// 保留阈值（NN_POOL_RETAIN_MB，默认 256，0 = 尽量回收旧行为）：稳态训练里
+// 同一个 ~513MB 工作块每步"步末整块空闲 → vkFreeMemory(~9ms) → 下步重新
+// vkAllocate"纯抖动——WDDM 下大块 free/alloc 都是毫秒级。retain>0 让
+// 完全空闲块在空闲容量仍 ≥ 阈值时留在池内（下步 first-fit 复用），只在
+// 工作负载真正收缩时把超出阈值的块归还；步内峰值不变（工作块两种情形都
+// 在用），步间基线抬高 ≤ 保留阈值。进程内读一次并缓存（行为开关口径）。
 [[nodiscard]] Result<void> release_idle_pool_blocks()
 {
+    if (!pool_retain_env_applied_)
+    {
+        pool_retain_env_applied_ = true;
+        VkDeviceSize retain = 256ull << 20; // 默认 256MB
+        const std::string v = VulkanDevice::get_env("NN_POOL_RETAIN_MB");
+        if (!v.empty())
+        {
+            retain = static_cast<VkDeviceSize>(std::strtoull(v.c_str(), nullptr, 10)) << 20;
+        }
+        if (memory_pool_) memory_pool_->set_retain_free_bytes(retain);
+        if (transient_pool_) transient_pool_->set_retain_free_bytes(retain);
+    }
     auto r = reap_completed_frames();
     if (!r) return r;
     if (memory_pool_) memory_pool_->release_idle_blocks();

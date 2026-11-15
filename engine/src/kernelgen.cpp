@@ -42,9 +42,12 @@ void nnk_free_spirv(uint8_t* spirv)
     std::free(spirv);
 }
 
-nnk_status nnk_generate_spirv(const std::uint8_t* spec_bytes, std::size_t spec_len,
-                              std::uint32_t prec_sig, nnk_kernel_meta* out_meta,
-                              std::uint8_t** out_spirv, std::size_t* out_len)
+// 共享实现：variant 决定走基础形态还是网格变体生成入口（#f/#ks/#kr 的
+// 资格判据在 GlslEmitter/generate_glsl 内，不支持 → 空串 → NNK_COMPILE_FAIL）。
+static nnk_status generate_impl(const std::uint8_t* spec_bytes, std::size_t spec_len,
+                                std::uint32_t prec_sig, std::uint32_t variant,
+                                nnk_kernel_meta* out_meta, std::uint8_t** out_spirv,
+                                std::size_t* out_len)
 {
     *out_spirv = nullptr;
     *out_len = 0;
@@ -70,21 +73,45 @@ nnk_status nnk_generate_spirv(const std::uint8_t* spec_bytes, std::size_t spec_l
         out_meta->fold_out = m.fold_out;
         out_meta->fold_per_thread_row = m.fold_per_thread_row;
         out_meta->pc_base_fixed = m.pc_base_fixed;
+        // K 切分第一段（#ks / 原子 #ksa）：PC 固定头比 matmul 6 槽多一个
+        // ks_span（生成器 declare 同位置；后端 destroy.inc 的 is_ks 同源）。
+        if (variant == NNK_VARIANT_MM_KSPLIT || variant == NNK_VARIANT_MM_KSPLIT_ATOMIC)
+            out_meta->pc_base_fixed += 1u;
     }
 
-    // 3) GlslEmitter 生成 GLSL（归约走 generate_reduce，逐元素走 generate）
+    // 3) GlslEmitter 生成 GLSL（归约走 generate_reduce，逐元素走 generate；
+    //    网格变体走 generate_matmul_* —— 资格不符返回空串 = 上层 [skip] 降级）
     auto emitter = nn::emitter_registry::make("glsl");
     if (!emitter) return NNK_COMPILE_FAIL;
     const int raxis = nn::expr_spec_reduce_axis(canon);
-    const std::string glsl = (raxis >= 0)
-                                 ? emitter->generate_reduce("jit_kernel", canon, prec_sig)
-                                 : emitter->generate("jit_kernel", canon, prec_sig, /*alu=*/false);
+    std::string glsl;
+    switch (variant)
+    {
+    case NNK_VARIANT_MM_FINE:
+        glsl = emitter->generate_matmul_fine("jit_kernel", canon, prec_sig);
+        break;
+    case NNK_VARIANT_MM_KSPLIT:
+        glsl = emitter->generate_matmul_ksplit("jit_kernel", canon, prec_sig);
+        break;
+    case NNK_VARIANT_MM_KSPLIT_REDUCE:
+        glsl = emitter->generate_matmul_ksplit_reduce("jit_kernel", canon, prec_sig);
+        break;
+    case NNK_VARIANT_MM_KSPLIT_ATOMIC:
+        glsl = emitter->generate_matmul_ksplit_atomic("jit_kernel", canon, prec_sig);
+        break;
+    case NNK_VARIANT_BASE:
+    default:
+        glsl = (raxis >= 0)
+                   ? emitter->generate_reduce("jit_kernel", canon, prec_sig)
+                   : emitter->generate("jit_kernel", canon, prec_sig, /*alu=*/false);
+        break;
+    }
     if (glsl.empty())
     {
         // 生成器对该形态返回空串（不支持的视图/指令组合）——诊断到 stderr：
         // 调用方只见 NNK_COMPILE_FAIL，缺这行无法区分"生成空"还是"shaderc 报错"。
-        std::fprintf(stderr, "[kernelgen] GLSL 生成为空: raxis=%d fold=%d extras=%zu\n",
-                     raxis, canon.fold ? 1 : 0, canon.extras.size());
+        std::fprintf(stderr, "[kernelgen] GLSL 生成为空: raxis=%d fold=%d extras=%zu variant=%u\n",
+                     raxis, canon.fold ? 1 : 0, canon.extras.size(), variant);
         return NNK_COMPILE_FAIL;
     }
 
@@ -128,6 +155,22 @@ nnk_status nnk_generate_spirv(const std::uint8_t* spec_bytes, std::size_t spec_l
     *out_spirv = buf;
     *out_len = len;
     return NNK_OK;
+}
+
+nnk_status nnk_generate_spirv(const std::uint8_t* spec_bytes, std::size_t spec_len,
+                              std::uint32_t prec_sig, nnk_kernel_meta* out_meta,
+                              std::uint8_t** out_spirv, std::size_t* out_len)
+{
+    return generate_impl(spec_bytes, spec_len, prec_sig, NNK_VARIANT_BASE, out_meta, out_spirv,
+                         out_len);
+}
+
+nnk_status nnk_generate_spirv_variant(const std::uint8_t* spec_bytes, std::size_t spec_len,
+                                      std::uint32_t prec_sig, std::uint32_t variant,
+                                      nnk_kernel_meta* out_meta, std::uint8_t** out_spirv,
+                                      std::size_t* out_len)
+{
+    return generate_impl(spec_bytes, spec_len, prec_sig, variant, out_meta, out_spirv, out_len);
 }
 
 } // extern "C"

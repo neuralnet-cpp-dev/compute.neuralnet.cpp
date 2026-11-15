@@ -645,7 +645,7 @@ void test_fold_v2_tail()
     std::printf("[OK] test_fold_v2_tail\n");
 }
 
-// ── 测试 6：上限压力（拼接后超 EXPR_MAX_INSTRS 则放弃融合） ───────────
+// ── 测试 6：上限压力（预算常量的融合/拒绝边界） ──────────────────────────
 // 用 abs 链（abs 不可代数化简、不可常量折叠）构造可控指令数
 nn::ExprSpec make_abs_chain(std::uint8_t n)
 {
@@ -665,6 +665,25 @@ nn::ExprSpec make_abs_chain(std::uint8_t n)
     return s;
 }
 
+// reg-light 高指令数链：全部指令覆写 dst=0（num_regs=1）——在寄存器不触顶
+// 的前提下压满 INSTRS 预算（仅用于 validate 边界；不经 canonicalize，避免
+// CSE 把同构覆写链合并）
+nn::ExprSpec make_reg0_chain(std::uint32_t n)
+{
+    nn::ExprSpec s;
+    s.views.push_back(nn::expr::linear());
+    for (std::uint32_t i = 0; i < n; ++i)
+    {
+        nn::ExprInstr in;
+        in.op = static_cast<std::uint8_t>(nn::ExprOp::Abs);
+        in.dst = 0;
+        in.a = (i == 0) ? nn::expr::input(0) : nn::expr::reg(0);
+        s.instrs.push_back(in);
+    }
+    s.num_regs = 1;
+    return s;
+}
+
 void test_limit_pressure()
 {
     auto eng_owner = nn::create_cpu_engine();
@@ -673,26 +692,33 @@ void test_limit_pressure()
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
 
-    // A：40 条 abs 指令；B：1 条 → 拼接后 41 ≤ 64 → 融合
+    // A：40 条 abs 指令；B：1 条 → 拼接后 41 ≤ 4096 → 融合
     const int nA = g.add_node(make_abs_chain(40), std::vector<nn::Tensor>{x}, rows, cols, false);
     nn::Tensor yt = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
     (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}), std::vector<nn::Tensor>{yt},
                      rows, cols, false);
 
     auto kernels = fuse_expr_graph(g);
-    CHECK(kernels.size() == 1, "40+1 条指令应在 EXPR_MAX_INSTRS=64 内 → 融合");
+    CHECK(kernels.size() == 1, "40+1 条指令 ≤ EXPR_MAX_INSTRS → 融合");
 
-    // A：60 条 abs；B：5 条 abs 链 → 拼接后 65 > 64 → 不融合
+    // A：60 条 abs；B：5 条 abs 链 → 拼接后 65 ≤ EXPR_MAX_INSTRS(4096) → 融合
+    //（EXPR_MAX_INSTRS 放大前该用例为 65 > 64 → 分裂 2 kernel）
     nn::ExprGraph g2;
     nn::Tensor x2 = make_tensor(eng, rows, cols, 0.0f, 0.1f);
     const int nC = g2.add_node(make_abs_chain(60), std::vector<nn::Tensor>{x2}, rows, cols, false);
-    nn::Tensor yt2 = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nC)]);
+    nn::Tensor yt2 = make_placeholder(eng, rows, cols, g2.tag_of_node[static_cast<std::size_t>(nC)]);
     // B：5 条 abs 链（消费 A 输出）
     nn::ExprSpec sb = make_abs_chain(5);
     (void)g2.add_node(sb, std::vector<nn::Tensor>{yt2}, rows, cols, false);
 
     auto kernels2 = fuse_expr_graph(g2);
-    CHECK(kernels2.size() == 2, "60+5 条指令超 EXPR_MAX_INSTRS → 保守放弃融合");
+    CHECK(kernels2.size() == 1, "60+5=65 条 ≤ EXPR_MAX_INSTRS=4096 → 融合");
+
+    // INSTRS 卫生边界（validate 层）：4096 放行、4097 拒绝
+    auto v_ok = nn::validate_expr_spec(make_reg0_chain(4096), 1);
+    CHECK(v_ok.has_value(), "4096 条 ≤ EXPR_MAX_INSTRS → validate 放行");
+    auto v_over = nn::validate_expr_spec(make_reg0_chain(4097), 1);
+    CHECK(!v_over.has_value(), "4097 条 > EXPR_MAX_INSTRS → validate 拒绝");
     std::printf("[OK] test_limit_pressure\n");
 }
 
@@ -1412,15 +1438,16 @@ void test_fold_ash_tier_and_dead_store()
     struct Tier
     {
         std::uint32_t mm_k;
-        const char* decl;   // shared 声明行（唯一出现点）
-        const char* key;    // expr_spec_fold_variant_key 期望
+        std::uint32_t cap;   // fold_mmk_cap_for 档宽（>256 → 1024）
+        const char* key;     // expr_spec_fold_variant_key 期望
     };
+    // invert_kv（has_mm && vecacc）→ shared float Ash[2][cap]
     const Tier tiers[] = {
-        {64, "shared float Ash[64];", "K#m64"},
-        {128, "shared float Ash[128];", "K#m128"},
-        {256, "shared float Ash[256];", "K#m256"},
-        {512, "shared float Ash[1024];", "K"},    // >256 → 基线档，键无后缀
-        {1024, "shared float Ash[1024];", "K"},   // 基线原值
+        {64, 64, "K#m64"},
+        {128, 128, "K#m128"},
+        {256, 256, "K#m256"},
+        {512, 1024, "K"},    // >256 → 基线档，键无后缀
+        {1024, 1024, "K"},   // 基线原值
     };
     for (const Tier& t : tiers)
     {
@@ -1434,14 +1461,17 @@ void test_fold_ash_tier_and_dead_store()
         const std::string g = glsl->generate("fold_tier", spec);
         lab = "tier GLSL 生成 mm_k=" + std::to_string(t.mm_k);
         CHECK(!g.empty(), lab.c_str());
-        lab = "Ash 分档声明 mm_k=" + std::to_string(t.mm_k);
-        CHECK(g.find(t.decl) != std::string::npos, lab.c_str());
+        // make_fold_mm_chain 带 mm+vecacc → invert_kv → Ash[2][cap]
+        const std::string want = "shared float Ash[2][" + std::to_string(t.cap) + "];";
+        lab = "Ash 分档声明 mm_k=" + std::to_string(t.mm_k) + " want=" + want;
+        CHECK(g.find(want) != std::string::npos, lab.c_str());
         for (const Tier& o : tiers)
         {
-            if (std::string(o.decl) == t.decl) continue;
+            if (o.cap == t.cap) continue;
+            const std::string other = "shared float Ash[2][" + std::to_string(o.cap) + "];";
             lab = "非本档 Ash 声明不得出现 mm_k=" + std::to_string(t.mm_k) + " vs " +
                   std::to_string(o.mm_k);
-            CHECK(g.find(o.decl) == std::string::npos, lab.c_str());
+            CHECK(g.find(other) == std::string::npos, lab.c_str());
         }
     }
     // 键保持：非 fold、fold 无 mm 段（无 Ash 预载 → 不分档）

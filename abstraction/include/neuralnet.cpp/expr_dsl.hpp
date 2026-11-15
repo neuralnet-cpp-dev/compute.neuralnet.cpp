@@ -34,6 +34,7 @@
 
 #include <neuralnet.cpp/core_config.hpp>   // NN_PROBES_ENABLED（探针编译门）
 #include <neuralnet.cpp/core_parallel.hpp>   // nn::parallel_for_samples
+#include <neuralnet.cpp/core_assert.hpp>    // NN_ASSERT_ALWAYS（DSL 结构不变量）
 #include "core_domain.hpp"
 #include "core_env.hpp"      // RV-09：环境变量读取唯一入口
 
@@ -638,6 +639,12 @@ struct MatmulRef
         // transA=1 → A.rows()/batch（A 存储 (batch*K, M)，每批 (K, M)）
         const std::uint32_t k = static_cast<std::uint32_t>(
             transA ? (a.rows() / (batch / (a_kv_ratio ? a_kv_ratio : 1))) : a.cols());
+        // 单 matmul 段约束：spec.matmul 是单个 optional，第二个 MatmulRef
+        // 会静默覆盖前一个 → 错值。结构不变量在此 fail-fast（编程错误，
+        // 与"一个表达式一个 matmul 段"的 IR 域规则同源）。
+        NN_ASSERT_ALWAYS(!sb.spec.matmul.has_value(),
+                         "MatmulRef::to_spec: 一个表达式至多一个 matmul 段"
+                         "（多 matmul 融合暂不支持，请拆成多个表达式）");
         sb.spec.matmul = MatmulSpec{ai,
                                     bi,
                                     transA ? std::uint8_t{1} : std::uint8_t{0},

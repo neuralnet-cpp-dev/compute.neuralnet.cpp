@@ -504,7 +504,7 @@ expr_try_algebraic_simplify(ExprOp op, const ExprOperand& a, const ExprOperand& 
 //  IR pass 5：寄存器分配（liveness 线性扫描，IR-B）
 //
 //  计算每条指令 dst 的最后使用位置（last_use），线性扫描复用已释放寄存器，
-//  降低 num_regs（让更多表达式落在 EXPR_MAX_REGS=16 内）。确定性贪心：
+//  降低 num_regs（让更多表达式落在 EXPR_MAX_REGS 内）。确定性贪心：
 //  每步释放所有 last_use < i 的寄存器，分配时取最小可用号。
 //  输出寄存器（最后一条指令 dst）的 last_use 设为 n-1 防复用（值需保留到输出）。
 //

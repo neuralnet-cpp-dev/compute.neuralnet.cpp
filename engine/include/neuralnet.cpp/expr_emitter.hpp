@@ -110,6 +110,14 @@ public:
     [[nodiscard]] virtual std::string
     generate_matmul_ksplit_reduce(const std::string&, const ExprSpec&, ExprPrecSig = 0) const
     { return {}; }
+
+    // 原子单遍 K 切分（**实验**，键 = key#ksa，开关 NN_MM_KSPLIT_ATOMIC）：
+    // 段部分和 CAS 累加进已清零的最终输出（免 #kr）。资格 = #ks ∧ 无尾链
+    // ∧ V0（尾链非线性 → 有尾链必须两段式）。⚠ 原子序不定 = 运行间不确定。
+    // 默认返回空串 = 该后端不支持 → 不产出条目（运行期回落 #ks/#kr）。
+    [[nodiscard]] virtual std::string
+    generate_matmul_ksplit_atomic(const std::string&, const ExprSpec&, ExprPrecSig = 0) const
+    { return {}; }
 };
 
 // ── 简单注册表：按后端名选择 emitter 工厂 ────────────────────────────────

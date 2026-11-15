@@ -560,9 +560,10 @@ private:
     {
         // 输出列数（vec_state_len 或 1）；0 = 非 fold 形态
         std::uint32_t out = 0;
-        // 1 → v1 标量 fold：每线程一行（wg = ceil(rows/256)）
+        // 1 → v1 标量 fold：每线程一行（wg = ceil(count/256) = ceil(rows/256)）
+        // 2 → v1 staged（P3-lite）：每 WG 32 行、tid<32 计算（wg = ceil(rows/32)）
         // 0 → v2 双域 fold：每 WG EXPR_FOLD_ROWS_PER_WG 行（wg = ceil(rows/NR)）
-        // ——dispatch 公式两者不同（v2 若按 ceil(count/256) 会丢行）
+        // ——dispatch 公式三者不同（v2/若按 ceil(count/256) 会丢行）
         std::uint8_t per_thread_row = 0;
     };
 
@@ -600,6 +601,9 @@ private:
     // （构建期 batch_mode_=false）走 memory_pool_。此拆分**纯组织性**——两池均
     // 不强制释放，仅按生命周期隔离，避免频繁临时分配在参数常驻块里切出碎片。
     std::unique_ptr<MemoryPool> transient_pool_;
+    // release_idle_pool_blocks 的 NN_POOL_RETAIN_MB 环境开关：进程内读一次
+    // 并写入两池 retain 阈值（行为开关口径，见 destroy.inc 注释）
+    bool pool_retain_env_applied_ = false;
     std::unique_ptr<StagingRing> staging_ring_;
 
     VkCommandPool command_pool_ = VK_NULL_HANDLE;

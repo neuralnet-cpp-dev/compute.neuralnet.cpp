@@ -32,7 +32,17 @@ namespace nn::fused
 
 // 生成器版本：只在**代码生成语义变化**时 bump（非每次 release；避免无关升级
 // 频繁作废缓存）。进 K 的版本组件与 .nnk 的 generator_version 字段。
-inline constexpr const char* kKernelCacheGeneratorVersion = "1";
+// v2（2026-11-13）：P1 matmul 共享 bank swizzle + vec4 写出快路径。
+// v3（2026-11-13）：P3-lite fold v1 staged（每 WG 32 行 + smem 单遍暂存；
+//   fold_per_thread_row 1→2 改派发公式——旧缓存 shader 的行映射与新派发
+//   错位 = 静默丢行，必须作废）。
+// v4（2026-11-14）：fold v2 注意力形态 invert_kv（k0 外/ri 内 + Ash[2][cap]）
+//   ——同 key 旧 SPIR-V 行循环结构不同，必须作废。
+// v5（2026-11-14）：invert_kv 持久槽 shared→local（ob/o 每线程分片写 WG
+//   shared 会互相覆盖；同 v4 键但语义不同，再作废一次）。
+// v6（2026-11-14）：invert_kv 默认关（A/B 回退 fold +109% / e2e +19%）；
+//   同 key 默认路径回到非反转循环，须作废 v5 的 invert 缓存。
+inline constexpr const char* kKernelCacheGeneratorVersion = "6";
 inline constexpr std::uint64_t kKernelCacheFormatVersion = 1;
 
 // KVRecord 里每条 kernel 一个字段，前缀 "kernel." + K。

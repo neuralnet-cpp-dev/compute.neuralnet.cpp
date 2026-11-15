@@ -108,12 +108,21 @@ private:
     {
         void* handle = nullptr;
         decltype(&nnk_generate_spirv) generate = nullptr;
+        // 网格变体（#f/#ks/#kr，P0 补产）：可选符号——旧生成器 .so 缺本符号
+        // → 变体整体跳过（留在 64-tile 路径，降级不报错），基础键路径不受影响。
+        decltype(&nnk_generate_spirv_variant) generate_variant = nullptr;
         decltype(&nnk_free_spirv) free = nullptr;
         decltype(&nnk_generator_version) version = nullptr;
         [[nodiscard]] bool loaded() const noexcept { return handle != nullptr; }
     };
     mutable std::shared_ptr<nn::fused::KernelCache> kernel_cache_;
     mutable JitGenerator jit_;
+
+    // P0 网格变体补产状态（ensure_mm_grid_variants_）：结构键 → 本进程已尝试
+    // （成功/失败/生成器未加载任一终态）。失败不重试——否则"生成器不支持"
+    // 会在热路径每次派发重付 shaderc 现编（10–50 ms/次）。
+    mutable std::unordered_set<std::string> mm_variants_attempted_;
+    mutable std::mutex mm_variants_mu_;
 
     // typed JIT（in-kernel f16 直通）失败负缓存：结构级生成/建管线/派发失败
     // 的键不再重试——否则"生成器不支持该形态"会在热路径上每次调用都重付
@@ -1720,6 +1729,10 @@ public:
         JitGenerator next;
         next.handle = h;
         next.generate = reinterpret_cast<decltype(next.generate)>(sym("nnk_generate_spirv"));
+        // 网格变体入口（P0 补产）：可选符号——缺失只意味着变体降级（见
+        // JitGenerator::generate_variant 注释），不视为符号不完整。
+        next.generate_variant =
+            reinterpret_cast<decltype(next.generate_variant)>(sym("nnk_generate_spirv_variant"));
         next.free = reinterpret_cast<decltype(next.free)>(sym("nnk_free_spirv"));
         next.version = reinterpret_cast<decltype(next.version)>(sym("nnk_generator_version"));
         if (!next.generate || !next.free || !next.version)
@@ -1838,6 +1851,104 @@ public:
 #endif
     }
 
+    // ── P0 网格变体补产（JIT 接替已删的 AOT 注册表）────────────────────────
+    // run_fused_gpu 的饥饿网格选择（64-tile WG 数 < EXPR_MATMUL_FINE_MIN_WGS）
+    // 只认 fused_kernels_ 里的 `key#f` / `key#ks`+`key#kr`；11-08 删 AOT 注册表
+    // 后这三个后缀键没有任何生产者（ensure_fused_kernel 原注释也写明"AOT 专属"）
+    // → wgrad 形状永远留在 64-tile 饥饿路径，P0 修复被架空。本函数在纯 matmul
+    // V0 结构首次 JIT 时补齐三变体：
+    //   #f  细 tile（输出块 64²→16²，网格 ×16，逐位与基础键一致）；
+    //   #ks K 切分第一段（每 WG 一段 K 写部分和，PC 7 槽）+
+    //   #kr 伴生归约（跨段升序求和 + 尾链 → 最终输出）。
+    // 资格与生成器同源（spec.matmul、无 fold、raxis<0）；#ks/#kr 额外要求
+    // extras 空（生成器拒绝）。每个结构键每进程只尝试一次（attempted 集合，
+    // 覆盖成功/失败/生成器未加载全部终态——失败重试会在热路径重付 shaderc）。
+    // 任何失败一律降级（打一行告警后留在基础网格路径），绝不阻断基础键路径。
+    // ⚠ #ks/#kr 跨段 K 累加序 ≠ 逐 k 串联 → 移动 GPU 字节锚（AOT 时代已裁定
+    //   放行，见 history「K 切分」条）。
+    // 命名空间：run_fused_gpu 的 shader_name 有两种写法——单表达式路径用裸
+    // 结构键，run_graph_kernel_into_ 用 kernel_cache_key(vkey, psig)（带 v1.
+    // 前缀）；变体注册键必须与所在路径的基础键同源 → 调用方对两种名字各调
+    // 一次（attempted 按 base_name 隔离；.nnk 存储键恒从 raw_key 推导 → 第
+    // 二次调用只补建 pipeline，不重付 shaderc）。
+    void ensure_mm_grid_variants_(const std::string& base_name, const std::string& raw_key,
+                                  const nn::ExprSpec& spec, std::uint32_t prec_sig) const
+    {
+        // 仅 V0（分派哨兵/静态签名变体留后续；#ks/#kr 生成器也拒分派哨兵）
+        if (prec_sig != 0) return;
+        if (!spec.matmul || spec.fold || nn::expr_spec_reduce_axis(spec) >= 0) return;
+        {
+            std::lock_guard lk(mm_variants_mu_);
+            if (!mm_variants_attempted_.insert(base_name).second) return;
+        }
+        // 生成器不可用 → 本进程整体降级（不重试 dlopen；基础键同样依赖它，
+        // 走到这里的前提通常是缓存命中，基础键可跑、变体缺席只影响饥饿网格）
+        if (!ensure_generator_() || jit_.generate_variant == nullptr) return;
+        struct Var
+        {
+            const char* suffix;
+            std::uint32_t variant;
+            bool extras_forbidden;     // #ks/#kr/#ksa：多输出结构生成器拒绝
+            bool pure_matmul_only;     // #ksa：仅无尾链纯 matmul（尾链须 #kr 后补跑）
+        };
+        constexpr Var kVars[] = {
+            { nn::EXPR_MM_FINE_SUFFIX, NNK_VARIANT_MM_FINE, false, false },
+            { nn::EXPR_MM_KSPLIT_SUFFIX, NNK_VARIANT_MM_KSPLIT, true, false },
+            { nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX, NNK_VARIANT_MM_KSPLIT_REDUCE, true, false },
+            // 原子单遍（实验 NN_MM_KSPLIT_ATOMIC）：内容与开关无关（键不同 →
+            // 无缓存污染），运行期按 env 决定是否派发；无尾链资格与生成器同源
+            { nn::EXPR_MM_KSPLIT_ATOMIC_SUFFIX, NNK_VARIANT_MM_KSPLIT_ATOMIC, true, true },
+        };
+        const nn::FusedKernelMeta base_meta = nn::fused_kernel_meta_of(spec);
+        bool generated_any = false;
+        for (const auto& v : kVars)
+        {
+            if (v.extras_forbidden && !spec.extras.empty()) continue;
+            if (v.pure_matmul_only && !spec.instrs.empty()) continue;   // 有尾链 → 只走 #ks/#kr
+            const std::string vkey = base_name + v.suffix;
+            if (backend_->has_fused_shader(vkey)) continue;   // 已建（幂等）
+            // .nnk 存储键恒以 raw_key 推导（跨命名空间共享同一份 SPIR-V）
+            const std::string K =
+                nn::fused::kernel_cache_key(raw_key + v.suffix, /*prec_sig=*/0);
+            const std::vector<std::uint32_t>* spv = kernel_cache_->hit(K);
+            std::vector<std::uint32_t> owned;
+            if (spv == nullptr)
+            {
+                const auto spec_bytes = nn::fused::encode_expr_spec(spec);
+                std::uint8_t* buf = nullptr;
+                std::size_t len = 0;
+                nnk_kernel_meta meta{};
+                const nnk_status st =
+                    jit_.generate_variant(spec_bytes.data(), spec_bytes.size(), 0, v.variant,
+                                          &meta, &buf, &len);
+                if (st != NNK_OK || buf == nullptr)
+                {
+                    std::fprintf(stderr, "[mm-variant] %s 生成失败（降级，留基础网格路径）\n",
+                                 vkey.c_str());
+                    continue;
+                }
+                owned.assign(reinterpret_cast<const std::uint32_t*>(buf),
+                             reinterpret_cast<const std::uint32_t*>(buf) + len /
+                                 sizeof(std::uint32_t));
+                jit_.free(buf);
+                spv = &owned;
+                if (auto ir = kernel_cache_->insert(K, *spv); !ir)
+                    std::fprintf(stderr, "[mm-variant] %s 缓存 insert 失败（本进程内存可用）：%s\n",
+                                 vkey.c_str(), ir.error().message.c_str());
+                generated_any = true;
+            }
+            if (auto ek = backend_->ensure_fused_kernel(vkey, *spv, base_meta, spec); !ek)
+                std::fprintf(stderr, "[mm-variant] %s 建管线失败（降级）：%s\n", vkey.c_str(),
+                             ek.error().message.c_str());
+        }
+        if (generated_any)
+        {
+            if (auto pr = persist_cache_(); !pr)
+                std::fprintf(stderr, "[nnk] .nnk 缓存落盘失败（变体本次不写盘，继续执行）：%s\n",
+                             pr.error().message.c_str());
+        }
+    }
+
     // 编译（或缓存命中）得到某 key 的 SPIR-V；miss → 生成器现编 → 内存缓存 insert
     // + 落盘。prec_sig=0（V0）或 EXPR_PREC_SIG_DISPATCH（`#x`）。
     [[nodiscard]] Result<std::vector<std::uint32_t>> jit_compile_(const std::string& key,
@@ -1847,7 +1958,18 @@ public:
         NN_TRY(unused, ensure_cache_());
         (void)unused;
         const std::string K = nn::fused::kernel_cache_key(key, prec_sig);
-        if (const auto* spv = kernel_cache_->hit(K)) return *spv;
+        if (const auto* spv = kernel_cache_->hit(K))
+        {
+            // V0 首见即补网格变体（缓存命中方也走：变体 SPIR-V 可能在盘上缓存、
+            // 但 pipeline 必须本进程懒建；attempted 集合保证每键只付一次成本）。
+            // 两种命名空间各注册一次（裸键 = 单表达式路径；K = 图路径 pname）
+            if (prec_sig == 0)
+            {
+                ensure_mm_grid_variants_(key, key, spec, prec_sig);
+                ensure_mm_grid_variants_(K, key, spec, prec_sig);
+            }
+            return *spv;
+        }
         NN_TRY(unused2, ensure_generator_());
         (void)unused2;
         const auto spec_bytes = nn::fused::encode_expr_spec(spec);
@@ -1871,6 +1993,12 @@ public:
         if (auto pr = persist_cache_(); !pr)
             std::fprintf(stderr, "[nnk] .nnk 缓存落盘失败（本次不写盘，继续执行）：%s\n",
                          pr.error().message.c_str());
+        // P0：同上（miss 路径；两种命名空间各注册一次）
+        if (prec_sig == 0)
+        {
+            ensure_mm_grid_variants_(key, key, spec, prec_sig);
+            ensure_mm_grid_variants_(K, key, spec, prec_sig);
+        }
         return spv;
     }
 

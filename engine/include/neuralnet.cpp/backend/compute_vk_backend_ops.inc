@@ -193,6 +193,12 @@ run_fused_gpu(const std::string& shader_name,
     // ⚠ 跨段 K 累加序 ≠ 逐 k 串联 → **移动 GPU 字节锚**（已裁定放行，
     // 与 P2-2 同处置：重测 + 更新 §12 + history 记新旧值）。
     bool use_ks = false;
+    // ── 原子单遍选择（实验 NN_MM_KSPLIT_ATOMIC，键 #ksa）──────────────────
+    // 满足：开关开 + #ksa 已注册（⇒ 无尾链纯 matmul V0，与生成器同源）+
+    // 输出为本调用自有分配（fill0 只能清自有 buffer——override/别名路径
+    // 可能与输入共享存储，原子累加会踩数据 → 回落两段式）。
+    // 与 #ks 同一套 S/span 公式；优先于两段式（省 #kr）。
+    bool use_ksa = false;
     std::uint32_t ks_s = 0; // 段数 S
     std::uint32_t ks_span = 0; // 段宽（16 对齐）
     if (has_mm && raxis < 0 && !is_fold && !mm_fine_disabled())
@@ -206,10 +212,15 @@ run_fused_gpu(const std::string& shader_name,
         if (wg64 < nn::EXPR_MATMUL_FINE_MIN_WGS &&
             fused_kernels_.count(shader_name + nn::EXPR_MM_FINE_SUFFIX) != 0)
             use_fine = true;
-        if (wg64 < nn::EXPR_MATMUL_FINE_MIN_WGS && !is_disp && !mm_ksplit_disabled() &&
-            extra_outs.empty() && matmul_k && *matmul_k > 0 &&
+        const bool has_two_pass =
+            !is_disp && !mm_ksplit_disabled() && extra_outs.empty() && matmul_k && *matmul_k > 0 &&
             fused_kernels_.count(shader_name + nn::EXPR_MM_KSPLIT_SUFFIX) != 0 &&
-            fused_kernels_.count(shader_name + nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX) != 0)
+            fused_kernels_.count(shader_name + nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX) != 0;
+        const bool has_atomic =
+            mm_ksplit_atomic_enabled() && output_override == nullptr && !mm_ksplit_disabled() &&
+            matmul_k && *matmul_k > 0 &&
+            fused_kernels_.count(shader_name + nn::EXPR_MM_KSPLIT_ATOMIC_SUFFIX) != 0;
+        if (wg64 < nn::EXPR_MATMUL_FINE_MIN_WGS && (has_two_pass || has_atomic))
         {
             constexpr std::uint32_t Bf = nn::EXPR_MATMUL_BLOCK_FINE;
             const std::uint64_t wg_fine =
@@ -229,13 +240,15 @@ run_fused_gpu(const std::string& shader_name,
                 if (s > nn::EXPR_MATMUL_KSPLIT_MAX_S) s = nn::EXPR_MATMUL_KSPLIT_MAX_S;
                 const std::uint32_t k = *matmul_k;
                 const std::uint32_t span = ((k + s - 1u) / s + 15u) & ~15u; // 上取 16 对齐
-                // 部分和缓冲 = S·rows·cols 个 float，shader 线性索引是 u32
+                // 部分和缓冲 = S·rows·cols 个 float（两段式校验；原子式无缓冲，
+                // 但 dispatch x 含 S、shader 索引仍 u32 → 同界校验保留）
                 const std::uint64_t part =
                     static_cast<std::uint64_t>(s) * rows * static_cast<std::uint64_t>(cols);
                 if (span > 0u && part <= 0xFFFFFFFFull)
                 {
-                    use_ks = true;
-                    use_fine = false; // K 切分独占派发（不走基础/细 tile）
+                    use_ksa = has_atomic;   // 原子优先；否则两段式
+                    use_ks = !has_atomic && has_two_pass;
+                    use_fine = false; // K 切分族独占派发（不走基础/细 tile）
                     ks_s = s;
                     ks_span = span;
                 }
@@ -318,6 +331,114 @@ run_fused_gpu(const std::string& shader_name,
             NN_FAIL("run_fused_gpu: 多输出（extras）要求主输出为 output_override");
         for (const GpuTensor* eo : extra_outs)
             if (eo == nullptr) NN_FAIL("run_fused_gpu: 多输出（extras）含空输出指针");
+    }
+
+    // ── K 切分单遍原子派发（实验 NN_MM_KSPLIT_ATOMIC，键 #ksa）──────────────
+    // 录制：输入屏障 → fill0 输出（**自有分配**——选择处已排除 override；
+    // CAS 累加从 0 起）→ transfer→compute 屏障 → bind #ksa → push（7 槽，
+    // 与 #ks 同源）→ dispatch（与 #ks 同网格：细块 × ks_valid）→ 输出屏障。
+    // 省部分和缓冲与 #kr 二段；原子序不定（实验面）。
+    if (use_ksa)
+    {
+        const VulkanPipeline& ksa_pipe =
+            fused_kernels_.at(shader_name + nn::EXPR_MM_KSPLIT_ATOMIC_SUFFIX).pipeline;
+        const std::uint32_t rows32 = static_cast<std::uint32_t>(rows);
+        const std::uint32_t cols32 = static_cast<std::uint32_t>(cols);
+        const std::uint32_t k32 = *matmul_k;
+
+        // PC：{count, cols, rows, mm_k, mm_batch, mm_trans, ks_span} + vp + c + rp
+        //（与 #ks 的 pc_ks 逐字段同源，槽位对齐见生成器 PC 声明）
+        const std::size_t tail_bytes =
+            sizeof(Scalar) * consts.size() + sizeof(Scalar) * rparams.size();
+        std::vector<std::uint8_t> pc((7u + n_vp) * sizeof(std::uint32_t) + tail_bytes);
+        std::memcpy(pc.data(), &count, sizeof(std::uint32_t));
+        std::memcpy(pc.data() + 4, &cols32, sizeof(std::uint32_t));
+        std::memcpy(pc.data() + 8, &rows32, sizeof(std::uint32_t));
+        std::memcpy(pc.data() + 12, &k32, sizeof(std::uint32_t));
+        std::memcpy(pc.data() + 16, &matmul_batch, sizeof(std::uint32_t));
+        std::memcpy(pc.data() + 20, &matmul_trans, sizeof(std::uint32_t));
+        std::memcpy(pc.data() + 24, &ks_span, sizeof(std::uint32_t));
+        const std::size_t vp_off = 7u * sizeof(std::uint32_t);
+        for (std::uint32_t i = 0; i < n_vp; ++i)
+            std::memcpy(pc.data() + vp_off + i * sizeof(std::uint32_t), &view_params[i],
+                        sizeof(std::uint32_t));
+        if (!consts.empty())
+            std::memcpy(pc.data() + vp_off + n_vp * sizeof(std::uint32_t), consts.data(),
+                        sizeof(Scalar) * consts.size());
+        if (!rparams.empty())
+            std::memcpy(pc.data() + vp_off + n_vp * sizeof(std::uint32_t) +
+                            sizeof(Scalar) * consts.size(),
+                        rparams.data(), sizeof(Scalar) * rparams.size());
+
+        // 描述符：N 输入 + 最终输出（#ksa 无部分和缓冲）
+        const std::size_t n_in = inputs.size();
+        std::vector<VkBuffer> ksa_bindings(n_in + 1);
+        for (std::size_t i = 0; i < n_in; ++i) ksa_bindings[i] = gpu_vk_impl(*inputs[i]);
+        ksa_bindings[n_in] = gpu_vk_impl(output.buffer());
+        auto dsa_r = alloc_desc_set_for(ksa_pipe.descriptor_layout(), ksa_bindings);
+        NN_TRY_CHECK(dsa_r);
+        VkDescriptorSet ds_ksa = *dsa_r;
+
+        auto cmda_r = acquire_cmd();
+        if (!cmda_r)
+        {
+            release_desc_set_now(ds_ksa);
+            NN_TRY_CHECK(cmda_r);
+        }
+        auto [cmd, owns_cmd] = *cmda_r;
+        std::vector<VkBuffer> in_bufs;
+        in_bufs.reserve(inputs.size());
+        for (const auto* b : inputs) in_bufs.push_back(gpu_vk_impl(*b));
+        record_input_barriers(cmd, in_bufs);
+
+        // 清零输出（原子累加基准；buffer 归本张量专有 → WHOLE_SIZE 安全）
+        vkCmdFillBuffer(cmd, gpu_vk_impl(output.buffer()), 0, VK_WHOLE_SIZE, 0);
+        {
+            VkBufferMemoryBarrier zb{};
+            zb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            zb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            zb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            zb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            zb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            zb.buffer = gpu_vk_impl(output.buffer());
+            zb.offset = 0;
+            zb.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &zb, 0,
+                                 nullptr);
+        }
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ksa_pipe.handle());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ksa_pipe.pipeline_layout(), 0,
+                                1, &ds_ksa, 0, nullptr);
+        vkCmdPushConstants(cmd, ksa_pipe.pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           static_cast<std::uint32_t>(pc.size()), pc.data());
+        {
+            constexpr std::uint32_t Bf = nn::EXPR_MATMUL_BLOCK_FINE;
+            const std::uint32_t m_per = rows32 / matmul_batch;
+            const std::uint32_t ks_valid = (k32 + ks_span - 1u) / ks_span;
+            // 同 #ks：只派有效段；x = 列块序号决定段号（与生成器 slice 同源）
+            const std::uint32_t gx = ((cols32 + Bf - 1u) / Bf) * ks_valid;
+            const std::uint32_t gy = (m_per + Bf - 1u) / Bf;
+            ts_dispatch(cmd, "fused_mm", gx, gy, matmul_batch, shader_name,
+                        nn::EXPR_MM_KSPLIT_ATOMIC_SUFFIX);
+        }
+        record_output_barrier(cmd, gpu_vk_impl(output.buffer()));
+
+        if (owns_cmd)
+        {
+            auto r = submit_and_wait(cmd, ds_ksa);
+            NN_TRY_CHECK(r);
+        }
+        if (profile_ops_enabled())
+        {
+            const long long dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - prof_t0)
+                                     .count();
+            std::fprintf(stderr, "[gpu-profile] fused fold=0 out=%u total=%lldus key=%.16s ksa\n",
+                         static_cast<std::uint32_t>(cols), dt, shader_name.c_str());
+        }
+        return output;
     }
 
     // ── K 切分两段派发（use_ks，选择判据见上方）────────────────────────
@@ -635,14 +756,18 @@ run_fused_gpu(const std::string& shader_name,
     }
     else
     {
-        // fold 的 dispatch 分两种（FoldMeta，与生成器分派同源）：
-        //   v1 标量 fold（每线程一行，row=gl_GlobalInvocationID.x）：
+        // fold 的 dispatch 分三种（FoldMeta，与生成器分派同源）：
+        //   v1 标量 fold（每线程一行，row=gl_GlobalInvocationID.x，per=1）：
         //     count=rows×1 → ceil(count/256) 恰 = ceil(rows/256) ✓
+        //   v1 staged（P3-lite：每 WG 32 行、tid<32 计算，per=2，
+        //     见 expr_glsl_gen.hpp fold_v1_staged）：**wg = ceil(rows/32)**
         //   v2 双域 fold（每 WG NR 行，row=wg*NR+ri，EXPR_FOLD_ROWS_PER_WG
-        //     与生成器行循环同源）：**wg = ceil(rows/NR)**
+        //     与生成器行循环同源，per=0）：**wg = ceil(rows/NR)**
         //     （按 ceil(count/256)=ceil(rows×out/256) 派会丢行！）
         const std::uint32_t wg_count =
-            (is_fold && !fmeta.per_thread_row)
+            (is_fold && fmeta.per_thread_row == 2)
+                ? (static_cast<std::uint32_t>(rows) + 31u) / 32u
+            : (is_fold && !fmeta.per_thread_row)
                 ? (static_cast<std::uint32_t>(rows) + nn::EXPR_FOLD_ROWS_PER_WG - 1u) /
                       nn::EXPR_FOLD_ROWS_PER_WG
             : (raxis == 0) ? static_cast<std::uint32_t>(rows)
@@ -887,8 +1012,9 @@ run_fused_gpu(const std::string& shader_name,
 // SPIR-V + 元数据建 pipeline 并插入 fused_kernels_（mutable，运行期可增长，
 // fused_mutex_ 保护）。与 init 预建（destroy.inc §16）同一套 binding/PC 布局
 // 推导——两处漂移会让 vkCmdPushConstants 超 range 被驱动丢弃（假 PASS）。
-// JIT 只产 V0（键 `key`）与 V1 运行期精度分派（键 `key#x`）两种形态；
-// 批量 `#b` / 细 tile `#f` / K 切分 `#ks`/`#kr` 是 AOT 专属网格变体，此处不处理。
+// JIT 产 V0（键 `key`）、V1 运行期精度分派（键 `key#x`）以及**网格变体**
+// `#f`/`#ks`/`#kr`（GpuEngine::ensure_mm_grid_variants_ 补产，接替已删除的
+// AOT 注册表）；三者的绑定/PC 差异与 destroy.inc 的 AOT 预建逐槽同源。
 [[nodiscard]] Result<void> ensure_fused_kernel(const std::string& key,
                                                const std::vector<std::uint32_t>& spirv,
                                                const nn::FusedKernelMeta& meta,
@@ -897,13 +1023,25 @@ run_fused_gpu(const std::string& shader_name,
     if (!initialized_) NN_FAIL("GPU backend not initialized");
     std::lock_guard<std::mutex> lock(fused_mutex_);
     if (fused_kernels_.find(key) != fused_kernels_.end()) return {};   // 已存在（幂等）
-    const bool is_disp = std::string_view(key).ends_with(nn::EXPR_PREC_DISPATCH_SUFFIX);
+    const std::string_view key_sv(key);
+    const bool is_disp = key_sv.ends_with(nn::EXPR_PREC_DISPATCH_SUFFIX);
+    // K 切分伴生归约（#kr）：原输入 0..N-1 + 部分和（N）+ 输出（N+1）——
+    // 比基础键多一个绑定（AOT 时代由"追加一个视图的合成 spec"凑出同式）。
+    const bool is_ks = key_sv.ends_with(nn::EXPR_MM_KSPLIT_SUFFIX);
+    const bool is_kr = key_sv.ends_with(nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX);
+    // 原子单遍（实验 #ksa）：PC 固定头同 #ks（7 槽 = matmul 6 + ks_span）；
+    // 绑定 = N 输入 + 最终输出（无部分和缓冲 → 走默认 n+1 公式）。
+    const bool is_ksa = key_sv.ends_with(nn::EXPR_MM_KSPLIT_ATOMIC_SUFFIX);
     const std::uint32_t n_in = static_cast<std::uint32_t>(spec.views.size());
     const std::uint32_t num_bindings =
         is_disp ? (2u * n_in + 2u)
-                : (n_in + 1u + static_cast<std::uint32_t>(spec.extras.size()));
-    // 分派变体在固定头末尾多一个 uint prec（生成器同位置声明）
-    const std::uint32_t pc_base = meta.pc_base_fixed + (is_disp ? 1u : 0u);
+                : is_kr ? (n_in + 2u)
+                        : (n_in + 1u + static_cast<std::uint32_t>(spec.extras.size()));
+    // 分派变体在固定头末尾多一个 uint prec（生成器同位置声明）；
+    // K 切分第一段（#ks / #ksa）固定头 7 槽（matmul 6 + ks_span，生成器
+    // declare 同位置）——与 destroy.inc `is_ks ? 7u : ...` 同源。
+    const std::uint32_t pc_base =
+        ((is_ks || is_ksa) ? 7u : meta.pc_base_fixed) + (is_disp ? 1u : 0u);
     const std::uint32_t pc_size = static_cast<std::uint32_t>(
         (pc_base + meta.view_param_count) * sizeof(std::uint32_t) +
         sizeof(Scalar) * spec.consts.size() + sizeof(Scalar) * spec.rparams.size());

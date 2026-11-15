@@ -437,8 +437,8 @@ struct FoldSpec
 //     extras 落回各自张量。**仅纯逐元素 spec**（无 matmul/fold/归约）支持；
 //     仅 V0（全 f32）变体生成（`#x`/`#a` 变体跳过——多输出节点同精度融合由
 //     fuse_expr_graph 的精度门禁保证）。属于结构 → 进 key。
-// 上限（校验保证，亦约束 GPU 路径资源）：
-//   - 指令 ≤ 64，寄存器 ≤ 16，输入 ≤ 8，常量 ≤ 16
+// 上限（校验保证，亦约束 GPU 路径资源；数值见文末 EXPR_MAX_* 常量）：
+//   - 指令 ≤ 4096，寄存器 ≤ 255，输入 ≤ 16，常量 ≤ 16，extras ≤ 64
 struct ExprSpec
 {
     std::vector<ExprInstr> instrs;
@@ -451,8 +451,9 @@ struct ExprSpec
     std::vector<std::uint8_t> extras; // P2 额外输出寄存器（槽 1..k；见上）
 };
 
-// 多输出上限（Adam 金刚石 = 3 extras：m/v/delta，主输出 p）
-inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
+// 多输出上限（Adam 金刚石 = 3 extras：m/v/delta，主输出 p）。无定长存储
+// 依赖；上界 = 同 stage 描述符 binding 的设备余量（inputs + 输出 + extras）。
+inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 64;
 
 // ── matmul 段辅助（引擎/校验/生成器共用）──────────────────────────────
 [[nodiscard]] inline bool expr_spec_has_matmul(const ExprSpec& s) noexcept
@@ -631,7 +632,7 @@ struct FusedKernelMeta
     std::uint32_t rparam_count = 0;      // rp push constant 槽数
     std::uint32_t vec_width = 1;         // 每线程元素数（1=标量, 4=vec4）
     std::uint32_t fold_out = 0;          // fold 输出列数（0=非 fold）
-    std::uint32_t fold_per_thread_row = 0; // 1 → v1 标量 fold；0 → v2 双域 fold
+    std::uint32_t fold_per_thread_row = 0; // 0 → v2 双域；1 → v1 每线程一行；2 → v1 staged（每 WG 32 行，见 expr_glsl_gen fold_v1_staged）
     std::uint32_t pc_base_fixed = 2;     // 固定头 uint 槽数（不含 prec/vp/常量池）
 };
 
@@ -848,6 +849,12 @@ inline constexpr const char* EXPR_MM_KSPLIT_SUFFIX = "#ks";
 // （尾链读）+ 部分和（binding N）+ 输出（binding N+1）；PC 固定头 6 槽与
 // matmul 同布局（第 4 槽复用为段数 S，kr 不读 mm_k/mm_trans）。
 inline constexpr const char* EXPR_MM_KSPLIT_REDUCE_SUFFIX = "#kr";
+// 原子单遍 K 切分（**实验开关 NN_MM_KSPLIT_ATOMIC**；键 = 结构 key + "#ksa"）：
+// 段部分和经 CAS（atomicCompSwap，f32 无核心原子 → uint 位型 CAS 环）累加进
+// **已清零的最终输出**——免 #kr 二段与部分和缓冲。资格比 #ks 更严：仅**无
+// 尾链**的纯 matmul（尾链非线性，必须在完整求和之后跑 → 有尾链仍走 #ks/#kr）
+// 且仅 V0 f32。⚠ 原子完成序不定 → **破坏运行间确定性**（ML 可接受，实验面）。
+inline constexpr const char* EXPR_MM_KSPLIT_ATOMIC_SUFFIX = "#ksa";
 
 // 第 i 个输入是否为 f16 / 输出是否为 f16
 // ⚠ in_f16 必须先与 EXPR_PREC_SIG_INPUT_MASK 相与：EXPR_PREC_SIG_DISPATCH
@@ -970,8 +977,11 @@ inline constexpr std::size_t EXPR_MAX_INPUTS =
     16; // 树型 DSL 重复叶子上限（绑定按 spec 实际 views 动态创建，非固定）
 inline constexpr std::size_t EXPR_MAX_CONSTS = 16;
 inline constexpr std::size_t EXPR_MAX_REGS =
-    32; // 全融合分支 select 表达式（如 SwiGLU backward）所需；shader 仅声明实际 num_regs
-inline constexpr std::size_t EXPR_MAX_INSTRS = 64;
+    255; // ExprOperand.idx 为 uint8 的 ABI 天花板（P2 预算同源）；CPU 解释器
+         // 栈数组与 GLSL 槽表同尺寸；shader 仅声明实际 num_regs
+inline constexpr std::size_t EXPR_MAX_INSTRS =
+    4096; // 卫生边界（无定长存储依赖）；GLSL 把指令展开成直线代码，
+          // 超大指令数的代价 = JIT 编译时长与寄存器压力
 // fold 段上限（body/finalize 独立计数，不占顶层 instrs 预算——
 //   两者在 GPU 上分别生成块循环体与收尾段，资源约束与主链解耦）
 inline constexpr std::size_t FOLD_MAX_BODY = 48;
