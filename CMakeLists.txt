@@ -1,4 +1,4 @@
-# ═══════════════════════════════════════════════════════════════════════════
+﻿# ═══════════════════════════════════════════════════════════════════════════
 #  compute.neuralnet.cpp — 计算引擎（引擎 LGPL + 抽象层 MIT）
 #
 #  目标：引擎实现编进独立 .so（libnn-cpu.so / libnn-gpu.so），以抽象层（MIT）
@@ -126,7 +126,7 @@ if(NN_ENABLE_GPU)
             add_custom_command(
                 OUTPUT ${SPV}
                 COMMAND ${GLSLC} -I ${SHADER_DIR} ${ARGN} -o ${SPV} ${SRC_FILE}
-                DEPENDS ${SRC_FILE} ${SHADER_DIR}/nn_f16_rne.glsl
+                DEPENDS ${SRC_FILE} ${SHADER_DIR}/nn_f16_rne.glsl ${SHADER_DIR}/mm_swz.glsl
                 COMMENT "[GPU] Compiling ${SHADER_NAME}.comp → ${SHADER_NAME}.spv")
             add_custom_command(
                 OUTPUT ${HPP}

@@ -40,6 +40,8 @@
 
 #version 450
 
+#include "mm_swz.glsl"   // 必须在 #version 之后、不在 F16 条件分支内
+
 // ── 精度变体（编译期开关：glslc -DNN_SHADER_F16=1）────────────────────────
 // 默认（无宏）= 全 f32（f32 分支宏展开与裸写 f32 代码逐字同形 →
 // SPIR-V 字节零差异）。
@@ -105,6 +107,10 @@ const uint EPT_B = (BK * BN) / 256u;
 shared vec4 Ash[2][BK][BM / 4];
 shared vec4 Bsh[2][BK][BN / 4];
 
+// bank swizzle（与 matmul_tiled_v2 同式，见 mm_swz.glsl）：标量散布写 4-way -> 1-way
+#define SWZ_A(k, slot) MM_SWZ((k), (slot), BM / 4u)
+#define SWZ_B(k, slot) MM_SWZ((k), (slot), BN / 4u)
+
 // ── 协作加载 A 分块 BM×BK → 指定 stage（base = b*M*K）────────────────────
 void load_A_tile(uint t, uint stage, uint tid, uint block_row, uint base)
 {
@@ -127,17 +133,17 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row, uint base)
             if (aligned && gr < M && gc < K)
             {
                 const vec4 v = NN_LOADV4(Av4, (base + gr * K + gc) >> 2);
-                Ash[stage][k0    ][m >> 2][m & 3u] = v.x;
-                Ash[stage][k0 + 1u][m >> 2][m & 3u] = v.y;
-                Ash[stage][k0 + 2u][m >> 2][m & 3u] = v.z;
-                Ash[stage][k0 + 3u][m >> 2][m & 3u] = v.w;
+                Ash[stage][k0    ][SWZ_A(k0, m >> 2)][m & 3u] = v.x;
+                Ash[stage][k0 + 1u][SWZ_A(k0 + 1u, m >> 2)][m & 3u] = v.y;
+                Ash[stage][k0 + 2u][SWZ_A(k0 + 2u, m >> 2)][m & 3u] = v.z;
+                Ash[stage][k0 + 3u][SWZ_A(k0 + 3u, m >> 2)][m & 3u] = v.w;
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
                     const float v = (gr < M && gc + j < K) ? NN_RD(A[base + gr * K + gc + j]) : 0.0;
-                    Ash[stage][k0 + j][m >> 2][m & 3u] = v;
+                    Ash[stage][k0 + j][SWZ_A(k0 + j, m >> 2)][m & 3u] = v;
                 }
             }
         }
@@ -150,14 +156,14 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row, uint base)
             const uint gr = block_row + mq * 4u;
             if (aligned && gc < K && gr < M)
             {
-                Ash[stage][k][mq] = NN_LOADV4(Av4, (base + gc * M + gr) >> 2);
+                Ash[stage][k][SWZ_A(k, mq)] = NN_LOADV4(Av4, (base + gc * M + gr) >> 2);
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
                     const float v = (gr + j < M && gc < K) ? NN_RD(A[base + gc * M + gr + j]) : 0.0;
-                    Ash[stage][k][mq][j] = v;
+                    Ash[stage][k][SWZ_A(k, mq)][j] = v;
                 }
             }
         }
@@ -186,14 +192,14 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col, uint base)
             if (aligned && gr < K && gc < N)
             {
                 const vec4 v = NN_LOADV4(Bv4, (base + gr * N + gc) >> 2);
-                Bsh[stage][k][n0 >> 2] = v;
+                Bsh[stage][k][SWZ_B(k, n0 >> 2)] = v;
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
                     const float v = (gr < K && gc + j < N) ? NN_RD(B[base + gr * N + gc + j]) : 0.0;
-                    Bsh[stage][k][(n0 + j) >> 2][(n0 + j) & 3u] = v;
+                    Bsh[stage][k][SWZ_B(k, (n0 + j) >> 2)][(n0 + j) & 3u] = v;
                 }
             }
         }
@@ -208,14 +214,14 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col, uint base)
             {
                 const vec4 v = NN_LOADV4(Bv4, (base + gc * K + gr) >> 2);
                 for (uint j = 0u; j < 4u; ++j)
-                    Bsh[stage][k0 + j][n >> 2][n & 3u] = v[j];
+                    Bsh[stage][k0 + j][SWZ_B(k0 + j, n >> 2)][n & 3u] = v[j];
             }
             else
             {
                 for (uint j = 0u; j < 4u; ++j)
                 {
                     const float v = (gr + j < K && gc < N) ? NN_RD(B[base + gc * K + gr + j]) : 0.0;
-                    Bsh[stage][k0 + j][n >> 2][n & 3u] = v;
+                    Bsh[stage][k0 + j][SWZ_B(k0 + j, n >> 2)][n & 3u] = v;
                 }
             }
         }
@@ -264,8 +270,8 @@ void main()
         #pragma unroll 4
         for (uint k = 0u; k < BK; ++k)
         {
-            const vec4 a_vec = Ash[stage][k][ty];
-            const vec4 b_vec = Bsh[stage][k][tx];
+            const vec4 a_vec = Ash[stage][k][SWZ_A(k, ty)];
+            const vec4 b_vec = Bsh[stage][k][SWZ_B(k, tx)];
 
             acc[0] += a_vec.x * b_vec;
             acc[1] += a_vec.y * b_vec;
