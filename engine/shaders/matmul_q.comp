@@ -17,6 +17,15 @@
 //
 // 精度变体（glslc -DNN_SHADER_F16=1）：B/C 声明 float16_t（f32 参考累加 + 写出
 // RNE，同所有原语惯例）；打包字缓冲恒 uint。
+//
+// 【2026-11-15 两项微优化，逐位不变】
+// ① bank swizzle（P1 旧式，与 matmul_tiled 现行同式；involution，写读同式）：
+//    原实现 A/B 分块的标量散布写 4-way bank 冲突（q 比稠密路径更狠——A 装载
+//    整条是解码后的标量 STS）。SLOTS=16 ≥ 8，旧式到 2-way。
+// ② 整字解码：BK=16 且 BM%16==0 ⇒ 同一 4 元素组的 (cj>>4) 恒相同，4 次同址
+//    P[] 读退化为 1 次 LDG + 4 次移位；三值解码走 mm_trit（≡ float(c)-2.0
+//    逐位，避 I2F）。**不含 τ 外提（TAU_HOIST 语义）**——那条改舍入路径，
+//    须另立 A/B（默认保持逐元素 τ·trit）。
 // ─────────────────────────────────────────────────────────────────────────
 #version 450
 
@@ -64,11 +73,27 @@ const uint EPT_B = (BK * BN) / 256u;   // 4
 shared vec4 Ash[2][BK][BM / 4];
 shared vec4 Bsh[2][BK][BN / 4];
 
+// ── Bank swizzle（P1 旧式；写读同式，involution）─────────────────────────
+// 与 matmul_tiled 现行同式：slot ^ ((k>>2) & (SLOTS-1))，SLOTS = BM/4 = 16。
+// 三方 A/B（2026-11-15，none/old/new 同窗 3 轮）：swizzle 对 none **−4~−17%**；
+// old 与 new 差在噪声内（sq2048 4.36 vs 4.37、wideN 33.3 vs 33.4 ms）→ 落 old
+// （与 matmul_tiled 一致；mm_swz 新式在 tiled 上 1024³ +24% 曾否决）。
+#define SWZ_A(k, slot) ((slot) ^ (((k) >> 2) & (BM / 4u - 1u)))
+#define SWZ_B(k, slot) ((slot) ^ (((k) >> 2) & (BN / 4u - 1u)))
+
+// 2-bit 码 → 三值（≡ float(code) - 2.0 逐位：2^23|c − (2^23+2)，Sterbenz 精确）
+float mm_trit(uint code)
+{
+    return uintBitsToFloat(0x4b000000u | code) - 8388610.0;
+}
+
 // ── A 分块装载（**解码**）：BM×BK 元素，每线程 4 个 ───────────────────────
 // 分组与 matmul_tiled 的 A 装载一致（按连续维取 4 元素组），只是每个元素都
 // 由"打包字 → 2 bit 码 → 三值 → ×τ"得到：
 //   transA=0：4 个连续 k（同一存储行 m）→ 同一行、k0..k0+3，字内不同 2-bit 槽
 //   transA=1：4 个连续 m（同一存储行 k）
+// 整字解码前提（BK==16 且 BM%16==0，本文件常量保证）：组内 (cj>>4) 恒同 ⇒
+// 只读 1 次 P[]；越界组按 cmax 判 0（字读不到/元素判 0，覆盖与逐元素读相同）。
 void load_A_tile(uint t, uint stage, uint tid, uint block_row)
 {
     const uint k_contig = (transA == 0u) ? 1u : 0u;
@@ -79,12 +104,14 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row)
         uint sr;      // 存储行
         uint c0;      // 该组第一个"列"（= k 或 m）
         uint cmax;    // 列上限（= K 或 M）
+        uint rmax;    // 存储行上限（= M 或 K）
         if (k_contig != 0u)
         {
             const uint m = (4u * g) / BK;
             c0 = t * BK + (4u * g) % BK;
             sr = block_row + m;
             cmax = K;
+            rmax = M;
         }
         else
         {
@@ -93,29 +120,29 @@ void load_A_tile(uint t, uint stage, uint tid, uint block_row)
             c0 = block_row + mq * 4u;     // 列 = m
             sr = t * BK + k;              // 存储行 = k
             cmax = M;
+            rmax = K;
         }
-        const float tau = (sr < ((k_contig != 0u) ? M : K)) ? T[sr] : 0.0;
+        const bool inrow = (sr < rmax);
+        const uint word = (inrow && c0 < cmax) ? P[sr * wpr + (c0 >> 4u)] : 0u;
+        const float tau = inrow ? T[sr] : 0.0;
         for (uint j = 0u; j < 4u; ++j)
         {
             const uint cj = c0 + j;
             float v = 0.0;
-            if (cj < cmax && sr < ((k_contig != 0u) ? M : K))
-            {
-                const uint word = P[sr * wpr + (cj >> 4u)];
-                v = tau * (float((word >> (2u * (cj & 15u))) & 3u) - 2.0);
-            }
+            if (inrow && cj < cmax)
+                v = tau * mm_trit((word >> (2u * (cj & 15u))) & 3u);
             if (k_contig != 0u)
             {
                 // 组内 4 个连续 k：k0 = c0 - t*BK
                 const uint k0 = c0 - t * BK;
                 const uint m = sr - block_row;
-                Ash[stage][k0 + j][m >> 2][m & 3u] = v;
+                Ash[stage][k0 + j][SWZ_A(k0 + j, m >> 2)][m & 3u] = v;
             }
             else
             {
                 const uint k = sr - t * BK;
                 const uint m = cj - block_row;   // 组内 4 个连续 m
-                Ash[stage][k][m >> 2][m & 3u] = v;
+                Ash[stage][k][SWZ_A(k, m >> 2)][m & 3u] = v;
             }
         }
     }
@@ -131,21 +158,20 @@ void load_B_tile(uint t, uint stage, uint tid, uint block_col)
     {
         const uint g = tid * groups + vv;
         const uint k  = (4u * g) / BN;
-        const uint n0 = (4u * g) % BN;
+        const uint n0 = (4u * g) % BN;      // %4==0：4 元素恰占一个槽
         const uint gr = b_base_row + k;
         const uint gc = block_col + n0;
         if (aligned && gr < K && gc < N)
         {
-            const vec4 v = NN_LOADV4(Bv4, (gr * N + gc) >> 2);
-            for (uint j = 0u; j < 4u; ++j)
-                Bsh[stage][k][(n0 + j) >> 2][(n0 + j) & 3u] = v[j];
+            // 整槽 STS.128（n0%4==0 ⇒ 槽 (n0>>2) 的 .x..w）+ swizzle
+            Bsh[stage][k][SWZ_B(k, n0 >> 2)] = NN_LOADV4(Bv4, (gr * N + gc) >> 2);
         }
         else
         {
             for (uint j = 0u; j < 4u; ++j)
             {
                 const float v = (gr < K && gc + j < N) ? NN_RD(B[gr * N + gc + j]) : 0.0;
-                Bsh[stage][k][(n0 + j) >> 2][(n0 + j) & 3u] = v;
+                Bsh[stage][k][SWZ_B(k, (n0 + j) >> 2)][(n0 + j) & 3u] = v;
             }
         }
     }
@@ -181,8 +207,8 @@ void main()
         #pragma unroll 4
         for (uint k = 0u; k < BK; ++k)
         {
-            const vec4 a_vec = Ash[stage][k][ty];
-            const vec4 b_vec = Bsh[stage][k][tx];
+            const vec4 a_vec = Ash[stage][k][SWZ_A(k, ty)];
+            const vec4 b_vec = Bsh[stage][k][SWZ_B(k, tx)];
             acc[0] += a_vec.x * b_vec;
             acc[1] += a_vec.y * b_vec;
             acc[2] += a_vec.z * b_vec;
