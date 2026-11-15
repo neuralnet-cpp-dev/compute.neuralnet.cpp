@@ -1934,9 +1934,10 @@ template <Precision P> [[nodiscard]] Result<GpuTensorT<P>> clone_gpu(const GpuTe
     vkCmdPushConstants(cmd, pipe->pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        static_cast<uint32_t>(pc.size()), pc.data());
 
-    const std::uint64_t total = static_cast<std::uint64_t>(M) * N;
-    const std::uint32_t gw = static_cast<std::uint32_t>((total + 255u) / 256u);
-    vkCmdDispatch(cmd, gw < 1u ? 1u : gw, 1u, 1u);
+    // 分块内核（16×16 线程 / 64×64 tile）：2D 网格 = (ceil(N/BN), ceil(M/BM))
+    const std::uint32_t gx = (N + 63u) / 64u;
+    const std::uint32_t gy = (M + 63u) / 64u;
+    vkCmdDispatch(cmd, gx < 1u ? 1u : gx, gy < 1u ? 1u : gy, 1u);
     record_output_barrier(cmd, gpu_vk_impl(y));
 
     if (owns_cmd)
