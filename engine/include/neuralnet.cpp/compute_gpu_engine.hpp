@@ -1806,7 +1806,7 @@ public:
             }
             if (!disk_bytes.empty())
             {
-                auto disk = nn::KeyValueRecord::parse(disk_bytes);
+                auto disk = kvrec::KeyValueRecord::parse(disk_bytes);
                 if (disk)
                 {
                     std::string dgen;

@@ -25,10 +25,13 @@
 #include <neuralnet.cpp/core_env.hpp>
 #include <exstl/errors.hpp>
 #include <neuralnet.cpp/expr_spec.hpp>
-#include <neuralnet.cpp/model_keyvalue_record.hpp>
+#include <kvrec/kvrecord.hpp>
 
 namespace nn::fused
 {
+
+// KVRecord 实体在 kvrec submodule（namespace kvrec）；本头 API 用裸名
+using kvrec::KeyValueRecord;
 
 // 生成器版本：只在**代码生成语义变化**时 bump（非每次 release；避免无关升级
 // 频繁作废缓存）。进 K 的版本组件与 .nnk 的 generator_version 字段。
