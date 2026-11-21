@@ -117,8 +117,11 @@ if(WIN32)
     # undefined symbol）
     set_target_properties(nn_cpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
+# abstraction 公开头（precision/kernel_cache/…）include exstl/kvrec ⇒ 消费方
+# 测试必须拿到它们的 INTERFACE include；PRIVATE 只链会让 consumer_test 等
+# 「只 link nn_cpu」的目标缺 -I（CI 实测 exstl/errors.hpp not found）。
 target_include_directories(nn_cpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp)
-target_link_libraries(nn_cpu PRIVATE exstl::exstl kvrec::kvrec Threads::Threads)
+target_link_libraries(nn_cpu PUBLIC exstl::exstl kvrec::kvrec PRIVATE Threads::Threads)
 set_target_properties(nn_cpu PROPERTIES
     OUTPUT_NAME nn-cpu
     CXX_VISIBILITY_PRESET default
@@ -216,7 +219,7 @@ if(NN_ENABLE_GPU)
             target_compile_definitions(nn_gpu PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
         endif()
         target_include_directories(nn_gpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${GENERATED_INCLUDE})
-        target_link_libraries(nn_gpu PRIVATE exstl::exstl kvrec::kvrec Threads::Threads Vulkan::Vulkan)
+        target_link_libraries(nn_gpu PUBLIC exstl::exstl kvrec::kvrec PRIVATE Threads::Threads Vulkan::Vulkan)
         target_compile_definitions(nn_gpu PRIVATE NN_HAS_VULKAN=1)
         add_custom_target(gpu_generated DEPENDS ${GPU_GENERATED_HPP})
         add_dependencies(nn_gpu gpu_generated)
@@ -248,7 +251,7 @@ if(SHADERC_INCLUDE_DIR AND SHADERC_LIBRARY)
         set_target_properties(nn_kernelgen PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
     endif()
     target_include_directories(nn_kernelgen PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${SHADERC_INCLUDE_DIR})
-    target_link_libraries(nn_kernelgen PRIVATE exstl::exstl kvrec::kvrec Threads::Threads ${SHADERC_LIBRARY})
+    target_link_libraries(nn_kernelgen PUBLIC exstl::exstl kvrec::kvrec PRIVATE Threads::Threads ${SHADERC_LIBRARY})
     set_target_properties(nn_kernelgen PROPERTIES
         OUTPUT_NAME nn-kernelgen
         CXX_VISIBILITY_PRESET default
@@ -307,6 +310,9 @@ function(nn_add_engine_test name)
     target_include_directories(${name} PRIVATE
         ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE}
         ${ENGINE_INCLUDE}/neuralnet.cpp ${NN_TESTS_DIR})
+    # 线程池等直接 include <exstl/…> 的目标不链 nn_cpu，须显式挂上；
+    # 其余经 nn_cpu/nn_gpu PUBLIC 已传递，重复链接无害。
+    target_link_libraries(${name} PRIVATE exstl::exstl kvrec::kvrec)
     if(NN_HAVE_MAIN_HEADERS)
         target_include_directories(${name} PRIVATE ${NN_MAIN_INCLUDE})
     endif()

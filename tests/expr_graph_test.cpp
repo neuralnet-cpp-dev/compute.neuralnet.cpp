@@ -1461,18 +1461,35 @@ void test_fold_ash_tier_and_dead_store()
         const std::string g = glsl->generate("fold_tier", spec);
         lab = "tier GLSL 生成 mm_k=" + std::to_string(t.mm_k);
         CHECK(!g.empty(), lab.c_str());
-        // make_fold_mm_chain 带 mm+vecacc → invert_kv → Ash[2][cap]
-        const std::string want = "shared float Ash[2][" + std::to_string(t.cap) + "];";
+        // 默认 invert 关（NN_FOLD_INVERT=1 才开，见 expr_glsl_gen）→ 单槽
+        // Ash[cap]；invert 时才是 Ash[2][cap]。此处锁默认路径声明。
+        const std::string want = "shared float Ash[" + std::to_string(t.cap) + "];";
         lab = "Ash 分档声明 mm_k=" + std::to_string(t.mm_k) + " want=" + want;
         CHECK(g.find(want) != std::string::npos, lab.c_str());
         for (const Tier& o : tiers)
         {
             if (o.cap == t.cap) continue;
-            const std::string other = "shared float Ash[2][" + std::to_string(o.cap) + "];";
+            const std::string other = "shared float Ash[" + std::to_string(o.cap) + "];";
             lab = "非本档 Ash 声明不得出现 mm_k=" + std::to_string(t.mm_k) + " vs " +
                   std::to_string(o.mm_k);
             CHECK(g.find(other) == std::string::npos, lab.c_str());
         }
+        // invert 开启时（同进程设 env 再生成）→ 二维 Ash[2][cap]
+        // ⚅ getenv 在生成器内每次读取，可进程内切换（与 NN_IRC_* 同哲学）。
+#if !defined(_WIN32)
+        setenv("NN_FOLD_INVERT", "1", 1);
+#else
+        _putenv_s("NN_FOLD_INVERT", "1");
+#endif
+        const std::string gi = glsl->generate("fold_tier_inv", spec);
+        const std::string want_i = "shared float Ash[2][" + std::to_string(t.cap) + "];";
+        lab = "invert Ash 分档 mm_k=" + std::to_string(t.mm_k) + " want=" + want_i;
+        CHECK(gi.find(want_i) != std::string::npos, lab.c_str());
+#if !defined(_WIN32)
+        unsetenv("NN_FOLD_INVERT");
+#else
+        _putenv_s("NN_FOLD_INVERT", "");
+#endif
     }
     // 键保持：非 fold、fold 无 mm 段（无 Ash 预载 → 不分档）
     std::string vkey_st;
