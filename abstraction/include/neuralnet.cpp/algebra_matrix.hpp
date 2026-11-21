@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <algorithm>
 #include <array>
@@ -19,10 +19,10 @@
 #include <utility>
 #include <vector>
 
-#include <neuralnet.cpp/core_errors.hpp>
-#include <neuralnet.cpp/core_assert.hpp>
-#include <neuralnet.cpp/core_threadpool.hpp>
-#include <neuralnet.cpp/core_parallel.hpp>   // nn::parallel_for_blocks / parallel_for_samples
+#include <exstl/errors.hpp>
+#include <exstl/assert.hpp>
+#include <exstl/threadpool.hpp>
+#include <exstl/parallel.hpp>   // exstl::parallel_for_blocks / parallel_for_samples
 #include <neuralnet.cpp/core_config.hpp>
 #include "algebra_span.hpp"
 
@@ -78,13 +78,13 @@ struct HostAllocLedger
 //  Matrix 类 — 矩阵存储与运算原语
 //
 //  错误处理约定（与上层 L2 计算层不同）：
-//    - L1 代数层用 **NN_ASSERT_ALWAYS / NN_FATAL** 做形状与索引校验
+//    - L1 代数层用 **EX_ASSERT_ALWAYS / EX_FATAL** 做形状与索引校验
 //      （编程错误检查，Release 也终止——RV-01：断言后仍会按错误形状索引
-//       = OOB，NN_ASSERT 在 NDEBUG 下展开为空会静默 UB）。
-//      NN_ASSERT（可选诊断）只保留给"失败不影响后续正确性"的检查。
-//    - L2+ 计算层使用 Result<T> 进行运行时错误处理（用户输入校验）
+//       = OOB，EX_ASSERT 在 NDEBUG 下展开为空会静默 UB）。
+//      EX_ASSERT（可选诊断）只保留给"失败不影响后续正确性"的检查。
+//    - L2+ 计算层使用 exstl::Result<T> 进行运行时错误处理（用户输入校验）
 //    - 原因：Matrix 是底层原语，一次 size_t 比较不影响 Release 性能；
-//            上层需要向用户报告错误，故使用 Result<T>
+//            上层需要向用户报告错误，故使用 exstl::Result<T>
 //    - 参见 docs/contributors/cpp-standards.md "分层职责单一" 章节
 // ═══════════════════════════════════════════════════════════════════════
 // ── MatrixT<P> — 类型化矩阵存储（docs/development/05-mixed-precision.md D2：存储精度是 P）──
@@ -171,14 +171,14 @@ private:
             // **绝不静默 OOB**（RV-01）：形状不匹配在 L1 是编程错误
             // （用户输入已在引擎入口经 Result 校验，见 ComputeEngine::add_inplace），
             // 此处 fail-fast 中止，代价为两次 size_t 比较，不影响热路径。
-            // 统一走 NN_FATAL（= 无条件终止 + file:line），不再手抄三段式；
+            // 统一走 EX_FATAL（= 无条件终止 + file:line），不再手抄三段式；
             // 详情经 snprintf 组装（message 是 string_view，**不保证** NUL 结尾，
             // 不能直接当 %s 实参）。
             char detail[192];
             std::snprintf(detail, sizeof(detail), "Matrix 形状不匹配: %.*s (%zux%zu vs %zux%zu)",
                           static_cast<int>(message.size()), message.data(), lhs.rows_, lhs.cols_,
                           rhs.rows_, rhs.cols_);
-            NN_FATAL(detail);
+            EX_FATAL(detail);
         }
     }
 
@@ -284,12 +284,12 @@ public:
     [[nodiscard]] constexpr bool empty() const noexcept { return size_ == 0; }
     [[nodiscard]] element at(std::size_t row, std::size_t col) const
     {
-        if (row >= rows_ || col >= cols_) { NN_FATAL("MatrixT::at index out of range"); }
+        if (row >= rows_ || col >= cols_) { EX_FATAL("MatrixT::at index out of range"); }
         return ptr()[index(row, col)];
     }
     void set_value(std::size_t row, std::size_t col, element value)
     {
-        if (row >= rows_ || col >= cols_) { NN_FATAL("MatrixT::set_value index out of range"); }
+        if (row >= rows_ || col >= cols_) { EX_FATAL("MatrixT::set_value index out of range"); }
         ptr()[index(row, col)] = value;
     }
     [[nodiscard]] element at_unchecked(std::size_t row, std::size_t col) const noexcept
@@ -308,7 +308,7 @@ public:
     // ── 转置到预分配缓冲区（零分配热路径） ─────────────────────────────
     void transpose_to(MatrixT& result) const
     {
-        NN_ASSERT_ALWAYS(&result != this, "transpose_to: self-referencing not supported");
+        EX_ASSERT_ALWAYS(&result != this, "transpose_to: self-referencing not supported");
         result.resize(cols_, rows_);
         if (rows_ == 0 || cols_ == 0) return;
 
@@ -320,7 +320,7 @@ public:
         const std::size_t i_blocks = (R + BLOCK_SIZE - 1) / BLOCK_SIZE;
         const std::size_t j_blocks = (C + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-        // 通过 nn::parallel_for_blocks 分发块级并行：分块数很少（1~几十），但其内循环计算量大。
+        // 通过 exstl::parallel_for_blocks 分发块级并行：分块数很少（1~几十），但其内循环计算量大。
         const auto n_blocks = i_blocks * j_blocks;
         if (n_blocks <= 1)
         {
@@ -331,7 +331,7 @@ public:
         else
         {
             auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-            nn::parallel_for_blocks(block_indices.begin(), block_indices.end(),
+            exstl::parallel_for_blocks(block_indices.begin(), block_indices.end(),
                                     [src, dst, R, C, j_blocks](std::size_t block_idx) noexcept
                                     {
                                         const std::size_t ib = block_idx / j_blocks;
@@ -409,7 +409,7 @@ public:
                                  std::size_t b_cols)
     {
         // RV-01：内维不匹配后**仍会**按 K = a_cols 索引 B → 必须无条件终止
-        NN_ASSERT_ALWAYS(a_cols == b_rows, "multiply_to_span: inner dimension mismatch");
+        EX_ASSERT_ALWAYS(a_cols == b_rows, "multiply_to_span: inner dimension mismatch");
         const std::size_t K = a_cols;
         if (M == 0 || N == 0 || K == 0) return;
 
@@ -423,7 +423,7 @@ public:
             const std::size_t nb = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             // 工作量门控：每样本一块 64 行 × N 列 × K 次乘加。窄 N 下这块
             // 工作量常低于并行区固定开销，样本数不能单独作为并行依据。
-            nn::parallel_for_samples(nb, BLOCK_SIZE * N * K,
+            exstl::parallel_for_samples(nb, BLOCK_SIZE * N * K,
                                      [a, b, r, M, N, K, b_cols](std::size_t ib) noexcept
                                      {
                                          const std::size_t i0 = ib * BLOCK_SIZE;
@@ -499,7 +499,7 @@ public:
         else
         {
             auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-            nn::parallel_for_blocks(block_indices.begin(), block_indices.end(), kernel);
+            exstl::parallel_for_blocks(block_indices.begin(), block_indices.end(), kernel);
         }
     }
 
@@ -510,7 +510,7 @@ public:
                                             std::size_t /*bt_rows*/, std::size_t bt_cols)
     {
         // RV-01：同 multiply_to_span——内维不匹配即越界读，必须无条件终止
-        NN_ASSERT_ALWAYS(a_cols == bt_cols,
+        EX_ASSERT_ALWAYS(a_cols == bt_cols,
                          "multiply_transposed_to_span: inner dimension mismatch");
         const std::size_t K = a_cols;
         if (M == 0 || N == 0 || K == 0) return;
@@ -521,7 +521,7 @@ public:
         {
             const std::size_t nb = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             // 工作量门控口径同上：每样本 64 行 × N 列 × K 次乘加
-            nn::parallel_for_samples(nb, BLOCK_SIZE * N * K,
+            exstl::parallel_for_samples(nb, BLOCK_SIZE * N * K,
                                      [a, bt, r, M, N, K](std::size_t ib) noexcept
                                      {
                                          const std::size_t i0 = ib * BLOCK_SIZE;
@@ -593,7 +593,7 @@ public:
         else
         {
             auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-            nn::parallel_for_blocks(block_indices.begin(), block_indices.end(), kernel);
+            exstl::parallel_for_blocks(block_indices.begin(), block_indices.end(), kernel);
         }
     }
 
@@ -604,7 +604,7 @@ public:
                                            std::size_t b_rows, std::size_t b_cols)
     {
         // RV-01：同 multiply_to_span——内维不匹配即越界读，必须无条件终止
-        NN_ASSERT_ALWAYS(a_rows == b_rows, "transpose_multiply_to_span: inner dimension mismatch");
+        EX_ASSERT_ALWAYS(a_rows == b_rows, "transpose_multiply_to_span: inner dimension mismatch");
         const std::size_t K = a_rows;  // a is (K, M) stored
         if (M == 0 || N == 0 || K == 0) return;
 
@@ -614,7 +614,7 @@ public:
         {
             const std::size_t nb = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             // 工作量门控口径同上：每样本 64 行 × N 列 × K 次乘加
-            nn::parallel_for_samples(nb, BLOCK_SIZE * N * K,
+            exstl::parallel_for_samples(nb, BLOCK_SIZE * N * K,
                                      [a, b, r, M, N, K, a_cols, b_cols](std::size_t ib) noexcept
                                      {
                                          const std::size_t i0 = ib * BLOCK_SIZE;
@@ -693,7 +693,7 @@ public:
         else
         {
             auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-            nn::parallel_for_blocks(block_indices.begin(), block_indices.end(), kernel);
+            exstl::parallel_for_blocks(block_indices.begin(), block_indices.end(), kernel);
         }
     }
 
@@ -701,7 +701,7 @@ public:
     // 使用 std::span（C++20）提供类型安全的非拥有视图
     void multiply_to(MatrixT& result, const MatrixT& other) const
     {
-        NN_ASSERT_ALWAYS(&result != this, "multiply_to: self-referencing not supported");
+        EX_ASSERT_ALWAYS(&result != this, "multiply_to: self-referencing not supported");
         const std::size_t M = rows_;
         const std::size_t N = other.cols_;
         const std::size_t K = cols_;
@@ -726,9 +726,9 @@ public:
     // 委托给 span 版内核：GEMM 内核只保留一份，避免两处实现漂移。
     void multiply_transposed_to(MatrixT& result, const MatrixT& b_trans) const
     {
-        NN_ASSERT_ALWAYS(&result != this && &result != &b_trans,
+        EX_ASSERT_ALWAYS(&result != this && &result != &b_trans,
                          "multiply_transposed_to: self-referencing not supported");
-        NN_ASSERT_ALWAYS(cols_ == b_trans.cols_,
+        EX_ASSERT_ALWAYS(cols_ == b_trans.cols_,
                          "multiply_transposed_to: inner dimensions mismatch");
         const std::size_t M = rows_;
         const std::size_t K = cols_;
@@ -748,9 +748,9 @@ public:
     // 委托给 span 版内核：GEMM 内核只保留一份，避免两处实现漂移。
     void transpose_multiply_to(MatrixT& result, const MatrixT& b) const
     {
-        NN_ASSERT_ALWAYS(&result != this && &result != &b,
+        EX_ASSERT_ALWAYS(&result != this && &result != &b,
                          "transpose_multiply_to: self-referencing not supported");
-        NN_ASSERT_ALWAYS(rows_ == b.rows_, "transpose_multiply_to: inner dimensions mismatch");
+        EX_ASSERT_ALWAYS(rows_ == b.rows_, "transpose_multiply_to: inner dimensions mismatch");
         const std::size_t K = rows_;  // this is (K, M)
         const std::size_t M = cols_;
         const std::size_t N = b.cols_;
@@ -763,7 +763,7 @@ public:
     void scale_inplace(Scalar scalar) noexcept
     {
         auto s = span();
-        nn::for_each(s.begin(), s.end(), [scalar](element& value) noexcept { value *= scalar; });
+        exstl::for_each(s.begin(), s.end(), [scalar](element& value) noexcept { value *= scalar; });
     }
 
     // 逐元素加法 inplace
@@ -772,7 +772,7 @@ public:
         require_same_shape(*this, other, "add_inplace dimension mismatch");
         auto s = span();
         auto o = other.span();
-        nn::transform(s.begin(), s.end(), o.begin(), s.begin(), std::plus<>{});
+        exstl::transform(s.begin(), s.end(), o.begin(), s.begin(), std::plus<>{});
     }
 
     // 填充零
@@ -787,7 +787,7 @@ public:
     [[nodiscard]] T reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
     {
         auto s = span();
-        return nn::transform_reduce(s.begin(), s.end(), init, std::forward<ReduceOp>(reduce_op),
+        return exstl::transform_reduce(s.begin(), s.end(), init, std::forward<ReduceOp>(reduce_op),
                                     std::forward<TransformOp>(transform_op));
     }
 
@@ -817,11 +817,11 @@ public:
         };
 
         // 并行门控按**元素数**（R*C），与 broadcast_* 一致：行数本身远低于
-        // PARALLEL_THRESHOLD（512K），按行数比较会让本原语**恒定串行**，
+        // exstl::PARALLEL_THRESHOLD（512K），按行数比较会让本原语**恒定串行**，
         // 故必须按 R*C 分片触发。
         // 每行独立累加、行内顺序不变 → 并行与串行逐字节一致（铁律 8）。
-        if (rows_ * cols_ >= PARALLEL_THRESHOLD && rows_ > 1)
-            nn::parallel_for_samples(rows_, process_row);
+        if (rows_ * cols_ >= exstl::PARALLEL_THRESHOLD && rows_ > 1)
+            exstl::parallel_for_samples(rows_, process_row);
         else
             for (std::size_t r = 0; r < rows_; ++r)
                 process_row(r);
@@ -835,7 +835,7 @@ public:
     //
     // 实现策略：cache-friendly blocked + 行块并行。
     // 实测：blocked 全面优于 naive（按列跨行扫描），
-    // 行块并行仅在 R >= 256 且 R*C >= PARALLEL_THRESHOLD 时启用。
+    // 行块并行仅在 R >= 256 且 R*C >= exstl::PARALLEL_THRESHOLD 时启用。
     template <typename T, typename ReduceOp, typename TransformOp>
     [[nodiscard]] MatrixT col_reduce(T init, ReduceOp&& reduce_op, TransformOp&& transform_op) const
     {
@@ -860,14 +860,14 @@ public:
             return result;
         }
 
-        // 行块并行启用条件：R >= COL_REDUCE_PARALLEL_ROWS 且 R*C >= PARALLEL_THRESHOLD。
+        // 行块并行启用条件：R >= COL_REDUCE_PARALLEL_ROWS 且 R*C >= exstl::PARALLEL_THRESHOLD。
         // 行数门槛取 256：R*C >= 512K 时即使 R=256 每线程也有 >=16K 元素
         // 的工作量（32 线程假设），同步开销不占主导；256 覆盖常见 d_model=768 场景。
         constexpr std::size_t COL_REDUCE_PARALLEL_ROWS = 256;      // 行数门槛
         const std::size_t hw_threads = std::thread::hardware_concurrency();
         const std::size_t n_threads = (hw_threads == 0) ? 1 : hw_threads;
         const bool use_parallel =
-            R >= COL_REDUCE_PARALLEL_ROWS && R * C >= PARALLEL_THRESHOLD && n_threads > 1;
+            R >= COL_REDUCE_PARALLEL_ROWS && R * C >= exstl::PARALLEL_THRESHOLD && n_threads > 1;
 
         if (!use_parallel)
         {
@@ -895,7 +895,7 @@ public:
                 local_acc[t * C + c] = init;
 
         // 按行分块并行扫描
-        auto& pool = global_thread_pool();
+        auto& pool = exstl::global_thread_pool();
         const std::size_t base = R / n_threads;
         const std::size_t rem = R % n_threads;
         auto row_blocks = std::views::iota(std::size_t{0}, n_threads);

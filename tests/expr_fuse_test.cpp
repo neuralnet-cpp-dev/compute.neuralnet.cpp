@@ -564,8 +564,8 @@ int run_batch_dispatch(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu)
         const nn::Tensor xcg = to_gpu(gpu, xc);
         const nn::Tensor gcg = to_gpu(gpu, gc);
 
-        std::vector<nn::Result<nn::Tensor>> s1(3), ma(3), va(3), da(3);
-        std::vector<nn::Result<void>> pd(3);
+        std::vector<exstl::Result<nn::Tensor>> s1(3), ma(3), va(3), da(3);
+        std::vector<exstl::Result<void>> pd(3);
         CHECK(static_cast<bool>(gpu.begin_expr()), "批量用例 begin_expr 成功");
         for (int i = 0; i < 3; ++i)
             s1[i] = nn::test_fuse::one_shot_rb2(gpu, xg[i], gsg[i], sh[i].R, sh[i].C);

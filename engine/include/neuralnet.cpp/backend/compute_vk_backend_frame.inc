@@ -21,7 +21,7 @@
 // ── 取下一帧并开始录制（begin_batch / flush_batch 共用）──────────
 // 环槽复用前等待：该帧若仍在飞行，等其 fence（这是唯一的常规等待点；
 // 环深度 N 限制 host 至多超前 N 帧）。
-[[nodiscard]] Result<void> start_frame()
+[[nodiscard]] exstl::Result<void> start_frame()
 {
     const std::size_t i = frame_next_;
     frame_next_ = (i + 1) % PIPELINE_FRAMES;
@@ -30,17 +30,17 @@
     if (!rr)
     {
         batch_mode_ = false;
-        NN_TRY_CHECK(rr);
+        EX_TRY_CHECK(rr);
     }
 
     auto& f = frames_[i];
     auto r = detail::vk_check(vkResetCommandBuffer(f.cmd, 0), __FILE__, __LINE__);
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     r = detail::vk_check(vkBeginCommandBuffer(f.cmd, &begin_info), __FILE__, __LINE__);
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     batch_cmd_ = f.cmd;
     batch_frame_ = i;
     last_active_frame_ = i;
@@ -52,14 +52,14 @@
 
 // ── 提交当前帧（不等待）────────────────────────────────────────────
 // 空帧不提交（无 op 的帧跳过，省一次 vkQueueSubmit + 一个环槽）。
-[[nodiscard]] Result<void> submit_frame_no_wait()
+[[nodiscard]] exstl::Result<void> submit_frame_no_wait()
 {
     auto& f = frames_[batch_frame_];
     if (!batch_has_ops_) return {}; // 空帧：不提交
 
     // reap 已确保 fence 处于 unsignaled（或从未提交）状态
     auto r = detail::vk_check(vkResetFences(device_.device(), 1, &f.fence), __FILE__, __LINE__);
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     // 跨 submit 数据依赖：帧命令的输入可能刚由 batch 内的 from_matrix
     // 独立上传提交写入——等 in-flight region 信号量（GPU 队列内等待，
     // host 不阻塞）
@@ -76,7 +76,7 @@
         r = detail::vk_check(vkQueueSubmit(device_.compute_queue(), 1, &submit_info, f.fence),
                              __FILE__, __LINE__);
     }
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     f.in_flight = true;
     last_active_frame_ = batch_frame_;
     // 提交后立即非阻塞收割其它已完成帧：让步内已析构张量的内存尽早
@@ -85,22 +85,22 @@
     if (early_reap_enabled_)
     {
         auto rr = reap_completed_frames();
-        NN_TRY_CHECK(rr);
+        EX_TRY_CHECK(rr);
     }
     return {};
 }
 
-[[nodiscard]] Result<void> begin_batch()
+[[nodiscard]] exstl::Result<void> begin_batch()
 {
-    if (!initialized_) NN_FAIL("GPU backend not initialized");
-    if (batch_mode_) NN_FAIL("Already in batch mode");
+    if (!initialized_) EX_FAIL("GPU backend not initialized");
+    if (batch_mode_) EX_FAIL("Already in batch mode");
     return start_frame();
 }
 
 // ── 结束 batch：提交当前帧，**不等待**─────────────────────
 // 帧在队列上执行；其延迟销毁 / 描述符集在 reap 时释放。
 // 设备丢失等错误在 wait_in_flight / 环槽复用 reap 时浮出。
-[[nodiscard]] Result<void> end_batch()
+[[nodiscard]] exstl::Result<void> end_batch()
 {
     if (!batch_mode_) return {}; // 容错：非 batch 模式时 no-op
 
@@ -109,7 +109,7 @@
     if (!r)
     {
         batch_mode_ = false;
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
     }
 
     // 2. 提交（不等待）
@@ -123,7 +123,7 @@
 // forward 与 backward 之间），避免单次提交时间过长触发 Windows TDR。
 // 当前帧为空（无 op 录制）时 no-op——不提交、不换帧（避免浪费环槽
 // 与 submit，如 to_matrix 的 drain 已换过帧的场景）。
-[[nodiscard]] Result<void> flush_batch()
+[[nodiscard]] exstl::Result<void> flush_batch()
 {
     if (!batch_mode_) return {}; // 非 batch 模式时 no-op
     if (!batch_has_ops_) return {}; // 空帧：无需提交，继续在同一帧录制
@@ -132,14 +132,14 @@
     if (!r)
     {
         batch_mode_ = false;
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
     }
 
     r = submit_frame_no_wait(); // 不等待
     if (!r)
     {
         batch_mode_ = false;
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
     }
 
     // 仍处于 batch 模式：开始录制下一帧
@@ -150,14 +150,14 @@
 // 等待所有在飞帧完成并 reap（延迟销毁 + 描述符集释放）。
 // to_matrix / copy_from 读 GPU 内存前必须调用：要读的数据可能刚由
 // 在飞帧写入，队列 FIFO 只保证顺序、不保证完成。
-[[nodiscard]] Result<void> wait_in_flight()
+[[nodiscard]] exstl::Result<void> wait_in_flight()
 {
     for (std::size_t i = 0; i < frames_.size(); ++i)
     {
         if (frames_[i].in_flight)
         {
             auto r = reap_frame(i, /*wait=*/true);
-            NN_TRY_CHECK(r);
+            EX_TRY_CHECK(r);
         }
     }
     // 所有帧已完成：兜底清理剩余延迟销毁（正常应为空）
@@ -170,13 +170,13 @@
 // 每块大小不超过 staging region，通过多次 memcpy + vkCmdCopyBuffer 完成。
 // 元素类型由 P 决定（f32=4B / f16=2B），memcpy 为字节级操作，§6.5。
 template <Precision P>
-[[nodiscard]] Result<void> upload_blocking(GpuTensorT<P>& dst, std::span<const elem<P>> cpu_data)
+[[nodiscard]] exstl::Result<void> upload_blocking(GpuTensorT<P>& dst, std::span<const elem<P>> cpu_data)
 {
     using ElemType = elem<P>;
-    if (!initialized_) NN_FAIL("GPU backend not initialized");
-    if (!dst.valid()) NN_FAIL("Invalid destination GpuTensor");
+    if (!initialized_) EX_FAIL("GPU backend not initialized");
+    if (!dst.valid()) EX_FAIL("Invalid destination GpuTensor");
     const std::size_t elem_count = dst.rows() * dst.cols();
-    if (cpu_data.size() != elem_count) NN_FAIL("Upload size mismatch");
+    if (cpu_data.size() != elem_count) EX_FAIL("Upload size mismatch");
     const std::size_t total_bytes = elem_count * sizeof(ElemType);
     const std::size_t staging_cap = staging_ring_->region_size();
 
@@ -315,13 +315,13 @@ template <Precision P>
 // 当数据超过 staging region 大小时，自动分块下载。
 // 元素类型由 P 决定（f32=4B / f16=2B），memcpy 为字节级操作，§6.5。
 template <Precision P>
-[[nodiscard]] Result<void> download_blocking(const GpuTensorT<P>& src, std::span<elem<P>> cpu_data)
+[[nodiscard]] exstl::Result<void> download_blocking(const GpuTensorT<P>& src, std::span<elem<P>> cpu_data)
 {
     using ElemType = elem<P>;
-    if (!initialized_) NN_FAIL("GPU backend not initialized");
-    if (!src.valid()) NN_FAIL("Invalid source GpuTensor");
+    if (!initialized_) EX_FAIL("GPU backend not initialized");
+    if (!src.valid()) EX_FAIL("Invalid source GpuTensor");
     const std::size_t elem_count = src.rows() * src.cols();
-    if (cpu_data.size() != elem_count) NN_FAIL("Download size mismatch");
+    if (cpu_data.size() != elem_count) EX_FAIL("Download size mismatch");
     const std::size_t total_bytes = elem_count * sizeof(ElemType);
     const std::size_t staging_cap = staging_ring_->region_size();
 
@@ -511,7 +511,7 @@ template <Precision P>
 //   output   : 输出张量（写入最后一个 binding）
 //   pc       : push constants 字节流（按 pipeline_layout 布局）
 //   wg_x/y/z : dispatch 工作组数（三维）
-[[nodiscard]] Result<void>
+[[nodiscard]] exstl::Result<void>
 dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inputs,
                  const GpuTensor& output, const std::vector<std::uint8_t>& pc, std::uint32_t wg_x,
                  std::uint32_t wg_y, std::uint32_t wg_z,
@@ -520,7 +520,7 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
                  // 进表 5 的 "detail@label@stage" 行；空 = 只进表 4）
                  std::string_view ts_detail = {})
 {
-    if (!initialized_) NN_FAIL("GPU backend not initialized");
+    if (!initialized_) EX_FAIL("GPU backend not initialized");
     const auto t_disp_start = std::chrono::steady_clock::now();
     const std::size_t n = inputs.size() + 1;
     std::vector<VkBuffer> bindings(n);
@@ -528,14 +528,14 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
         bindings[i] = gpu_vk_impl(inputs[i].buffer());
     bindings[n - 1] = gpu_vk_impl(output.buffer());
     auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
-    NN_TRY_CHECK(ds_r);
+    EX_TRY_CHECK(ds_r);
     VkDescriptorSet desc_set = *ds_r;
 
     auto cmd_r = acquire_cmd();
     if (!cmd_r)
     {
         release_desc_set_now(desc_set);
-        NN_TRY_CHECK(cmd_r);
+        EX_TRY_CHECK(cmd_r);
     }
     auto [cmd, owns_cmd] = *cmd_r;
 
@@ -565,7 +565,7 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
                 static_cast<long long>(
                     std::chrono::duration_cast<std::chrono::microseconds>(t_rec - t_disp_start)
                         .count()));
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
     }
     return {};
 }
@@ -574,17 +574,17 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
 // batch_mode_ 时：录制到 batch_cmd_，不提交不等待
 // transA: A 存储为 (K,M)，按 A^T 使用
 // transB: B 存储为 (N,K)，按 B^T 使用
-[[nodiscard]] Result<GpuTensor> matmul_gpu(const GpuTensor& A, const GpuTensor& B,
+[[nodiscard]] exstl::Result<GpuTensor> matmul_gpu(const GpuTensor& A, const GpuTensor& B,
                                            uint32_t transA = 0, uint32_t transB = 0,
                                            bool f16_io = false)
 {
-    if (!initialized_) NN_FAIL("GPU backend not initialized");
+    if (!initialized_) EX_FAIL("GPU backend not initialized");
     // 计算有效维度（考虑转置）
     const auto M = static_cast<uint32_t>(transA ? A.cols() : A.rows());
     const auto K = static_cast<uint32_t>(transA ? A.rows() : A.cols());
     const auto N = static_cast<uint32_t>(transB ? B.rows() : B.cols());
     const auto K_B = static_cast<uint32_t>(transB ? B.cols() : B.rows());
-    if (K != K_B) NN_FAIL("Dimension mismatch");
+    if (K != K_B) EX_FAIL("Dimension mismatch");
     // 1. 分配输出 Tensor（f16_io：按 2B/元素分配 + 纯绑定视图，见
     //    batched_matmul_gpu 的同款做法）
     const bool use_f16 = f16_io;
@@ -595,18 +595,18 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
         // gemv_f16 可用 → 下方分派走 GEMV，无需 tiled_f16
     }
     else if (use_f16 && !has(PipelineId::matmul_tiled_f16))
-        NN_FAIL("matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）");
+        EX_FAIL("matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）");
     std::optional<GpuTensor> owned;
     if (use_f16)
     {
         auto f16r = GpuTensorF16::create_empty(M, N, *this);
-        NN_TRY_CHECK(f16r);
+        EX_TRY_CHECK(f16r);
         owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
     }
     else
     {
         auto C_res = GpuTensor::create_empty(M, N, *this);
-        NN_TRY_CHECK(C_res);
+        EX_TRY_CHECK(C_res);
         owned.emplace(std::move(*C_res));
     }
     GpuTensor C = *owned;
@@ -692,14 +692,14 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
     {
         auto r = dispatch_compute(pipeline, inputs, C, pc, (M + GEMV_ROWS - 1u) / GEMV_ROWS, 1u, 1u,
                                   "matmul", mm_variant);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return C;
     }
     const uint32_t tile =
         (use_fine || use_naive_fine) ? 16u : use_wide ? 128u : use_tiled ? 64u : 16u;
     auto r = dispatch_compute(pipeline, inputs, C, pc, (N + tile - 1u) / tile,
                               (M + tile - 1u) / tile, 1u, "matmul", mm_variant);
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     return C;
 }
 
@@ -714,21 +714,21 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
 //   彻底消除"每个操作数抬 f32 的整份副本"。此时 A/B 只作**缓冲视图**使用
 //   （GpuTensorT<F32> 包裹 f16 buffer，字节布局由 pipeline 决定 —— 与
 //   run_fused_gpu 的 out_f16 同一套做法）。
-[[nodiscard]] Result<GpuTensor> batched_matmul_gpu(const GpuTensor& A, const GpuTensor& B,
+[[nodiscard]] exstl::Result<GpuTensor> batched_matmul_gpu(const GpuTensor& A, const GpuTensor& B,
                                                    uint32_t batch, uint32_t transA = 0,
                                                    uint32_t transB = 0, float alpha = 1.0f,
                                                    bool f16_io = false)
 {
-    if (!initialized_) NN_FAIL("GPU backend not initialized");
-    if (batch == 0) NN_FAIL("batched_matmul_gpu: batch must be > 0");
+    if (!initialized_) EX_FAIL("GPU backend not initialized");
+    if (batch == 0) EX_FAIL("batched_matmul_gpu: batch must be > 0");
     const bool use_f16 = f16_io && has(PipelineId::batched_matmul_f16);
     if (f16_io && !use_f16)
-        NN_FAIL("batched_matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）");
+        EX_FAIL("batched_matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）");
     if (!use_f16 && !has(PipelineId::batched_matmul))
-        NN_FAIL("batched_matmul_gpu: pipeline not available");
+        EX_FAIL("batched_matmul_gpu: pipeline not available");
     // 校验：A.rows() 必须能被 batch 整除
     if (A.rows() % batch != 0 || B.rows() % batch != 0)
-        NN_FAIL("batched_matmul_gpu: rows not divisible by batch");
+        EX_FAIL("batched_matmul_gpu: rows not divisible by batch");
     // 计算每个 batch 的逻辑维度
     const auto a_rows_per = static_cast<uint32_t>(A.rows() / batch);
     const auto b_rows_per = static_cast<uint32_t>(B.rows() / batch);
@@ -736,7 +736,7 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
     const auto K = transA ? a_rows_per : static_cast<uint32_t>(A.cols());
     const auto K_B = transB ? static_cast<uint32_t>(B.cols()) : b_rows_per;
     const auto N = transB ? b_rows_per : static_cast<uint32_t>(B.cols());
-    if (K != K_B) NN_FAIL("batched_matmul_gpu: K dimension mismatch");
+    if (K != K_B) EX_FAIL("batched_matmul_gpu: K dimension mismatch");
     // 1. 分配输出 Tensor: (batch * M, N)
     //    f16：按 2B/元素分配，再用 GpuTensor(shared_buffer,...) 包一层纯
     //    绑定视图交给 dispatch（调用方按 f16_io 重贴 GpuTensorF16）。
@@ -744,13 +744,13 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
     if (use_f16)
     {
         auto f16r = GpuTensorF16::create_empty(static_cast<std::size_t>(batch) * M, N, *this);
-        NN_TRY_CHECK(f16r);
+        EX_TRY_CHECK(f16r);
         owned.emplace(f16r->shared_buffer(), f16r->rows(), f16r->cols());
     }
     else
     {
         auto C_res = GpuTensor::create_empty(static_cast<std::size_t>(batch) * M, N, *this);
-        NN_TRY_CHECK(C_res);
+        EX_TRY_CHECK(C_res);
         owned.emplace(std::move(*C_res));
     }
     GpuTensor C = *owned;
@@ -774,6 +774,6 @@ dispatch_compute(const VulkanPipeline& pipeline, std::span<const GpuTensor> inpu
                                       : pipelines_.get(PipelineId::batched_matmul),
                               inputs, C, pc, (N + BN - 1) / BN, (M + BM - 1) / BM, batch,
                               "batched_matmul", use_f16 ? "f16" : "f32");
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     return C;
 }

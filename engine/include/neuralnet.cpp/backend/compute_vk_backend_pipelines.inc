@@ -12,18 +12,18 @@
 // ── 前缀扫描 + matvec 读出：输出 (rows*5, seq) ─────────────────────
 // f16_io（Phase C2f）：输入输出均 half（f16 pipeline）；scratch St 仍
 // f32（引擎分配）。无 f16 pipeline 时硬报错，调用方走引擎内 cast 回退。
-[[nodiscard]] Result<GpuTensor> scan_prefix_outer_gpu(const GpuTensor& K, const GpuTensor& V,
+[[nodiscard]] exstl::Result<GpuTensor> scan_prefix_outer_gpu(const GpuTensor& K, const GpuTensor& V,
                                                       const GpuTensor& P, const GpuTensor& R,
                                                       const GpuTensor& A0, const GpuTensor& B0,
                                                       bool has_state, uint32_t dk, uint32_t heads,
                                                       bool causal, const GpuTensor& boundary,
                                                       bool has_bnd, bool f16_io = false)
 {
-    if (!initialized_) NN_FAIL("GPU backend not initialized");
-    if (dk == 0u || heads == 0u) NN_FAIL("scan_prefix_outer_gpu: dk/heads must be > 0");
+    if (!initialized_) EX_FAIL("GPU backend not initialized");
+    if (dk == 0u || heads == 0u) EX_FAIL("scan_prefix_outer_gpu: dk/heads must be > 0");
     const bool generic = dk > 64u; // 通用路径（状态驻全局 scratch，无 dk 上限）
     if (f16_io && !has_scan_f16_pipelines())
-        NN_FAIL("scan_prefix_outer_gpu: f16 pipelines not available");
+        EX_FAIL("scan_prefix_outer_gpu: f16 pipelines not available");
     // P4-2b：dk ≤ 32 时优先走窄共享变体（占用率高 6× ⇒ 32 个 WG 只排 ~1 个
     // 波次）；变体不可用（老 SPIR-V / 裁剪构建）→ 回落宽变体，数值逐位相同。
     const bool narrow = !generic && dk <= 32u;
@@ -37,22 +37,22 @@
                                  ? pipelines_.get(PipelineId::scan_prefix_outer_d32)
                                  : pipelines_.get(PipelineId::scan_prefix_outer)));
     if (!generic && !has(PipelineId::scan_prefix_outer))
-        NN_FAIL("scan_prefix_outer_gpu: pipeline not available");
+        EX_FAIL("scan_prefix_outer_gpu: pipeline not available");
     if (generic && !has(PipelineId::scan_prefix_outer_gen))
-        NN_FAIL("scan_prefix_outer_gpu: generic pipeline not available");
+        EX_FAIL("scan_prefix_outer_gpu: generic pipeline not available");
     const auto rows = static_cast<uint32_t>(K.rows());
-    if (rows % (dk * heads) != 0) NN_FAIL("scan_prefix_outer_gpu: rows not divisible by H*dk");
+    if (rows % (dk * heads) != 0) EX_FAIL("scan_prefix_outer_gpu: rows not divisible by H*dk");
     if (V.rows() != rows || V.cols() != K.cols() || P.rows() != rows || P.cols() != K.cols() ||
         R.rows() != rows || R.cols() != K.cols())
-        NN_FAIL("scan_prefix_outer_gpu: K/V/P/R shape mismatch");
+        EX_FAIL("scan_prefix_outer_gpu: K/V/P/R shape mismatch");
     if (has_state &&
         (A0.rows() != heads * dk || A0.cols() != dk || B0.rows() != heads * dk || B0.cols() != dk))
-        NN_FAIL("scan_prefix_outer_gpu: A0/B0 must be (H*dk, dk)");
+        EX_FAIL("scan_prefix_outer_gpu: A0/B0 must be (H*dk, dk)");
     const auto seq = static_cast<uint32_t>(K.cols());
     if (has_bnd)
     {
         if (boundary.rows() != 1 || boundary.cols() != (rows / (dk * heads)) * seq)
-            NN_FAIL("scan_prefix_outer_gpu: boundary must be (1, B*seq)");
+            EX_FAIL("scan_prefix_outer_gpu: boundary must be (1, B*seq)");
     }
     const auto BH = rows / dk;
     const std::size_t out_rows = static_cast<std::size_t>(rows) * 5;
@@ -60,13 +60,13 @@
     if (f16_io)
     {
         auto f16r = GpuTensorF16::create_empty(out_rows, seq, *this);
-        NN_TRY_CHECK(f16r);
+        EX_TRY_CHECK(f16r);
         C = GpuTensor(f16r->shared_buffer(), out_rows, seq);
     }
     else
     {
         auto C_res = GpuTensor::create_empty(out_rows, seq, *this);
-        NN_TRY_CHECK(C_res);
+        EX_TRY_CHECK(C_res);
         C = std::move(*C_res);
     }
     struct PushPrefix
@@ -81,32 +81,32 @@
         // batch 录制期被引用（descriptor set）也不会过早释放。
         auto St_res =
             GpuTensor::create_empty(static_cast<std::size_t>(BH) * 2u * dk * dk, 1u, *this);
-        NN_TRY_CHECK(St_res);
+        EX_TRY_CHECK(St_res);
         GpuTensor St = std::move(*St_res);
         std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary, St};
         auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u, "scan_prefix");
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return C;
     }
     std::vector<GpuTensor> inputs{K, V, P, R, A0, B0, boundary};
     auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u, "scan_prefix");
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     return C;
 }
 
 // ── 后缀扫描 + matvec 读出：输出 (rows*3, seq) ─────────────────────
 // f16_io 同 scan_prefix_outer_gpu（Phase C2c→C2f）。
-[[nodiscard]] Result<GpuTensor> scan_suffix_outer_gpu(const GpuTensor& D, const GpuTensor& X,
+[[nodiscard]] exstl::Result<GpuTensor> scan_suffix_outer_gpu(const GpuTensor& D, const GpuTensor& X,
                                                       const GpuTensor& Y, uint32_t dk,
                                                       uint32_t heads, bool causal,
                                                       const GpuTensor& boundary, bool has_bnd,
                                                       bool f16_io = false)
 {
-    if (!initialized_) NN_FAIL("GPU backend not initialized");
-    if (dk == 0u || heads == 0u) NN_FAIL("scan_suffix_outer_gpu: dk/heads must be > 0");
+    if (!initialized_) EX_FAIL("GPU backend not initialized");
+    if (dk == 0u || heads == 0u) EX_FAIL("scan_suffix_outer_gpu: dk/heads must be > 0");
     const bool generic = dk > 64u; // 通用路径（状态驻全局 scratch，无 dk 上限）
     if (f16_io && !has_scan_f16_pipelines())
-        NN_FAIL("scan_suffix_outer_gpu: f16 pipelines not available");
+        EX_FAIL("scan_suffix_outer_gpu: f16 pipelines not available");
     // 注意：**后缀扫描刻意不走窄共享变体**——实测它对 suffix 有害（D 的
     // dk²×seq 列式散布读使其为流量/争用受限：窄变体把每 SM 的驻留 WG 从 3
     // 提到 15，dk=32/BH=32 下 7.9 → 16.2 ms），故只给 scan_prefix 加变体。
@@ -116,18 +116,18 @@
                 : (f16_io ? pipelines_.get(PipelineId::scan_suffix_outer_f16)
                           : pipelines_.get(PipelineId::scan_suffix_outer));
     if (!generic && !has(PipelineId::scan_suffix_outer))
-        NN_FAIL("scan_suffix_outer_gpu: pipeline not available");
+        EX_FAIL("scan_suffix_outer_gpu: pipeline not available");
     if (generic && !has(PipelineId::scan_suffix_outer_gen))
-        NN_FAIL("scan_suffix_outer_gpu: generic pipeline not available");
+        EX_FAIL("scan_suffix_outer_gpu: generic pipeline not available");
     const auto rows = static_cast<uint32_t>(X.rows());
-    if (rows % (dk * heads) != 0) NN_FAIL("scan_suffix_outer_gpu: X rows not divisible by H*dk");
+    if (rows % (dk * heads) != 0) EX_FAIL("scan_suffix_outer_gpu: X rows not divisible by H*dk");
     if (D.rows() != rows * dk || D.cols() != X.cols() || Y.rows() != rows || Y.cols() != X.cols())
-        NN_FAIL("scan_suffix_outer_gpu: D/X/Y shape mismatch");
+        EX_FAIL("scan_suffix_outer_gpu: D/X/Y shape mismatch");
     const auto seq = static_cast<uint32_t>(X.cols());
     if (has_bnd)
     {
         if (boundary.rows() != 1 || boundary.cols() != (rows / (dk * heads)) * seq)
-            NN_FAIL("scan_suffix_outer_gpu: boundary must be (1, B*seq)");
+            EX_FAIL("scan_suffix_outer_gpu: boundary must be (1, B*seq)");
     }
     const auto BH = rows / dk;
     const std::size_t out_rows = static_cast<std::size_t>(rows) * 3;
@@ -135,13 +135,13 @@
     if (f16_io)
     {
         auto f16r = GpuTensorF16::create_empty(out_rows, seq, *this);
-        NN_TRY_CHECK(f16r);
+        EX_TRY_CHECK(f16r);
         C = GpuTensor(f16r->shared_buffer(), out_rows, seq);
     }
     else
     {
         auto C_res = GpuTensor::create_empty(out_rows, seq, *this);
-        NN_TRY_CHECK(C_res);
+        EX_TRY_CHECK(C_res);
         C = std::move(*C_res);
     }
     struct PushSuffix
@@ -152,50 +152,50 @@
     if (generic)
     {
         auto St_res = GpuTensor::create_empty(static_cast<std::size_t>(BH) * dk * dk, 1u, *this);
-        NN_TRY_CHECK(St_res);
+        EX_TRY_CHECK(St_res);
         GpuTensor St = std::move(*St_res);
         std::vector<GpuTensor> inputs{D, X, Y, boundary, St};
         auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u, "scan_suffix");
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return C;
     }
     std::vector<GpuTensor> inputs{D, X, Y, boundary};
     auto r = dispatch_compute(pipe, inputs, C, pc, 1u, BH, 1u);
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     return C;
 }
 
 // ── 逐列外积：输出 (rows*dk, seq) ──────────────────────────────────
 // f16_io 同 scan_prefix_outer_gpu（Phase C2f）。
-[[nodiscard]] Result<GpuTensor> outer_col_gpu(const GpuTensor& P, const GpuTensor& R,
+[[nodiscard]] exstl::Result<GpuTensor> outer_col_gpu(const GpuTensor& P, const GpuTensor& R,
                                               const GpuTensor& S, uint32_t dk, bool has_scale,
                                               bool f16_io = false)
 {
-    if (!initialized_) NN_FAIL("GPU backend not initialized");
-    if (!has(PipelineId::outer_col)) NN_FAIL("outer_col_gpu: pipeline not available");
+    if (!initialized_) EX_FAIL("GPU backend not initialized");
+    if (!has(PipelineId::outer_col)) EX_FAIL("outer_col_gpu: pipeline not available");
     if (f16_io && pipelines_.get(PipelineId::outer_col_f16).handle() == VK_NULL_HANDLE)
-        NN_FAIL("outer_col_gpu: f16 pipeline not available");
+        EX_FAIL("outer_col_gpu: f16 pipeline not available");
     const VulkanPipeline& pipe =
         f16_io ? pipelines_.get(PipelineId::outer_col_f16) : pipelines_.get(PipelineId::outer_col);
-    if (dk == 0u) NN_FAIL("outer_col_gpu: dk must be > 0");
+    if (dk == 0u) EX_FAIL("outer_col_gpu: dk must be > 0");
     const auto rows = static_cast<uint32_t>(P.rows());
-    if (rows % dk != 0) NN_FAIL("outer_col_gpu: rows not divisible by dk");
-    if (R.rows() != rows || R.cols() != P.cols()) NN_FAIL("outer_col_gpu: P/R shape mismatch");
+    if (rows % dk != 0) EX_FAIL("outer_col_gpu: rows not divisible by dk");
+    if (R.rows() != rows || R.cols() != P.cols()) EX_FAIL("outer_col_gpu: P/R shape mismatch");
     if (has_scale && (S.rows() != rows || S.cols() != P.cols()))
-        NN_FAIL("outer_col_gpu: S must be (B*H*dk, seq)");
+        EX_FAIL("outer_col_gpu: S must be (B*H*dk, seq)");
     const auto seq = static_cast<uint32_t>(P.cols());
     const std::size_t out_rows = static_cast<std::size_t>(rows) * dk;
     GpuTensor C;
     if (f16_io)
     {
         auto f16r = GpuTensorF16::create_empty(out_rows, seq, *this);
-        NN_TRY_CHECK(f16r);
+        EX_TRY_CHECK(f16r);
         C = GpuTensor(f16r->shared_buffer(), out_rows, seq);
     }
     else
     {
         auto C_res = GpuTensor::create_empty(out_rows, seq, *this);
-        NN_TRY_CHECK(C_res);
+        EX_TRY_CHECK(C_res);
         C = std::move(*C_res);
     }
     struct PushOuter
@@ -206,7 +206,7 @@
     std::vector<GpuTensor> inputs{P, R, S};
     const auto total = static_cast<uint32_t>(rows) * dk * seq;
     auto r = dispatch_compute(pipe, inputs, C, pc, (total + 255u) / 256u, 1u, 1u);
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     return C;
 }
 
@@ -222,7 +222,7 @@
 // ══════════════════════════════════════════════════════════════════
 
 // ── 辅助：分配描述符集 ──────────────────────────────────────────────
-[[nodiscard]] Result<VkDescriptorSet> alloc_desc_set(VkDescriptorSetLayout layout)
+[[nodiscard]] exstl::Result<VkDescriptorSet> alloc_desc_set(VkDescriptorSetLayout layout)
 {
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
     VkDescriptorSetAllocateInfo desc_alloc{};
@@ -233,7 +233,7 @@
 
     auto r = detail::vk_check(vkAllocateDescriptorSets(device_.device(), &desc_alloc, &desc_set),
                               __FILE__, __LINE__);
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     // batch 模式：描述符集被当前帧的已录制命令引用，归属该帧，
     // 帧的 fence 信号后（reap_frame）才释放
     if (batch_mode_) frames_[batch_frame_].desc_sets.push_back(desc_set);
@@ -243,11 +243,11 @@
 // ── 辅助：分配描述符集并把 buffers[i] 绑到 binding i ──────────────────
 // 取代每个算子各写一遍的 "VkDescriptorBufferInfo[N] + VkWriteDescriptorSet[N]
 // + vkUpdateDescriptorSets" 样板。失败路径自己归还集合（RV-15 语义），
-// 调用方只需 NN_TRY_CHECK。
+// 调用方只需 EX_TRY_CHECK。
 //
 // 16 个以内走栈上数组（原语算子最多 4 个绑定，融合 extras 也在上限内）；
 // 超过时退回堆——保持旧实现"支持任意 N"的行为不变。
-[[nodiscard]] Result<VkDescriptorSet> alloc_desc_set_for(VkDescriptorSetLayout layout,
+[[nodiscard]] exstl::Result<VkDescriptorSet> alloc_desc_set_for(VkDescriptorSetLayout layout,
                                                          std::span<const VkBuffer> buffers)
 {
     auto ds_r = alloc_desc_set(layout);
@@ -622,7 +622,7 @@ void ts_resolve(TsCursor& cur)
 }
 
 // 返回 (cmd, owns_cmd)。owns_cmd=true 时调用方需 submit_and_wait。
-[[nodiscard]] Result<std::pair<VkCommandBuffer, bool>> acquire_cmd()
+[[nodiscard]] exstl::Result<std::pair<VkCommandBuffer, bool>> acquire_cmd()
 {
     if (batch_mode_)
     {
@@ -637,14 +637,14 @@ void ts_resolve(TsCursor& cur)
     // 不存在 pending 期 reset；begin 失败时 buffer 留在 reset 后初态
     // （规范允许 reset 从错误态恢复），下次调用可重试。
     VkCommandBuffer cmd = solo_cmd_;
-    if (cmd == VK_NULL_HANDLE) NN_FAIL("acquire_cmd: solo_cmd_ not initialized");
+    if (cmd == VK_NULL_HANDLE) EX_FAIL("acquire_cmd: solo_cmd_ not initialized");
     auto r = detail::vk_check(vkResetCommandBuffer(cmd, 0), __FILE__, __LINE__);
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     r = detail::vk_check(vkBeginCommandBuffer(cmd, &begin_info), __FILE__, __LINE__);
-    NN_TRY_CHECK(r);
+    EX_TRY_CHECK(r);
     ts_begin_block(cmd, ts_solo_); // 设备侧计时：solo 块开始
     return std::make_pair(cmd, true);
 }
@@ -653,7 +653,7 @@ void ts_resolve(TsCursor& cur)
 // cmd：acquire_cmd 返回的 solo_cmd_（非 batch 模式才会走到这里）
 // desc_set 可为 VK_NULL_HANDLE（fill_zero/copy_buffer 无描述符集）
 // NN_GPU_PROFILE=1：stderr 打印 host 分段耗时（µs）用于开销归因
-[[nodiscard]] Result<void> submit_and_wait(VkCommandBuffer cmd, VkDescriptorSet desc_set)
+[[nodiscard]] exstl::Result<void> submit_and_wait(VkCommandBuffer cmd, VkDescriptorSet desc_set)
 {
     const bool prof = profile_ops_enabled();
     const auto t_begin = std::chrono::steady_clock::now();
@@ -663,7 +663,7 @@ void ts_resolve(TsCursor& cur)
     {
         if (desc_set != VK_NULL_HANDLE)
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
     }
     const auto t_end = std::chrono::steady_clock::now();
 
@@ -671,7 +671,7 @@ void ts_resolve(TsCursor& cur)
     {
         if (desc_set != VK_NULL_HANDLE)
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-        NN_FAIL("submit_and_wait: solo_fence_ not initialized");
+        EX_FAIL("submit_and_wait: solo_fence_ not initialized");
     }
     // 上一次 submit 已 wait 到 signaled → 这里 reset 回 unsignaled 复用
     //（首次调用时是 init 创建的 fresh unsignaled，reset 为合法 no-op）
@@ -680,7 +680,7 @@ void ts_resolve(TsCursor& cur)
     {
         if (desc_set != VK_NULL_HANDLE)
             vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
     }
 
     // 跨 submit 数据依赖：输入 buffer 可能刚由在飞上传的 copy 写入
@@ -702,7 +702,7 @@ void ts_resolve(TsCursor& cur)
         {
             if (desc_set != VK_NULL_HANDLE)
                 vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
-            NN_TRY_CHECK(r);
+            EX_TRY_CHECK(r);
         }
     }
     const auto t_submit = std::chrono::steady_clock::now();

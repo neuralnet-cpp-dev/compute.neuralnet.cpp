@@ -73,9 +73,9 @@ namespace nn::prof
 //   NN_PROFILE_EVERY=<n>      每 n 次 dump() 打一次阶段表（默认 0 = 仅显式 dump）
 
 // ── 全局开关（静态初始化期读环境变量，进程内恒定）─────────────────────────
-inline const bool g_enabled = ::nn::detail::env_flag_raw("NN_PROFILE") ||
-                              !::nn::detail::env_string_raw("NN_PROFILE_TRACE").empty();
-inline const std::string g_trace_path = ::nn::detail::env_string_raw("NN_PROFILE_TRACE");
+inline const bool g_enabled = ::exstl::env::flag("NN_PROFILE") ||
+                              !::exstl::env::str("NN_PROFILE_TRACE").empty();
+inline const std::string g_trace_path = ::exstl::env::str("NN_PROFILE_TRACE");
 
 [[nodiscard]] inline bool enabled() noexcept
 { return g_enabled; }

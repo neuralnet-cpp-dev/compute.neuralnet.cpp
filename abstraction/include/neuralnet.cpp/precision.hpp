@@ -38,7 +38,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "core_errors.hpp"
+#include <exstl/errors.hpp>
 
 namespace nn
 {
@@ -121,7 +121,7 @@ enum class Precision : std::uint8_t
 {
     if (!precision_has_order(a) || !precision_has_order(b))
     {
-        NN_UNWRAP(false, std::string("max_precision: 无提升序的精度（非舍入精度）: ") +
+        EX_UNWRAP(false, std::string("max_precision: 无提升序的精度（非舍入精度）: ") +
                              precision_name(a) + " / " + precision_name(b));
     }
     return precision_rank(a) >= precision_rank(b) ? a : b;
@@ -132,15 +132,15 @@ enum class Precision : std::uint8_t
 // 用于一切"精度作为运行期输入"的入口（张量创建、cast、序列化 tag 回读…）。
 // T1_58 的拒绝是**设计意图**（docs 21 §4.1）：P1 里它只是一句 profile 声明 +
 // 层能力集合取值，绝不能有人拿它去 create_tensor。
-[[nodiscard]] inline Result<void> check_precision_supported(Precision p)
+[[nodiscard]] inline exstl::Result<void> check_precision_supported(Precision p)
 {
     if (p == Precision::BF16 || p == Precision::F64)
     {
-        NN_FAIL(std::string("精度未实现（Phase 1 仅支持 f16 / f32）: ") + precision_name(p));
+        EX_FAIL(std::string("精度未实现（Phase 1 仅支持 f16 / f32）: ") + precision_name(p));
     }
     if (p == Precision::T1_58)
     {
-        NN_FAIL(std::string("t1_58 不是存储精度（P1 口径：仅作为权重精度声明 + "
+        EX_FAIL(std::string("t1_58 不是存储精度（P1 口径：仅作为权重精度声明 + "
                             "BitLinear 能力集合；量化缓冲用 f16。打包存储 P2 落地）"));
     }
     return {};

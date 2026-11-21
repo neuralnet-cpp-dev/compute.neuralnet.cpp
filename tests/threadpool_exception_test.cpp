@@ -14,7 +14,7 @@
 //   5) 96B 行内任务对象在异常路径下仍正常析构（无泄漏）；
 //   6) 串行回落路径的异常语义与普通函数调用一致。
 
-#include <neuralnet.cpp/core_threadpool.hpp>
+#include <exstl/threadpool.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -59,7 +59,7 @@ constexpr std::size_t kN = 200000;  // 远超 MIN_CHUNK，保证 n_chunks > 1
 // ① 全部分块抛异常：主线程返回、异常可见、计数递增
 void test_all_chunks_throw()
 {
-    nn::ThreadPool pool(4);
+    exstl::ThreadPool pool(4);
     std::vector<int> v(kN, 0);
     const std::size_t before = pool.task_exception_count();
 
@@ -89,7 +89,7 @@ void test_all_chunks_throw()
 // ② 只有调用者末块抛异常：证明重抛发生在其余分块全部完成之后
 void test_throw_in_caller_chunk_after_others_done()
 {
-    nn::ThreadPool pool(4);
+    exstl::ThreadPool pool(4);
     std::vector<int> v(kN, 0);
     std::atomic<std::size_t> visited{0};
 
@@ -120,7 +120,7 @@ void test_throw_in_caller_chunk_after_others_done()
 // ③ 归约路径：有块失败时不得合并半成品
 void test_reduce_does_not_return_partial_result()
 {
-    nn::ThreadPool pool(4);
+    exstl::ThreadPool pool(4);
     std::vector<double> v(kN, 0.0);
 
     bool threw = false;
@@ -161,7 +161,7 @@ void test_inline_task_destructor_on_exception()
             (void)t;
             throw std::runtime_error("task-boom");
         };
-        nn::detail::PoolTask task = std::move(body);
+        exstl::detail::PoolTask task = std::move(body);
         CHECK(live >= 1, "捕获体已就地构造在任务对象内");
 
         bool caught = false;
@@ -181,7 +181,7 @@ void test_inline_task_destructor_on_exception()
 // ⑤ 串行回落路径：异常语义与普通函数调用一致（不经过线程池）
 void test_serial_fallback_propagates()
 {
-    nn::ThreadPool pool(4);
+    exstl::ThreadPool pool(4);
     std::vector<int> small(10, 0);
 
     bool caught = false;

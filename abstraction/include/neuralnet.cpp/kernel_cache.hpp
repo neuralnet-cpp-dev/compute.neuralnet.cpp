@@ -23,7 +23,7 @@
 #include <vector>
 
 #include <neuralnet.cpp/core_env.hpp>
-#include <neuralnet.cpp/core_errors.hpp>
+#include <exstl/errors.hpp>
 #include <neuralnet.cpp/expr_spec.hpp>
 #include <neuralnet.cpp/model_keyvalue_record.hpp>
 
@@ -69,21 +69,21 @@ inline constexpr const char* kKernelFieldPrefix = "kernel.";
 [[nodiscard]] inline std::string kernel_cache_path_from_env()
 {
     // 1) 显式文件路径
-    if (const std::string p = nn::detail::env_string_raw("NN_KERNEL_CACHE_PATH"); !p.empty())
+    if (const std::string p = exstl::env::str("NN_KERNEL_CACHE_PATH"); !p.empty())
         return p;
     // 2) 显式缓存目录
-    if (const std::string d = nn::detail::env_string_raw("NN_KERNEL_CACHE_DIR"); !d.empty())
+    if (const std::string d = exstl::env::str("NN_KERNEL_CACHE_DIR"); !d.empty())
         return d + "/kernels.nnk";
     // 3) 系统统一缓存目录 + 库子目录
     std::string base;
 #if defined(_WIN32)
-    base = nn::detail::env_string_raw("LOCALAPPDATA");
-    if (base.empty()) base = nn::detail::env_string_raw("USERPROFILE") + "/AppData/Local";
+    base = exstl::env::str("LOCALAPPDATA");
+    if (base.empty()) base = exstl::env::str("USERPROFILE") + "/AppData/Local";
 #elif defined(__APPLE__)
-    base = nn::detail::env_string_raw("HOME") + "/Library/Caches";
+    base = exstl::env::str("HOME") + "/Library/Caches";
 #else
-    base = nn::detail::env_string_raw("XDG_CACHE_HOME");
-    if (base.empty()) base = nn::detail::env_string_raw("HOME") + "/.cache";
+    base = exstl::env::str("XDG_CACHE_HOME");
+    if (base.empty()) base = exstl::env::str("HOME") + "/.cache";
 #endif
     if (base.empty()) base = ".";  // 都取不到 → 回退当前目录
     return base + "/neuralnet-cpp/kernels.nnk";
@@ -362,12 +362,12 @@ inline bool read_expr_spec(ByteReader& r, ExprSpec& s)
     detail::write_expr_spec(w, s);
     return std::move(w.buf);
 }
-[[nodiscard]] inline Result<ExprSpec> decode_expr_spec(const std::uint8_t* data, std::size_t n)
+[[nodiscard]] inline exstl::Result<ExprSpec> decode_expr_spec(const std::uint8_t* data, std::size_t n)
 {
     detail::ByteReader r{data, n, 0, false};
     ExprSpec s;
     if (!detail::read_expr_spec(r, s))
-        NN_FAIL("kernel_cache: ExprSpec 解码失败（截断/损坏）");
+        EX_FAIL("kernel_cache: ExprSpec 解码失败（截断/损坏）");
     return s;
 }
 
@@ -399,10 +399,10 @@ inline bool read_expr_spec(ByteReader& r, ExprSpec& s)
 //   · merge_kernels_from（persist 内盘上重读）→ 与既有"parse 失败即跳过
 //     合并"同口径：坏字段跳过 + 告警，好字段照常合并，随后整文件重写自然
 //     修复盘上损坏——不把错误上抛，避免 POSIX 侧提前返回跳过写锁释放。
-[[nodiscard]] inline Result<void> check_kernel_field(const std::string& key, std::size_t size)
+[[nodiscard]] inline exstl::Result<void> check_kernel_field(const std::string& key, std::size_t size)
 {
     if (size == 0 || size % sizeof(std::uint32_t) != 0)
-        NN_FAIL("kernel_cache: 字段 '" + key + "' 长度 " + std::to_string(size) +
+        EX_FAIL("kernel_cache: 字段 '" + key + "' 长度 " + std::to_string(size) +
                 " 非法（SPIR-V 须非空且为 4 的倍数）——缓存损坏");
     return {};
 }
@@ -415,10 +415,10 @@ struct KernelCache
     std::unordered_map<std::string, std::vector<std::uint32_t>> hot;  // 内存热缓存
 
     // 加载：generator_version 与期望一致 → 复用；不符 → 判陈旧 → 空缓存（重建）。
-    [[nodiscard]] static Result<KernelCache> from_bytes(std::string_view bytes,
+    [[nodiscard]] static exstl::Result<KernelCache> from_bytes(std::string_view bytes,
                                                         const std::string& expected_genver)
     {
-        NN_TRY(rec_r, KeyValueRecord::parse(bytes));
+        EX_TRY(rec_r, KeyValueRecord::parse(bytes));
         KernelCache c;
         std::string genver;
         c.generator_version = (rec_r->get("generator_version", genver))
@@ -432,7 +432,7 @@ struct KernelCache
             for (const std::string& key : rec_r->string_keys_with_prefix(kKernelFieldPrefix))
             {
                 std::string v;
-                if (rec_r->get(key, v)) NN_TRY_CHECK(check_kernel_field(key, v.size()));
+                if (rec_r->get(key, v)) EX_TRY_CHECK(check_kernel_field(key, v.size()));
             }
             c.rec = std::move(*rec_r);
         }
@@ -469,7 +469,7 @@ struct KernelCache
     }
 
     // JIT miss 后追加：内存 + rec（调用方随后 serialize()+ 写盘持久化）。
-    [[nodiscard]] Result<void> insert(const std::string& K,
+    [[nodiscard]] exstl::Result<void> insert(const std::string& K,
                                       const std::vector<std::uint32_t>& spirv)
     {
         hot[K] = spirv;
@@ -485,7 +485,7 @@ struct KernelCache
     // 合并另一份 rec 里本 rec 没有的 kernel 字段（进程锁写盘前，把并发进程中
     // 其它进程已 JIT 并落盘的 kernel 合进来，避免 lost-update）。hot 不更新
     // （hit() 懒加载自 rec，合进来的条目后续按需进 hot）。
-    [[nodiscard]] Result<void> merge_kernels_from(const KeyValueRecord& other)
+    [[nodiscard]] exstl::Result<void> merge_kernels_from(const KeyValueRecord& other)
     {
         for (const std::string& key : other.string_keys_with_prefix(kKernelFieldPrefix))
         {

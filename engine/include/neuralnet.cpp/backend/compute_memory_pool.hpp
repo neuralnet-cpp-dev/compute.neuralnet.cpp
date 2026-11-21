@@ -31,7 +31,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <neuralnet.cpp/core_errors.hpp>
+#include <exstl/errors.hpp>
 
 namespace nn
 {
@@ -226,9 +226,9 @@ private:
     }
 
     // 注：Block 的移动赋值被 delete（防止 vector 操作引发意外释放），
-    // 但移动构造可用。此处 `return block;` 经由移动构造构造 std::expected<Block, Error>，
+    // 但移动构造可用。此处 `return block;` 经由移动构造构造 std::expected<Block, exstl::Error>，
     // 不触发移动赋值，故可正常编译。
-    [[nodiscard]] Result<Block> create_block(uint32_t memory_type_index,
+    [[nodiscard]] exstl::Result<Block> create_block(uint32_t memory_type_index,
                                              VkMemoryPropertyFlags flags, VkDeviceSize size = 0)
     {
         VkDeviceSize alloc_size = (size > 0) ? size : block_size_;
@@ -256,11 +256,11 @@ private:
             // 真的占满，而是调用方未包 batch 作用域（逐原语路径不回收帧内
             // 临时分配）。报错必须指向根因与修复动作。
             if (res == VK_ERROR_OUT_OF_DEVICE_MEMORY)
-                NN_FAIL("vkAllocateMemory failed: VK_ERROR_OUT_OF_DEVICE_MEMORY"
+                EX_FAIL("vkAllocateMemory failed: VK_ERROR_OUT_OF_DEVICE_MEMORY"
                         "（显存不足；若在 GPU 上做单次推理/评估，请用"
                         " nn::InferenceScope 或 begin_batch/end_batch 包裹"
                         "——未收口的 batch 作用域会导致帧内分配持续累积）");
-            NN_FAIL("vkAllocateMemory failed: " + std::to_string(res));
+            EX_FAIL("vkAllocateMemory failed: " + std::to_string(res));
         }
         c_blocks_created_++;
 
@@ -306,7 +306,7 @@ public:
     MemoryPool(MemoryPool&&) = delete;
     MemoryPool& operator=(MemoryPool&&) = delete;
 
-    [[nodiscard]] Result<Allocation> allocate(VkMemoryRequirements requirements,
+    [[nodiscard]] exstl::Result<Allocation> allocate(VkMemoryRequirements requirements,
                                               VkMemoryPropertyFlags preferred_flags,
                                               VkMemoryPropertyFlags fallback_flags = 0)
     {
@@ -315,7 +315,7 @@ public:
 
         auto mem_type =
             find_memory_type(requirements.memoryTypeBits, preferred_flags, fallback_flags);
-        if (!mem_type) NN_FAIL("No suitable GPU memory type found");
+        if (!mem_type) EX_FAIL("No suitable GPU memory type found");
         VkDeviceSize alignment = requirements.alignment > 0 ? requirements.alignment : 1;
         // matmul_tiled 等 vec4 SSBO 快路径要求基址 16B 对齐（std430 vec4 读的
         // 对齐门槛）。buffer requirements 可能小于 16，这里统一抬到 ≥16；
@@ -363,10 +363,10 @@ public:
 
         // 创建新块
         auto block_result = create_block(*mem_type, preferred_flags, pool_size);
-        NN_TRY_CHECK(block_result);
+        EX_TRY_CHECK(block_result);
         auto new_block = std::make_unique<Block>(std::move(*block_result));
         auto best = find_best(*new_block, alignment, alloc_size);
-        if (!best) NN_FAIL("Suballocation failed in new block");
+        if (!best) EX_FAIL("Suballocation failed in new block");
         VkDeviceMemory mem = new_block->memory;
         VkMemoryPropertyFlags flags = new_block->property_flags;
         new_block->allocation_count++;

@@ -44,8 +44,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include <neuralnet.cpp/core_errors.hpp>
-#include <neuralnet.cpp/core_observer_ptr.hpp>
+#include <exstl/errors.hpp>
+#include <exstl/observer_ptr.hpp>
 #include <neuralnet.cpp/core_config.hpp>
 #include <neuralnet.cpp/core_profile.hpp>   // 设备侧计时回填（NN_PROFILE=1 门控）
 // 本文件直接使用 expr_spec 的符号（run_fused_gpu 签名的 ExprPrecSig、
@@ -498,7 +498,7 @@ struct GpuBuffer::Impl
     VkDevice device = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
     MemoryPool::Allocation alloc;
-    observer_ptr<MemoryPool> pool;
+    exstl::observer_ptr<MemoryPool> pool;
     std::uint64_t write_epoch = 0;
 };
 
@@ -782,7 +782,7 @@ private:
         VkDevice device = VK_NULL_HANDLE;
         VkBuffer buffer = VK_NULL_HANDLE;
         MemoryPool::Allocation alloc;
-        observer_ptr<MemoryPool> pool;
+        exstl::observer_ptr<MemoryPool> pool;
         std::size_t frame = 0;  // 允许销毁的帧索引（该帧完成后才可释放）
     };
     std::mutex pending_mutex_;

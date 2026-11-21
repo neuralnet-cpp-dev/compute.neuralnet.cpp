@@ -361,7 +361,7 @@ namespace fused
 
 // RV-03 兜底校验：给定**执行序**下的 kernel 列表，检查每条顺序隐患边都保序。
 // 违反 = 静默错值的隐患已经成真 → fail-fast（绝不静默算错）。
-[[nodiscard]] inline Result<void> validate_dst_order(const ExprGraph& g,
+[[nodiscard]] inline exstl::Result<void> validate_dst_order(const ExprGraph& g,
                                                      std::span<const FusedKernel> ordered_kernels)
 {
     const std::vector<std::pair<int, int>> edges = dst_order_constraints(g);
@@ -386,7 +386,7 @@ namespace fused
         if (pi == pj &&
             member_pos[static_cast<std::size_t>(i)] < member_pos[static_cast<std::size_t>(j)])
             continue;
-        NN_FAIL("IR-C 顺序隐患被破坏（同目标写序/WAR 要求节点 i 先于 j 执行）：i=" +
+        EX_FAIL("IR-C 顺序隐患被破坏（同目标写序/WAR 要求节点 i 先于 j 执行）：i=" +
                 std::to_string(i) + " j=" + std::to_string(j) + "（分组或重排拆掉了显式顺序边）");
     }
     return {};
@@ -438,7 +438,7 @@ namespace fused
         {
             // NN_IRC_TRACE 按 C3 裁决为**非探针门行为开关**（AGENTS §7）：
             // 走 env_flag_raw，默认构建下 `NN_IRC_TRACE=1` 同样生效。
-            if (::nn::detail::env_flag_raw("NN_IRC_TRACE"))
+            if (::exstl::env::flag("NN_IRC_TRACE"))
                 std::fprintf(stderr,
                              "[ir-c][fuse-decline] into 节点输出（node %d, key %s）"
                              "拒绝拼接为非尾 → 独立 kernel 落盘\n",

@@ -20,11 +20,11 @@ inline GpuBuffer make_gpu_buffer(VkDevice device, VkBuffer buffer,
     impl->device = device;
     impl->buffer = buffer;
     impl->alloc = alloc;
-    impl->pool = observer_ptr<MemoryPool>(pool);
+    impl->pool = exstl::observer_ptr<MemoryPool>(pool);
     return GpuBuffer(std::move(impl), std::move(backend_keepalive));
 }
 
-Result<GpuBuffer>
+exstl::Result<GpuBuffer>
 GpuBuffer::create_device_local(std::uint64_t device_u, MemoryPool& pool, std::size_t byte_count,
                                std::uint32_t usage_u, std::shared_ptr<GpuBackend> backend_keepalive)
 {
@@ -40,7 +40,7 @@ GpuBuffer::create_device_local(std::uint64_t device_u, MemoryPool& pool, std::si
 
     VkBuffer buffer = VK_NULL_HANDLE;
     VkResult res = vkCreateBuffer(device, &buf_info, nullptr, &buffer);
-    if (res != VK_SUCCESS) NN_FAIL("vkCreateBuffer failed: " + std::to_string(res));
+    if (res != VK_SUCCESS) EX_FAIL("vkCreateBuffer failed: " + std::to_string(res));
     VkMemoryRequirements mem_reqs;
     vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
 
@@ -48,7 +48,7 @@ GpuBuffer::create_device_local(std::uint64_t device_u, MemoryPool& pool, std::si
     if (!alloc_r)
     {
         vkDestroyBuffer(device, buffer, nullptr);
-        NN_TRY_CHECK(alloc_r);
+        EX_TRY_CHECK(alloc_r);
     }
 
     res = vkBindBufferMemory(device, buffer, alloc_r->memory, alloc_r->offset);
@@ -56,13 +56,13 @@ GpuBuffer::create_device_local(std::uint64_t device_u, MemoryPool& pool, std::si
     {
         pool.free(*alloc_r);
         vkDestroyBuffer(device, buffer, nullptr);
-        NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
+        EX_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
     }
 
     return make_gpu_buffer(device, buffer, *alloc_r, pool, std::move(backend_keepalive));
 }
 
-Result<GpuBuffer>
+exstl::Result<GpuBuffer>
 GpuBuffer::create_host_visible(std::uint64_t device_u, MemoryPool& pool, std::size_t byte_count,
                                std::uint32_t usage_u, std::shared_ptr<GpuBackend> backend_keepalive)
 {
@@ -79,7 +79,7 @@ GpuBuffer::create_host_visible(std::uint64_t device_u, MemoryPool& pool, std::si
 
     VkBuffer buffer = VK_NULL_HANDLE;
     VkResult res = vkCreateBuffer(device, &buf_info, nullptr, &buffer);
-    if (res != VK_SUCCESS) NN_FAIL("vkCreateBuffer failed: " + std::to_string(res));
+    if (res != VK_SUCCESS) EX_FAIL("vkCreateBuffer failed: " + std::to_string(res));
     VkMemoryRequirements mem_reqs;
     vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
 
@@ -100,7 +100,7 @@ GpuBuffer::create_host_visible(std::uint64_t device_u, MemoryPool& pool, std::si
     if (!alloc_r)
     {
         vkDestroyBuffer(device, buffer, nullptr);
-        NN_TRY_CHECK(alloc_r);
+        EX_TRY_CHECK(alloc_r);
     }
 
     res = vkBindBufferMemory(device, buffer, alloc_r->memory, alloc_r->offset);
@@ -108,7 +108,7 @@ GpuBuffer::create_host_visible(std::uint64_t device_u, MemoryPool& pool, std::si
     {
         pool.free(*alloc_r);
         vkDestroyBuffer(device, buffer, nullptr);
-        NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
+        EX_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
     }
 
     return make_gpu_buffer(device, buffer, *alloc_r, pool, std::move(backend_keepalive));
@@ -123,10 +123,10 @@ static constexpr VkBufferUsageFlags TENSOR_BUFFER_USAGE = VK_BUFFER_USAGE_STORAG
                                                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
 template <Precision P>
-inline Result<GpuTensorT<P>> GpuTensorT<P>::from_matrix(const MatrixT<P>& cpu_mat,
+inline exstl::Result<GpuTensorT<P>> GpuTensorT<P>::from_matrix(const MatrixT<P>& cpu_mat,
                                                         GpuBackend& backend)
 {
-    if (cpu_mat.empty()) NN_FAIL("Empty matrix");
+    if (cpu_mat.empty()) EX_FAIL("Empty matrix");
     // buffer 字节数 = 元素数 × sizeof(elem<P>)（§6.3），**4 B 对齐**（见下）
     // ⚠ 缓冲字节数 4 B 对齐（P3 验收门 D 实测修复）：f16 按 2 B/元素，奇数
     //   元素数时 packHalf2x16 类写点（cast.comp 的 D[pairs-1] 等）的最后一个
@@ -138,18 +138,18 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::from_matrix(const MatrixT<P>& cpu_ma
     auto buf_res =
         GpuBuffer::create_device_local(reinterpret_cast<std::uint64_t>(backend.device().device()), backend.alloc_pool(), byte_count,
                                        TENSOR_BUFFER_USAGE, backend.keepalive());
-    NN_TRY_CHECK(buf_res);
+    EX_TRY_CHECK(buf_res);
     auto tensor = GpuTensorT<P>(std::make_shared<GpuBuffer>(std::move(*buf_res)), cpu_mat.rows(),
                                 cpu_mat.cols());
 
     // 同精度跨设备 = 原始字节拷贝（§6.5）
     auto upload_res = backend.upload_blocking(tensor, cpu_mat.span());
-    NN_TRY_CHECK(upload_res);
+    EX_TRY_CHECK(upload_res);
     return tensor;
 }
 
 template <Precision P>
-inline Result<GpuTensorT<P>> GpuTensorT<P>::create_empty(std::size_t rows, std::size_t cols,
+inline exstl::Result<GpuTensorT<P>> GpuTensorT<P>::create_empty(std::size_t rows, std::size_t cols,
                                                          GpuBackend& backend)
 {
     // buffer 字节数 = 元素数 × sizeof(elem<P>)（§6.3），**4 B 对齐**（见下）
@@ -165,19 +165,19 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::create_empty(std::size_t rows, std::
     constexpr std::size_t k_elem_bytes = sizeof(elem<P>);
     constexpr std::size_t k_max_size = ~std::size_t{0};
     if (rows != 0 && cols > (k_max_size - 3) / k_elem_bytes / rows)
-        NN_FAIL("GpuTensorT::create_empty: 字节数溢出（rows*cols*sizeof(elem) 超过 size_t 上限）");
+        EX_FAIL("GpuTensorT::create_empty: 字节数溢出（rows*cols*sizeof(elem) 超过 size_t 上限）");
     const std::size_t byte_count = (rows * cols * sizeof(elem<P>) + 3u) & ~std::size_t{3};
     // TRANSFER_DST_BIT: 允许 vkCmdFillBuffer (zero) 和 vkCmdCopyBuffer (insert_rows) 写入
     // TRANSFER_SRC_BIT: 允许 vkCmdCopyBuffer (clone/slice_rows) 读取
     auto buf_res =
         GpuBuffer::create_device_local(reinterpret_cast<std::uint64_t>(backend.device().device()), backend.alloc_pool(), byte_count,
                                        TENSOR_BUFFER_USAGE, backend.keepalive());
-    NN_TRY_CHECK(buf_res);
+    EX_TRY_CHECK(buf_res);
     return GpuTensorT<P>(std::make_shared<GpuBuffer>(std::move(*buf_res)), rows, cols);
 }
 
 template <Precision P>
-inline Result<GpuTensorT<P>>
+inline exstl::Result<GpuTensorT<P>>
 GpuTensorT<P>::create_host_visible_empty(std::size_t rows, std::size_t cols, GpuBackend& backend)
 {
     // Host Visible 存储（activation offload）：数据驻留主机可见内存（§6.6）。
@@ -185,21 +185,21 @@ GpuTensorT<P>::create_host_visible_empty(std::size_t rows, std::size_t cols, Gpu
     constexpr std::size_t k_elem_bytes = sizeof(elem<P>);
     constexpr std::size_t k_max_size = ~std::size_t{0};
     if (rows != 0 && cols > (k_max_size - 3) / k_elem_bytes / rows)
-        NN_FAIL("GpuTensorT::create_host_visible_empty: 字节数溢出（rows*cols*sizeof(elem) 超过 size_t 上限）");
+        EX_FAIL("GpuTensorT::create_host_visible_empty: 字节数溢出（rows*cols*sizeof(elem) 超过 size_t 上限）");
     const std::size_t byte_count = (rows * cols * sizeof(elem<P>) + 3u) & ~std::size_t{3};  // 4 B 对齐（同上）
     auto buf_res =
         GpuBuffer::create_host_visible(reinterpret_cast<std::uint64_t>(backend.device().device()), backend.alloc_pool(), byte_count,
                                        TENSOR_BUFFER_USAGE, backend.keepalive());
-    NN_TRY_CHECK(buf_res);
+    EX_TRY_CHECK(buf_res);
     return GpuTensorT<P>(std::make_shared<GpuBuffer>(std::move(*buf_res)), rows, cols);
 }
 
-template <Precision P> inline Result<MatrixT<P>> GpuTensorT<P>::to_matrix(GpuBackend& backend) const
+template <Precision P> inline exstl::Result<MatrixT<P>> GpuTensorT<P>::to_matrix(GpuBackend& backend) const
 {
-    if (!valid()) NN_FAIL("Invalid GpuTensor");
+    if (!valid()) EX_FAIL("Invalid GpuTensor");
     MatrixT<P> cpu_mat(rows_, cols_);
     auto dl_res = backend.download_blocking(*this, cpu_mat.span());
-    NN_TRY_CHECK(dl_res);
+    EX_TRY_CHECK(dl_res);
     return cpu_mat;
 }
 

@@ -52,7 +52,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <neuralnet.cpp/core_errors.hpp>   // base 仓
+#include <exstl/errors.hpp>   // base 仓
 
 namespace nn
 {
@@ -60,7 +60,7 @@ namespace nn
 // ── v2 字节源契约（公开类型；kvrec_memory_source 是其内存实现）──────────
 // ReadAt 语义：addr 为文件绝对偏移，取 [addr, addr+len) 字节。
 // KeyValueRecord::parse_at 的参数类型，库外自定义字节源（文件/流式）同用此型。
-using KvReadAt = std::function<Result<std::string>(std::uint64_t addr, std::uint64_t len)>;
+using KvReadAt = std::function<exstl::Result<std::string>(std::uint64_t addr, std::uint64_t len)>;
 
 namespace detail
 {
@@ -108,34 +108,34 @@ struct KvCursor
     const KvReadAt* read = nullptr;
     std::uint64_t pos = 0;
 
-    [[nodiscard]] Result<std::string> take(std::uint64_t n)
+    [[nodiscard]] exstl::Result<std::string> take(std::uint64_t n)
     {
-        NN_TRY(buf, (*read)(pos, n));
+        EX_TRY(buf, (*read)(pos, n));
         pos += n;
         return buf;
     }
 
-    [[nodiscard]] Result<std::uint32_t> take_u32()
+    [[nodiscard]] exstl::Result<std::uint32_t> take_u32()
     {
-        NN_TRY(b, take(4));
+        EX_TRY(b, take(4));
         std::string_view sv = *b;
         std::uint32_t v = 0;
-        if (!::nn::detail::take_u32(sv, v)) NN_FAIL("KeyValueRecord::parse: u32 解码失败");
+        if (!::nn::detail::take_u32(sv, v)) EX_FAIL("KeyValueRecord::parse: u32 解码失败");
         return v;
     }
 
-    [[nodiscard]] Result<std::uint64_t> take_u64()
+    [[nodiscard]] exstl::Result<std::uint64_t> take_u64()
     {
-        NN_TRY(b, take(8));
+        EX_TRY(b, take(8));
         std::string_view sv = *b;
         std::uint64_t v = 0;
-        if (!::nn::detail::take_u64(sv, v)) NN_FAIL("KeyValueRecord::parse: u64 解码失败");
+        if (!::nn::detail::take_u64(sv, v)) EX_FAIL("KeyValueRecord::parse: u64 解码失败");
         return v;
     }
 
-    [[nodiscard]] Result<std::uint8_t> take_u8()
+    [[nodiscard]] exstl::Result<std::uint8_t> take_u8()
     {
-        NN_TRY(b, take(1));
+        EX_TRY(b, take(1));
         return static_cast<std::uint8_t>(static_cast<unsigned char>((*b)[0]));
     }
 };
@@ -146,10 +146,10 @@ struct KvCursor
 // ⚠ 捕获 string_view，调用方须保证 bytes 生命周期覆盖解析期。
 inline KvReadAt kvrec_memory_source(std::string_view bytes)
 {
-    return [bytes](std::uint64_t addr, std::uint64_t len) -> Result<std::string>
+    return [bytes](std::uint64_t addr, std::uint64_t len) -> exstl::Result<std::string>
     {
         if (addr > bytes.size() || len > bytes.size() - addr)
-            NN_FAIL("KeyValueRecord::parse: 读取越界（addr=" + std::to_string(addr) + ", len=" +
+            EX_FAIL("KeyValueRecord::parse: 读取越界（addr=" + std::to_string(addr) + ", len=" +
                     std::to_string(len) + ", size=" + std::to_string(bytes.size()) + "）");
         return std::string(
             bytes.substr(static_cast<std::size_t>(addr), static_cast<std::size_t>(len)));
@@ -191,9 +191,9 @@ public:
 
     // ── 解析（哨兵自举：无版本字段 = v1，有 = 按版本读）──────────
     // bytes 视为完整文件映像，v2 地址相对 bytes 起点。
-    [[nodiscard]] static Result<KeyValueRecord> parse(std::string_view bytes);
+    [[nodiscard]] static exstl::Result<KeyValueRecord> parse(std::string_view bytes);
     // 同上，但字节经 ReadAt 按绝对偏移取（大文件/流式场景）。
-    [[nodiscard]] static Result<KeyValueRecord> parse_at(const ReadAt& read, std::uint64_t offset);
+    [[nodiscard]] static exstl::Result<KeyValueRecord> parse_at(const ReadAt& read, std::uint64_t offset);
 
     // ── 读取（返回 false 表示缺失或类型不符） ──────────────────
     [[nodiscard]] bool has(const std::string& key) const;
@@ -246,7 +246,7 @@ private:
     [[nodiscard]] static std::uint64_t fields_blob_size_(const std::vector<Field>& fs);
     static void serialize_fields_v2_(const std::vector<Field>& fs, std::uint64_t base_offset,
                                      std::string& out);
-    [[nodiscard]] static Result<std::vector<KeyValueRecord::Field>>
+    [[nodiscard]] static exstl::Result<std::vector<KeyValueRecord::Field>>
     parse_fields_v2_(const ReadAt& read, std::uint64_t offset, std::uint32_t total_count);
 };
 
@@ -453,7 +453,7 @@ inline bool kv_decode_value_v1(KeyValueRecord::Type type, std::string_view value
 }
 }  // namespace detail
 
-inline Result<std::vector<KeyValueRecord::Field>>
+inline exstl::Result<std::vector<KeyValueRecord::Field>>
 KeyValueRecord::parse_fields_v2_(const ReadAt& read, std::uint64_t offset,
                                  std::uint32_t total_count)
 {
@@ -469,10 +469,10 @@ KeyValueRecord::parse_fields_v2_(const ReadAt& read, std::uint64_t offset,
     heads.reserve(total_count > 0 ? total_count - 1 : 0);
     for (std::uint32_t i = 1; i < total_count; ++i)
     {
-        NN_TRY(key_len, c.take_u32());
-        NN_TRY(key, c.take(*key_len));
-        NN_TRY(t, c.take_u8());
-        NN_TRY(addr, c.take_u64());
+        EX_TRY(key_len, c.take_u32());
+        EX_TRY(key, c.take(*key_len));
+        EX_TRY(t, c.take_u8());
+        EX_TRY(addr, c.take_u64());
         heads.push_back(Head{std::move(*key), static_cast<Type>(*t), *addr});
     }
     // 字段表到此结束；数据块按字段顺序紧随其后连续排布
@@ -483,10 +483,10 @@ KeyValueRecord::parse_fields_v2_(const ReadAt& read, std::uint64_t offset,
     for (const auto& h : heads)
     {
         if (h.addr != expect)
-            NN_FAIL("KeyValueRecord::parse: 字段 '" + h.key +
+            EX_FAIL("KeyValueRecord::parse: 字段 '" + h.key +
                     "' 数据块地址不连续（整体搬迁的 kvrec 字节地址已失效）");
         detail::KvCursor bc{&read, h.addr};
-        NN_TRY(value_len, bc.take_u64());
+        EX_TRY(value_len, bc.take_u64());
         expect = h.addr + 8 + *value_len;
 
         // 未知类型：按长度跳过（向前兼容），不报错
@@ -499,48 +499,48 @@ KeyValueRecord::parse_fields_v2_(const ReadAt& read, std::uint64_t offset,
         f.type = h.type;
         if (h.type == Type::Record)
         {
-            NN_TRY(sub, parse_at(read, h.addr + 8));
+            EX_TRY(sub, parse_at(read, h.addr + 8));
             f.rec = std::move(sub->fields_);
         }
         else
         {
-            NN_TRY(value, bc.take(*value_len));
+            EX_TRY(value, bc.take(*value_len));
             std::string_view sv = *value;
             if (!detail::kv_decode_value_v1(h.type, sv, f.u, f.s, f.arr))
-                NN_FAIL("KeyValueRecord::parse: 字段 '" + h.key + "' 值长度错误");
+                EX_FAIL("KeyValueRecord::parse: 字段 '" + h.key + "' 值长度错误");
         }
         fields.push_back(std::move(f));
     }
     return fields;
 }
 
-inline Result<KeyValueRecord> KeyValueRecord::parse_at(const ReadAt& read, std::uint64_t offset)
+inline exstl::Result<KeyValueRecord> KeyValueRecord::parse_at(const ReadAt& read, std::uint64_t offset)
 {
     detail::KvCursor c{&read, offset};
     KeyValueRecord rec;
-    NN_TRY(count, c.take_u32());
+    EX_TRY(count, c.take_u32());
     if (*count == 0) return rec;  // 空记录按 v1 处理
 
     // ── field[0] 按 v1 布局读出（版本自举的判别点）────────────────
-    NN_TRY(key_len0, c.take_u32());
-    NN_TRY(key0, c.take(*key_len0));
-    NN_TRY(type0, c.take_u8());
-    NN_TRY(value_len0, c.take_u32());
-    NN_TRY(value0, c.take(*value_len0));
+    EX_TRY(key_len0, c.take_u32());
+    EX_TRY(key0, c.take(*key_len0));
+    EX_TRY(type0, c.take_u8());
+    EX_TRY(value_len0, c.take_u32());
+    EX_TRY(value0, c.take(*value_len0));
 
     if (std::string_view(*key0) == KVREC_VERSION_KEY)
     {
         // ── v2：哨兵必须是 UInt(2)；余下字段按 v2 布局解析 ─────────
         if (static_cast<Type>(*type0) != Type::UInt || *value_len0 != 8)
-            NN_FAIL("KeyValueRecord::parse: kvrec 版本哨兵字段格式错误");
+            EX_FAIL("KeyValueRecord::parse: kvrec 版本哨兵字段格式错误");
         std::string_view sv = *value0;
         std::uint64_t version = 0;
         if (!detail::take_u64(sv, version))
-            NN_FAIL("KeyValueRecord::parse: kvrec 版本哨兵值长度错误");
+            EX_FAIL("KeyValueRecord::parse: kvrec 版本哨兵值长度错误");
         if (version != KVREC_VERSION_V2)
-            NN_FAIL("KeyValueRecord::parse: 不支持的 kvrec 版本 " + std::to_string(version) +
+            EX_FAIL("KeyValueRecord::parse: 不支持的 kvrec 版本 " + std::to_string(version) +
                     "（当前支持 v2）");
-        NN_TRY(fields, parse_fields_v2_(read, c.pos, *count));
+        EX_TRY(fields, parse_fields_v2_(read, c.pos, *count));
         rec.fields_ = std::move(*fields);
         rec.rebuild_index_();
         return rec;
@@ -559,16 +559,16 @@ inline Result<KeyValueRecord> KeyValueRecord::parse_at(const ReadAt& read, std::
             // 未知类型：按长度安全跳过（向前兼容），不报错
         }
         else if (!detail::kv_decode_value_v1(f.type, sv, f.u, f.s, f.arr))
-            NN_FAIL("KeyValueRecord::parse: 字段 '" + f.key + "' 值长度错误");
+            EX_FAIL("KeyValueRecord::parse: 字段 '" + f.key + "' 值长度错误");
         else rec.fields_.push_back(std::move(f));
     }
     for (std::uint32_t i = 1; i < *count; ++i)
     {
-        NN_TRY(key_len, c.take_u32());
-        NN_TRY(key, c.take(*key_len));
-        NN_TRY(t, c.take_u8());
-        NN_TRY(value_len, c.take_u32());
-        NN_TRY(value, c.take(*value_len));
+        EX_TRY(key_len, c.take_u32());
+        EX_TRY(key, c.take(*key_len));
+        EX_TRY(t, c.take_u8());
+        EX_TRY(value_len, c.take_u32());
+        EX_TRY(value, c.take(*value_len));
 
         const Type type = static_cast<Type>(*t);
         // 未知类型：按长度跳过（向前兼容），不报错
@@ -579,14 +579,14 @@ inline Result<KeyValueRecord> KeyValueRecord::parse_at(const ReadAt& read, std::
         f.type = type;
         std::string_view sv = *value;
         if (!detail::kv_decode_value_v1(type, sv, f.u, f.s, f.arr))
-            NN_FAIL("KeyValueRecord::parse: 字段 '" + f.key + "' 值长度错误");
+            EX_FAIL("KeyValueRecord::parse: 字段 '" + f.key + "' 值长度错误");
         rec.fields_.push_back(std::move(f));
     }
     rec.rebuild_index_();
     return rec;
 }
 
-inline Result<KeyValueRecord> KeyValueRecord::parse(std::string_view bytes)
+inline exstl::Result<KeyValueRecord> KeyValueRecord::parse(std::string_view bytes)
 { return parse_at(kvrec_memory_source(bytes), 0); }
 
 inline bool KeyValueRecord::has(const std::string& key) const

@@ -72,6 +72,17 @@ set(ABST_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/abstraction/include)
 set(ENGINE_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/engine/include)
 set(GENERATED_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
+# ── exSTL（foundation：errors/assert/threadpool/parallel/observer_ptr/env）──
+# 嵌入主仓时目标已由主仓 add_subdirectory(exstl) 创建；独立构建时从 sibling
+# ../exstl 拉入。零嵌套 submodule——只消费目标，不 git pin。
+if(NOT TARGET exstl::exstl)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../exstl/CMakeLists.txt)
+        add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../exstl ${CMAKE_CURRENT_BINARY_DIR}/exstl)
+    else()
+        find_package(exstl REQUIRED)
+    endif()
+endif()
+
 # 消费侧头（层/模型/训练/数据集/分词器/优化器）单一真源在主仓 include/，
 # engine/engine/include 只保留引擎实现头，不再保存层/模型头副本；
 # 纯接口头（expr_dsl / expr_fold / expr_registry / ternary_pack / int8_pack /
@@ -96,7 +107,7 @@ if(WIN32)
     set_target_properties(nn_cpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 target_include_directories(nn_cpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp)
-target_link_libraries(nn_cpu PRIVATE Threads::Threads)
+target_link_libraries(nn_cpu PRIVATE exstl::exstl Threads::Threads)
 set_target_properties(nn_cpu PROPERTIES
     OUTPUT_NAME nn-cpu
     CXX_VISIBILITY_PRESET default
@@ -194,7 +205,7 @@ if(NN_ENABLE_GPU)
             target_compile_definitions(nn_gpu PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
         endif()
         target_include_directories(nn_gpu PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${GENERATED_INCLUDE})
-        target_link_libraries(nn_gpu PRIVATE Threads::Threads Vulkan::Vulkan)
+        target_link_libraries(nn_gpu PRIVATE exstl::exstl Threads::Threads Vulkan::Vulkan)
         target_compile_definitions(nn_gpu PRIVATE NN_HAS_VULKAN=1)
         add_custom_target(gpu_generated DEPENDS ${GPU_GENERATED_HPP})
         add_dependencies(nn_gpu gpu_generated)
@@ -226,7 +237,7 @@ if(SHADERC_INCLUDE_DIR AND SHADERC_LIBRARY)
         set_target_properties(nn_kernelgen PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
     endif()
     target_include_directories(nn_kernelgen PRIVATE ${ABST_INCLUDE} ${ABST_INCLUDE}/neuralnet.cpp ${ENGINE_INCLUDE} ${ENGINE_INCLUDE}/neuralnet.cpp ${SHADERC_INCLUDE_DIR})
-    target_link_libraries(nn_kernelgen PRIVATE Threads::Threads ${SHADERC_LIBRARY})
+    target_link_libraries(nn_kernelgen PRIVATE exstl::exstl Threads::Threads ${SHADERC_LIBRARY})
     set_target_properties(nn_kernelgen PROPERTIES
         OUTPUT_NAME nn-kernelgen
         CXX_VISIBILITY_PRESET default

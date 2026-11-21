@@ -25,7 +25,7 @@
 #include <variant>
 
 #include <neuralnet.cpp/core_config.hpp>
-#include <neuralnet.cpp/core_errors.hpp>
+#include <exstl/errors.hpp>
 #include "core_domain.hpp"
 #include <neuralnet.cpp/precision.hpp>
 #include "algebra_matrix.hpp"
@@ -296,7 +296,7 @@ private:
         // 用 cpu_get_ptr（不拷贝 shared_ptr）：该函数在逐元素热点上会被按元素
         // 调用，拷贝 shared_ptr 的原子引用计数是实测的主要开销来源。
         MatrixT<P>* p = cpu_get_ptr<P>();
-        NN_ASSERT_ALWAYS(device_ == Device::CPU && p,
+        EX_ASSERT_ALWAYS(device_ == Device::CPU && p,
                          "cpu_matrix<P>(): tensor has no P-precision CPU storage");
         return *p;
     }
@@ -305,7 +305,7 @@ private:
     {
         static_assert(P == Precision::F16 || P == Precision::F32, "Phase 1 仅支持 F16/F32");
         const MatrixT<P>* p = cpu_get_ptr<P>();
-        NN_ASSERT_ALWAYS(device_ == Device::CPU && p,
+        EX_ASSERT_ALWAYS(device_ == Device::CPU && p,
                          "cpu_matrix<P>() const: tensor has no P-precision CPU storage");
         return *p;
     }
@@ -325,7 +325,7 @@ private:
                          "dev=%d %zux%zu\n",
                          static_cast<int>(P), static_cast<int>(precision_), gpu_data_.index(),
                          static_cast<int>(device_), rows_, cols_);
-        NN_ASSERT_ALWAYS(device_ == Device::GPU && p,
+        EX_ASSERT_ALWAYS(device_ == Device::GPU && p,
                          "gpu_tensor<P>(): tensor has no P-precision GPU storage");
         return *p;
     }
@@ -334,7 +334,7 @@ private:
     {
         static_assert(P == Precision::F16 || P == Precision::F32, "Phase 1 仅支持 F16/F32");
         auto p = gpu_get<P>();
-        NN_ASSERT_ALWAYS(device_ == Device::GPU && p,
+        EX_ASSERT_ALWAYS(device_ == Device::GPU && p,
                          "gpu_tensor<P>() const: tensor has no P-precision GPU storage");
         return *p;
     }
@@ -382,7 +382,7 @@ private:
     // 视图"能力，按 precision_ 复制数据到新形状的 Matrix（§6.1）。
     [[nodiscard]] Tensor reshape(std::size_t new_rows, std::size_t new_cols) const
     {
-        NN_ASSERT_ALWAYS(rows_ * cols_ == new_rows * new_cols, "reshape: element count mismatch");
+        EX_ASSERT_ALWAYS(rows_ * cols_ == new_rows * new_cols, "reshape: element count mismatch");
         Tensor t;
         t.device_ = device_;
         t.precision_ = precision_;

@@ -2,7 +2,6 @@
 
 #include <cstddef>
 
-#include "core_errors.hpp"
 #include "precision.hpp"
 
 // NN_VECTORIZE_PRAGMA：循环向量化提示的编译器分支实现，统一定义在 core_config.hpp
@@ -37,24 +36,7 @@ static_assert(BLOCK_SIZE * BLOCK_SIZE * sizeof(Scalar) <= 65536,
 // 使用 constexpr 避免运行时计算
 inline constexpr Scalar EPSILON = 1e-6f;
 
-// ── 并行阈值 ─────────────────────────────────────────────────────────────
-// 元素数 >= 此值时启用线程池并行；低于则串行执行（避免调度开销）。
-// 线程池调度开销约 50-200μs（Windows mutex+cv），仅当计算量足够时并行才有收益。
-//
-// 实测结果（32 核 CPU, Release -O3）：
-//   元素数   串行μs  并行μs  加速比   建议
-//   16384     9.6    9.8     0.98x   无差别
-//   32768    18.8   19.9     0.94x   无差别
-//   65536    38.7  121.7     0.32x   串行优（调度开销显现）
-//   131072   76.4  182.8     0.42x   串行优
-//   262144  151.6  196.0     0.77x   串行优
-//   524288  308.7  201.5     1.53x   ← 首次稳定 > 1.5x
-//   1048576 620.3  186.7     3.32x   并行优（稳定）
-//   2097152 1239.5 217.3     5.70x   并行优
-//   4194304 2657.3 340.6     7.80x   并行优
-// 取 524288 (512K) 作为阈值：在加速比首次稳定 > 1.5x 的位置。
-// 注：1024-4096 元素数测出的高加速比是亚微秒级测量噪声，不可靠。
-inline constexpr std::size_t PARALLEL_THRESHOLD = 524288;
+// exstl::PARALLEL_THRESHOLD 已迁 <exstl/parallel.hpp>（exstl::PARALLEL_THRESHOLD）。
 
 // ── 诊断探针编译门（默认关；CMake `-DNN_ENABLE_PROBES=ON` 才编入）────────
 // "探针" = 会在**热路径**采样/打印/下载/扫描的诊断代码：层内逐中间量扫描

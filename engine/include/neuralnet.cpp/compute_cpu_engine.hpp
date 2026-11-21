@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "compute_engine.hpp"
-#include <neuralnet.cpp/core_parallel.hpp> // nn::for_each / parallel_for_blocks / parallel_for_samples
+#include <exstl/parallel.hpp> // exstl::for_each / parallel_for_blocks / parallel_for_samples
 #include "expr_opt.hpp"
 #include "expr_op_table.hpp" // 算子元数据单一真源（CPU 标量语义 / GLSL 形态，RV-07）
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
@@ -35,7 +35,7 @@ namespace nn
 // 解释器并行门控（eval_expr_impl / 归约预计算共用）。
 // 解释执行的 per-element 成本比向量化逐元素高约一个数量级
 // （原 docs/development/11-cpu-performance-diagnosis.md §2.4：解释器 vs 等价串行标量 ~9x；该诊断文档已删，见 docs/history/history.md「失效文档链接清理」），而并行区启动
-// 开销约 100µs，因此门控远低于 nn::PARALLEL_THRESHOLD(524288)：
+// 开销约 100µs，因此门控远低于 exstl::PARALLEL_THRESHOLD(524288)：
 // 65536 元素 × ~10ns/element ≈ 0.65ms ≫ 0.1ms，稳赚。
 inline constexpr std::size_t kExprParallelThreshold = 65536;
 
@@ -52,9 +52,9 @@ public:
     [[nodiscard]] Device device() const noexcept override { return Device::CPU; }
 
     // ── 批处理：CPU 为 no-op（同步执行） ──────────────────────────────────
-    [[nodiscard]] Result<void> begin_batch() override { return {}; }
-    [[nodiscard]] Result<void> end_batch() override { return {}; }
-    [[nodiscard]] Result<void> flush_batch() override { return {}; }
+    [[nodiscard]] exstl::Result<void> begin_batch() override { return {}; }
+    [[nodiscard]] exstl::Result<void> end_batch() override { return {}; }
+    [[nodiscard]] exstl::Result<void> flush_batch() override { return {}; }
 
     // ── 表达式录制（IR-C）──────────────────────────────
     // 普通 CPU 运行：no-op（各表达式直接求值，行为不变——图融合是 GPU 优化）。
@@ -62,12 +62,12 @@ public:
     // 表达式加入图而非直接登记），end_expr 融合分析并登记**全部融合 kernel 的
     // spec**（含未拼接的单节点）——保证 GPU 运行期 begin_expr/end_expr 融合出的
     // 复合 spec 命中 AOT 注册表（注册表两端一致）。
-    [[nodiscard]] Result<void> begin_expr() override
+    [[nodiscard]] exstl::Result<void> begin_expr() override
     {
         return {};
     }
 
-    [[nodiscard]] Result<void> end_expr() override
+    [[nodiscard]] exstl::Result<void> end_expr() override
     {
         return {};
     }
@@ -89,14 +89,14 @@ public:
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
     // RV-02：分配在宿主直配上不会失败（失败 = bad_alloc → abort），故恒成功；
     // 仍按 Result 形态返回以统一协议。
-    [[nodiscard]] Result<Tensor> create_tensor_impl(std::size_t rows, std::size_t cols,
+    [[nodiscard]] exstl::Result<Tensor> create_tensor_impl(std::size_t rows, std::size_t cols,
                                                     Precision P) override
     {
         if (P == Precision::F16) return Tensor::cpu<Precision::F16>(rows, cols);
         return Tensor::cpu(rows, cols);
     }
 
-    [[nodiscard]] Result<Tensor> from_matrix_impl(const Matrix& m, Precision P) override
+    [[nodiscard]] exstl::Result<Tensor> from_matrix_impl(const Matrix& m, Precision P) override
     {
         if (P == Precision::F16)
         {
@@ -111,10 +111,10 @@ public:
         return Tensor::from_matrix(Matrix(m)); // f32 拷贝
     }
 
-    [[nodiscard]] Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) override
+    [[nodiscard]] exstl::Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) override
     {
         NN_PROF_OP("to_matrix");
-        if (!t.is_cpu()) NN_FAIL("to_matrix: tensor is not CPU");
+        if (!t.is_cpu()) EX_FAIL("to_matrix: tensor is not CPU");
         if (P == Precision::F16)
         {
             // 下载为 f16 → cast 到 f32（升 cast，精确无损）
@@ -159,11 +159,11 @@ public:
     }
 
     // ── cast 原语（§7.5，唯一"变精度"算子）──────────────────────────────
-    [[nodiscard]] Result<Tensor> cast_impl(const Tensor& src, Precision dst) override
+    [[nodiscard]] exstl::Result<Tensor> cast_impl(const Tensor& src, Precision dst) override
     {
         if (src.precision() == dst) return src;
 
-        if (!src.is_cpu()) NN_FAIL("cast: CPU engine only supports CPU tensors");
+        if (!src.is_cpu()) EX_FAIL("cast: CPU engine only supports CPU tensors");
         if (src.precision() == Precision::F16 && dst == Precision::F32)
         {
             const auto& m16 = src.cpu_matrix<Precision::F16>();
@@ -186,21 +186,21 @@ public:
             return Tensor::from_matrix(std::move(m16));
         }
 
-        NN_FAIL("cast: unsupported precision conversion");
+        EX_FAIL("cast: unsupported precision conversion");
     }
 
     // ── cast_into / copy_into（多精度适配层的"写回原存储"路径，§6.5）──────
     // 与 cast 的区别是**落点**：保留 dst 的对象身份与底层存储（in-place
     // 语义必需——若替换 dst 对象，其它持有同一张量句柄的缓存会静默失联）。
-    [[nodiscard]] Result<void> copy_into(Tensor& dst, const Tensor& src) override
+    [[nodiscard]] exstl::Result<void> copy_into(Tensor& dst, const Tensor& src) override
     {
         NN_PROF_OP("copy_into");
         WriteEpochGuard wg{dst};
         if (!dst.is_cpu() || !src.is_cpu())
-            NN_FAIL("copy_into: CPU engine only supports CPU tensors");
+            EX_FAIL("copy_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
-            NN_FAIL("copy_into: shape mismatch");
-        if (dst.precision() != src.precision()) NN_FAIL("copy_into: precision mismatch");
+            EX_FAIL("copy_into: shape mismatch");
+        if (dst.precision() != src.precision()) EX_FAIL("copy_into: precision mismatch");
         if (dst.precision() == Precision::F16)
         {
             const auto s = src.cpu_matrix<Precision::F16>().span();
@@ -218,14 +218,14 @@ public:
         return {};
     }
 
-    [[nodiscard]] Result<void> cast_into(const Tensor& src, Tensor& dst) override
+    [[nodiscard]] exstl::Result<void> cast_into(const Tensor& src, Tensor& dst) override
     {
         NN_PROF_OP("cast_into");
         WriteEpochGuard wg{dst};
         if (!dst.is_cpu() || !src.is_cpu())
-            NN_FAIL("cast_into: CPU engine only supports CPU tensors");
+            EX_FAIL("cast_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
-            NN_FAIL("cast_into: shape mismatch");
+            EX_FAIL("cast_into: shape mismatch");
         if (src.precision() == dst.precision()) return copy_into(dst, src);
         if (src.precision() == Precision::F16 && dst.precision() == Precision::F32)
         {
@@ -243,43 +243,43 @@ public:
                 d[i] = s[i]; // 降 cast：round-half-to-even
             return {};
         }
-        NN_FAIL("cast_into: unsupported precision conversion");
+        EX_FAIL("cast_into: unsupported precision conversion");
     }
 
-    [[nodiscard]] Result<void> copy_from_impl(Tensor& dst, const Matrix& src,
+    [[nodiscard]] exstl::Result<void> copy_from_impl(Tensor& dst, const Matrix& src,
                                               bool /*fresh_dst*/) override
     {
         // fresh_dst 是 GPU 录制窗口排空的跳过声明，CPU 直拷无此概念。
-        if (!dst.is_cpu()) NN_FAIL("copy_from: dst tensor is not CPU");
+        if (!dst.is_cpu()) EX_FAIL("copy_from: dst tensor is not CPU");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
-            NN_FAIL("copy_from: shape mismatch");
+            EX_FAIL("copy_from: shape mismatch");
         dst.cpu_matrix() = src; // 拷贝赋值
         return {};
     }
 
-    [[nodiscard]] Result<Tensor> clone_impl(const Tensor& src) override
+    [[nodiscard]] exstl::Result<Tensor> clone_impl(const Tensor& src) override
     {
-        if (!src.is_cpu()) NN_FAIL("clone: src tensor is not CPU");
+        if (!src.is_cpu()) EX_FAIL("clone: src tensor is not CPU");
         // CPU 原语基于 f32 Matrix → 非 f32 输入走通用边界 cast（抬 f32 拷贝 →
         // 落回源精度）；f32 直通。精度策略在此实现，基类入口不做能力分支。
         return move_(src,
-                     [](const Tensor& s) -> Result<Tensor>
+                     [](const Tensor& s) -> exstl::Result<Tensor>
                      {
                          return Tensor::from_matrix(Matrix(s.cpu_matrix())); // 深拷贝
                      });
     }
 
     // ── 行切片：拷贝 src 的行 [start_row, start_row + count) 到新 Tensor ──
-    [[nodiscard]] Result<Tensor> slice_rows_impl(const Tensor& src, std::size_t start_row,
+    [[nodiscard]] exstl::Result<Tensor> slice_rows_impl(const Tensor& src, std::size_t start_row,
                                                  std::size_t count) override
     {
-        if (!src.is_cpu()) NN_FAIL("slice_rows: src tensor is not CPU");
+        if (!src.is_cpu()) EX_FAIL("slice_rows: src tensor is not CPU");
         return move_(src,
-                     [start_row, count](const Tensor& s) -> Result<Tensor>
+                     [start_row, count](const Tensor& s) -> exstl::Result<Tensor>
                      {
                          const Matrix& m = s.cpu_matrix();
                          if (start_row + count > m.rows())
-                             NN_FAIL("slice_rows: range out of bounds");
+                             EX_FAIL("slice_rows: range out of bounds");
                          Matrix result(count, m.cols());
                          const auto src_span = m.span();
                          auto dst_span = result.span();
@@ -292,14 +292,14 @@ public:
     }
 
     // ── 行插入：将 src 的所有行写入 dst 的行 [dst_start_row, ...) ──
-    [[nodiscard]] Result<void> insert_rows_impl(Tensor& dst, std::size_t dst_start_row,
+    [[nodiscard]] exstl::Result<void> insert_rows_impl(Tensor& dst, std::size_t dst_start_row,
                                                 const Tensor& src) override
     {
-        if (!dst.is_cpu() || !src.is_cpu()) NN_FAIL("insert_rows: tensors are not CPU");
+        if (!dst.is_cpu() || !src.is_cpu()) EX_FAIL("insert_rows: tensors are not CPU");
         if (dst.precision() != Precision::F32 || src.precision() != Precision::F32)
             return insert_rows_cast_(dst, dst_start_row, src);
-        if (dst.cols() != src.cols()) NN_FAIL("insert_rows: column count mismatch");
-        if (dst_start_row + src.rows() > dst.rows()) NN_FAIL("insert_rows: range out of bounds");
+        if (dst.cols() != src.cols()) EX_FAIL("insert_rows: column count mismatch");
+        if (dst_start_row + src.rows() > dst.rows()) EX_FAIL("insert_rows: range out of bounds");
         Matrix& d = dst.cpu_matrix();
         const Matrix& s = src.cpu_matrix();
         const auto dst_span = d.span();
@@ -317,21 +317,21 @@ public:
     //   越界索引返回零行（防御性，不抛错）
     //
     // 并行策略：每个输出行独立，按行切分到线程。
-    //   - num * D >= PARALLEL_THRESHOLD 时启用行块并行
+    //   - num * D >= exstl::PARALLEL_THRESHOLD 时启用行块并行
     //   - 否则串行（小批量查表的 D 通常较小，并行调度开销不划算）
     //   - 行块并行避免跨行数据竞争（每行独立写入）
-    [[nodiscard]] Result<Tensor> gather_rows_impl(const Tensor& table,
+    [[nodiscard]] exstl::Result<Tensor> gather_rows_impl(const Tensor& table,
                                                   const Tensor& indices) override
     {
         // 输出精度 = 源精度（表）→ 非 f32 表走边界 cast 助手。
-        return move_(table, [this, &indices](const Tensor& t) -> Result<Tensor>
+        return move_(table, [this, &indices](const Tensor& t) -> exstl::Result<Tensor>
                      { return gather_rows_f32_(t, indices); });
     }
 
 private:
-    [[nodiscard]] Result<Tensor> gather_rows_f32_(const Tensor& table, const Tensor& indices)
+    [[nodiscard]] exstl::Result<Tensor> gather_rows_f32_(const Tensor& table, const Tensor& indices)
     {
-        if (!table.is_cpu() || !indices.is_cpu()) NN_FAIL("gather_rows: tensors are not CPU");
+        if (!table.is_cpu() || !indices.is_cpu()) EX_FAIL("gather_rows: tensors are not CPU");
         const Matrix& tbl = table.cpu_matrix();
         const Matrix& idx = indices.cpu_matrix();
         const std::size_t vocab = tbl.rows();
@@ -344,11 +344,11 @@ private:
         const auto idx_span = idx.span();
 
         const std::size_t total = num * D;
-        if (total >= PARALLEL_THRESHOLD && num > 1)
+        if (total >= exstl::PARALLEL_THRESHOLD && num > 1)
         {
             // 行块并行：每行独立查表，无数据竞争
             auto row_indices = std::views::iota(std::size_t{0}, num);
-            nn::for_each(row_indices.begin(), row_indices.end(),
+            exstl::for_each(row_indices.begin(), row_indices.end(),
                          [dst_span, tbl_span, idx_span, vocab, D](std::size_t i) noexcept
                          {
                              const auto row_idx = static_cast<std::size_t>(idx_span[i]);
@@ -386,7 +386,7 @@ public:
     // ── scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst ──
     //   dst: (vocab, D) 原地修改, indices: 任意形状（按 flat 遍历）, grad: (num_indices, D)
     //   语义: dst[flat_indices[i]] += grad[i]
-    [[nodiscard]] Result<void> scatter_add_rows_impl(Tensor& dst, const Tensor& indices,
+    [[nodiscard]] exstl::Result<void> scatter_add_rows_impl(Tensor& dst, const Tensor& indices,
                                                      const Tensor& grad) override
     {
         if (dst.precision() != Precision::F32 || grad.precision() != Precision::F32)
@@ -395,12 +395,12 @@ public:
     }
 
 private:
-    [[nodiscard]] Result<void> scatter_add_rows_f32_(Tensor& dst, const Tensor& indices,
+    [[nodiscard]] exstl::Result<void> scatter_add_rows_f32_(Tensor& dst, const Tensor& indices,
                                                      const Tensor& grad)
     {
         if (!dst.is_cpu() || !indices.is_cpu() || !grad.is_cpu())
-            NN_FAIL("scatter_add_rows: tensors are not CPU");
-        if (dst.cols() != grad.cols()) NN_FAIL("scatter_add_rows: column count mismatch");
+            EX_FAIL("scatter_add_rows: tensors are not CPU");
+        if (dst.cols() != grad.cols()) EX_FAIL("scatter_add_rows: column count mismatch");
         Matrix& d = dst.cpu_matrix();
         const Matrix& idx = indices.cpu_matrix();
         const Matrix& g = grad.cpu_matrix();
@@ -433,20 +433,20 @@ public:
     //   inverse=true:  (B*M, N) → (M, B*N), out[m, b*N+n] = in[b*M+m, n]
     //
     // 并行策略：按 (b, m) 二维块切分，每块独立 N 元素拷贝，无数据竞争。
-    //   - total >= PARALLEL_THRESHOLD 时启用块级并行
+    //   - total >= exstl::PARALLEL_THRESHOLD 时启用块级并行
     //   - 每块仅一次 std::copy_n(N)，cache 友好
     //   - 典型场景：MHA 中 d_model=128, batch=32, seq=256 → 1M 元素，明显受益
-    [[nodiscard]] Result<Tensor> rearrange_3d_impl(const Tensor& x, std::size_t M, std::size_t B,
+    [[nodiscard]] exstl::Result<Tensor> rearrange_3d_impl(const Tensor& x, std::size_t M, std::size_t B,
                                                    std::size_t N, bool inverse) override
     {
         // 非 f32：边界 cast（抬 f32 → 重入本函数 → 落回源精度）
         if (x.precision() != Precision::F32)
-            return move_(x, [this, M, B, N, inverse](const Tensor& t) -> Result<Tensor>
+            return move_(x, [this, M, B, N, inverse](const Tensor& t) -> exstl::Result<Tensor>
                          { return rearrange_3d_impl(t, M, B, N, inverse); });
-        if (x.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (x.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
         const Matrix& m = x.cpu_matrix();
         const std::size_t total = M * B * N;
-        if (m.size() != total) NN_FAIL("rearrange_3d: element count mismatch");
+        if (m.size() != total) EX_FAIL("rearrange_3d: element count mismatch");
         Matrix out(inverse ? M : (B * M), inverse ? (B * N) : N);
         const auto src = m.span();
         const auto dst = out.span();
@@ -474,10 +474,10 @@ public:
             }
         };
 
-        if (total >= PARALLEL_THRESHOLD && n_blocks > 1)
+        if (total >= exstl::PARALLEL_THRESHOLD && n_blocks > 1)
         {
             auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-            nn::parallel_for_blocks(block_indices.begin(), block_indices.end(), block_kernel);
+            exstl::parallel_for_blocks(block_indices.begin(), block_indices.end(), block_kernel);
         }
         else
         {
@@ -489,32 +489,32 @@ public:
     }
 
     // ── 矩阵转置：A (R, C) → out (C, R) ──
-    [[nodiscard]] Result<Tensor> transpose_impl(const Tensor& A) override
+    [[nodiscard]] exstl::Result<Tensor> transpose_impl(const Tensor& A) override
     {
         if (A.precision() != Precision::F32)
             return move_(A,
-                         [this](const Tensor& t) -> Result<Tensor> { return transpose_impl(t); });
-        if (A.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+                         [this](const Tensor& t) -> exstl::Result<Tensor> { return transpose_impl(t); });
+        if (A.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
         return Tensor::from_matrix(A.cpu_matrix().transpose());
     }
 
     // ── 卷积/池化窗口展开（详见 compute_engine.hpp 契约）───────────────
     // 并行策略：按输出行（im2col 的 r / col2im 的输入像素行）切块，块间无竞争；
     //   两个方向的写入都是**连续行**，读取按窗口散布。
-    [[nodiscard]] Result<Tensor> im2col_impl(const Tensor& x, std::size_t C, std::size_t H,
+    [[nodiscard]] exstl::Result<Tensor> im2col_impl(const Tensor& x, std::size_t C, std::size_t H,
                                              std::size_t W, std::size_t k, std::size_t stride,
                                              std::size_t pad, std::size_t OH,
                                              std::size_t OW) override
     {
         if (x.precision() != Precision::F32)
             return move_(x,
-                         [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> Result<Tensor>
+                         [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> exstl::Result<Tensor>
                          { return im2col_impl(t, C, H, W, k, stride, pad, OH, OW); });
-        if (x.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (x.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
-            NN_FAIL("im2col: C/H/W/k/stride/OH/OW must be > 0");
+            EX_FAIL("im2col: C/H/W/k/stride/OH/OW must be > 0");
         const std::size_t B = x.cols();
-        if (x.rows() != C * H * W) NN_FAIL("im2col: x must be (C*H*W, B)");
+        if (x.rows() != C * H * W) EX_FAIL("im2col: x must be (C*H*W, B)");
         const std::size_t kk = k * k;
         const std::size_t P = OH * OW;
         const std::size_t rows = C * kk;
@@ -557,10 +557,10 @@ public:
             }
         };
 
-        if (rows * cols >= PARALLEL_THRESHOLD && rows > 1)
+        if (rows * cols >= exstl::PARALLEL_THRESHOLD && rows > 1)
         {
             auto idx = std::views::iota(std::size_t{0}, rows);
-            nn::parallel_for_blocks(idx.begin(), idx.end(), row_kernel);
+            exstl::parallel_for_blocks(idx.begin(), idx.end(), row_kernel);
         }
         else
         {
@@ -570,22 +570,22 @@ public:
         return Tensor::from_matrix(std::move(out));
     }
 
-    [[nodiscard]] Result<Tensor> col2im_impl(const Tensor& col, std::size_t C, std::size_t H,
+    [[nodiscard]] exstl::Result<Tensor> col2im_impl(const Tensor& col, std::size_t C, std::size_t H,
                                              std::size_t W, std::size_t k, std::size_t stride,
                                              std::size_t pad, std::size_t OH,
                                              std::size_t OW) override
     {
         if (col.precision() != Precision::F32)
             return move_(col,
-                         [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> Result<Tensor>
+                         [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> exstl::Result<Tensor>
                          { return col2im_impl(t, C, H, W, k, stride, pad, OH, OW); });
-        if (col.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (col.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
-            NN_FAIL("col2im: C/H/W/k/stride/OH/OW must be > 0");
+            EX_FAIL("col2im: C/H/W/k/stride/OH/OW must be > 0");
         const std::size_t kk = k * k;
         const std::size_t P = OH * OW;
         if (col.rows() != C * kk || col.cols() == 0 || col.cols() % P != 0)
-            NN_FAIL("col2im: col must be (C*k*k, B*OH*OW)");
+            EX_FAIL("col2im: col must be (C*k*k, B*OH*OW)");
         const std::size_t B = col.cols() / P;
 
         Matrix out(C * H * W, B, Scalar{0});
@@ -626,10 +626,10 @@ public:
         };
 
         const std::size_t in_rows = C * H * W;
-        if (in_rows * B >= PARALLEL_THRESHOLD && in_rows > 1)
+        if (in_rows * B >= exstl::PARALLEL_THRESHOLD && in_rows > 1)
         {
             auto idx = std::views::iota(std::size_t{0}, in_rows);
-            nn::parallel_for_blocks(idx.begin(), idx.end(), pixel_kernel);
+            exstl::parallel_for_blocks(idx.begin(), idx.end(), pixel_kernel);
         }
         else
         {
@@ -665,30 +665,30 @@ public:
     // 解码只在"逐存储行"上做一次（一行 16 个权重共享一个 32-bit 字，解码一遍
     // 进小缓冲，之后按标量 FMA 复用）—— 既不物化 4 B/权重的 f32 副本，也不
     // 让内层循环反复移位。
-    [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w, const Tensor& scale) override
+    [[nodiscard]] exstl::Result<Tensor> trit_pack_impl(const Tensor& w, const Tensor& scale) override
     {
         const std::size_t words = nn::trit_pack::words_per_row(w.cols());
         // 输出被完整写满（逐行 pack_row）→ 未初始化构造
         Tensor out = Tensor::cpu(w.rows(), words);
-        NN_TRY_CHECK(trit_pack_into_impl(w, scale, out));
+        EX_TRY_CHECK(trit_pack_into_impl(w, scale, out));
         return out;
     }
 
     // 目标传递版：打包结果写进既有容器（不分配新张量；T1_58 显存修复 #L2）
-    [[nodiscard]] Result<void> trit_pack_into_impl(const Tensor& w, const Tensor& scale,
+    [[nodiscard]] exstl::Result<void> trit_pack_into_impl(const Tensor& w, const Tensor& scale,
                                                    Tensor& dst) override
     {
         if (!w.is_cpu() || !scale.is_cpu() || !dst.is_cpu())
-            NN_FAIL("trit_pack_into: tensors are not CPU");
+            EX_FAIL("trit_pack_into: tensors are not CPU");
         if (w.precision() != Precision::F32 || scale.precision() != Precision::F32 ||
             dst.precision() != Precision::F32)
-            NN_FAIL("trit_pack_into: 需要 f32 权重/尺度/容器");
+            EX_FAIL("trit_pack_into: 需要 f32 权重/尺度/容器");
         if (scale.rows() != w.rows() || scale.cols() != 1)
-            NN_FAIL("trit_pack_into: τ 形状必须是 (rows,1)");
+            EX_FAIL("trit_pack_into: τ 形状必须是 (rows,1)");
         const std::size_t rows = w.rows(), k = w.cols();
         const std::size_t words = nn::trit_pack::words_per_row(k);
         if (dst.rows() != rows || dst.cols() != words)
-            NN_FAIL("trit_pack_into: 容器形状不匹配");
+            EX_FAIL("trit_pack_into: 容器形状不匹配");
         const Matrix& wm = w.cpu_matrix();
         const Matrix& sm = scale.cpu_matrix();
         Matrix& om = dst.cpu_matrix();
@@ -706,12 +706,12 @@ public:
         return {};
     }
 
-    [[nodiscard]] Result<Tensor> matmul_q_impl(const Tensor& packed, const Tensor& scale,
+    [[nodiscard]] exstl::Result<Tensor> matmul_q_impl(const Tensor& packed, const Tensor& scale,
                                                const Tensor& B, bool transA, std::size_t out_rows,
                                                Precision P) override
     {
         if (!packed.is_cpu() || !scale.is_cpu() || !B.is_cpu())
-            NN_FAIL("matmul_q: tensors are not CPU");
+            EX_FAIL("matmul_q: tensors are not CPU");
         // 边界 cast（CPU 无 in-kernel f16 变体）：B/输出统一走 f32 参考空间 ——
         // 与 matmul_impl 的 CPU 口径一致（§7.2）。
         if (P != Precision::F32 || B.precision() != Precision::F32)
@@ -719,9 +719,9 @@ public:
             // 注：to_f32/to_prec 是基类**私有**助手（只有基类入口可用）→ 这里
             // 用公共 cast（与 matmul_impl 的 CPU 边界 cast 同款）。
             auto b32 =
-                (B.precision() == Precision::F32) ? Result<Tensor>{B} : cast(B, Precision::F32);
-            NN_TRY_CHECK(b32);
-            NN_TRY(r, matmul_q_impl(packed, scale, *b32, transA, out_rows, Precision::F32));
+                (B.precision() == Precision::F32) ? exstl::Result<Tensor>{B} : cast(B, Precision::F32);
+            EX_TRY_CHECK(b32);
+            EX_TRY(r, matmul_q_impl(packed, scale, *b32, transA, out_rows, Precision::F32));
             if (P == Precision::F32) return r;
             // 递归产物是 `*_impl` 直构；v3 起设备域从存储派生，进公共 cast
             // （内含 bind_check_）无需补任何身份。
@@ -729,7 +729,7 @@ public:
         }
         if (packed.precision() != Precision::F32 || scale.precision() != Precision::F32 ||
             B.precision() != Precision::F32)
-            NN_FAIL("matmul_q: 需要 f32 容器/尺度/操作数");
+            EX_FAIL("matmul_q: 需要 f32 容器/尺度/操作数");
 
         const std::size_t N = B.cols();
         // A 的"存储行长"（每行多少个三值）：transA=0 是 K（求和维），transA=1
@@ -739,14 +739,14 @@ public:
         const std::size_t a_len = transA ? M : K;
         if (transA)
         {
-            if (out_rows == 0) NN_FAIL("matmul_q_t: out_rows 必须显式给出");
-            if (B.rows() != K) NN_FAIL("matmul_q_t: B 行数 != 打包 A 的行数 K");
+            if (out_rows == 0) EX_FAIL("matmul_q_t: out_rows 必须显式给出");
+            if (B.rows() != K) EX_FAIL("matmul_q_t: B 行数 != 打包 A 的行数 K");
         }
-        else if (B.rows() != K) NN_FAIL("matmul_q: B 行数 != A 的列数 K");
+        else if (B.rows() != K) EX_FAIL("matmul_q: B 行数 != A 的列数 K");
         if (nn::trit_pack::words_per_row(a_len) != packed.cols())
-            NN_FAIL("matmul_q: 打包容器列数与 (K/M) 不匹配");
+            EX_FAIL("matmul_q: 打包容器列数与 (K/M) 不匹配");
         if (scale.rows() != packed.rows() || scale.cols() != 1)
-            NN_FAIL("matmul_q: τ 形状必须与打包 A 的行数一致");
+            EX_FAIL("matmul_q: τ 形状必须与打包 A 的行数一致");
 
         Tensor out = Tensor::cpu_uninitialized(M, N);
         const Matrix& pm = packed.cpu_matrix();
@@ -833,27 +833,27 @@ public:
     // 语义与布局：compute_engine.hpp 的公共入口说明 + int8_pack.hpp。
     // 精度：x 非 f32 先抬 f32（§7.2 f32 参考）；输出容器恒 f32（原始字，不做
     // 浮点运算）；matmul_q_i8 的输出按 P 落回（CPU 无 in-kernel f16 变体）。
-    [[nodiscard]] Result<Tensor> quantize_i8_impl(const Tensor& x, const Tensor& scale,
+    [[nodiscard]] exstl::Result<Tensor> quantize_i8_impl(const Tensor& x, const Tensor& scale,
                                                   bool col_scale, Precision P) override
     {
-        if (!x.is_cpu() || !scale.is_cpu()) NN_FAIL("quantize_i8: tensors are not CPU");
+        if (!x.is_cpu() || !scale.is_cpu()) EX_FAIL("quantize_i8: tensors are not CPU");
         if (P != Precision::F32 || x.precision() != Precision::F32)
         {
             auto x32 =
-                (x.precision() == Precision::F32) ? Result<Tensor>{x} : cast(x, Precision::F32);
-            NN_TRY_CHECK(x32);
+                (x.precision() == Precision::F32) ? exstl::Result<Tensor>{x} : cast(x, Precision::F32);
+            EX_TRY_CHECK(x32);
             auto s32 = (scale.precision() == Precision::F32)
-                           ? Result<Tensor>{scale}
+                           ? exstl::Result<Tensor>{scale}
                            : cast(scale, Precision::F32);
-            NN_TRY_CHECK(s32);
+            EX_TRY_CHECK(s32);
             return quantize_i8_impl(*x32, *s32, col_scale, Precision::F32);
         }
-        if (scale.precision() != Precision::F32) NN_FAIL("quantize_i8: 尺度必须 f32");
+        if (scale.precision() != Precision::F32) EX_FAIL("quantize_i8: 尺度必须 f32");
         const std::size_t rows = x.rows(), cols = x.cols();
         if (col_scale && (scale.rows() != 1 || scale.cols() != cols))
-            NN_FAIL("quantize_i8: 列尺度形状必须是 (1,N)（per-token）");
+            EX_FAIL("quantize_i8: 列尺度形状必须是 (1,N)（per-token）");
         if (!col_scale && (scale.rows() != rows || scale.cols() != 1))
-            NN_FAIL("quantize_i8: 行尺度形状必须是 (M,1)");
+            EX_FAIL("quantize_i8: 行尺度形状必须是 (M,1)");
         const std::size_t words = nn::i8_pack::words_per_row(cols);
         Tensor out = Tensor::cpu(rows, words);
         const Matrix& xm = x.cpu_matrix();
@@ -876,14 +876,14 @@ public:
         return out;
     }
 
-    [[nodiscard]] Result<Tensor> unpack_i8_impl(const Tensor& packed, std::size_t cols) override
+    [[nodiscard]] exstl::Result<Tensor> unpack_i8_impl(const Tensor& packed, std::size_t cols) override
     {
-        if (!packed.is_cpu()) NN_FAIL("unpack_i8: tensor is not CPU");
-        if (packed.precision() != Precision::F32) NN_FAIL("unpack_i8: 容器必须 f32");
+        if (!packed.is_cpu()) EX_FAIL("unpack_i8: tensor is not CPU");
+        if (packed.precision() != Precision::F32) EX_FAIL("unpack_i8: 容器必须 f32");
         const std::size_t rows = packed.rows();
         const std::size_t words = nn::i8_pack::words_per_row(cols);
         if (packed.cols() != words)
-            NN_FAIL("unpack_i8: 容器列数 != words_per_row(cols)（形状不匹配）");
+            EX_FAIL("unpack_i8: 容器列数 != words_per_row(cols)（形状不匹配）");
         Tensor out = Tensor::cpu_uninitialized(rows, cols);
         const Matrix& pm = packed.cpu_matrix();
         Matrix& om = out.cpu_matrix();
@@ -900,7 +900,7 @@ public:
         return out;
     }
 
-    [[nodiscard]] Result<Tensor> matmul_q_i8_impl(const Tensor& packed_w, const Tensor& tau,
+    [[nodiscard]] exstl::Result<Tensor> matmul_q_i8_impl(const Tensor& packed_w, const Tensor& tau,
                                                   const Tensor& packed_x, const Tensor& sx,
                                                   Precision P) override
     {
@@ -908,23 +908,23 @@ public:
         {
             // 容器恒 f32（原始字）；输出按 P 落回（CPU 无 in-kernel f16 变体）
             auto r = matmul_q_i8_impl(packed_w, tau, packed_x, sx, Precision::F32);
-            NN_TRY_CHECK(r);
+            EX_TRY_CHECK(r);
             return cast(*r, P);
         }
         if (!packed_w.is_cpu() || !tau.is_cpu() || !packed_x.is_cpu() || !sx.is_cpu())
-            NN_FAIL("matmul_q_i8: tensors are not CPU");
+            EX_FAIL("matmul_q_i8: tensors are not CPU");
         if (packed_w.precision() != Precision::F32 || packed_x.precision() != Precision::F32 ||
             tau.precision() != Precision::F32 || sx.precision() != Precision::F32)
-            NN_FAIL("matmul_q_i8: 需要 f32 容器/尺度");
+            EX_FAIL("matmul_q_i8: 需要 f32 容器/尺度");
         const std::size_t M = packed_w.rows();
         const std::size_t K = packed_x.rows();
         const std::size_t N = sx.cols();
-        if (sx.rows() != 1) NN_FAIL("matmul_q_i8: 激活尺度必须是 (1,N)");
-        if (tau.rows() != M || tau.cols() != 1) NN_FAIL("matmul_q_i8: τ 必须是 (M,1)");
+        if (sx.rows() != 1) EX_FAIL("matmul_q_i8: 激活尺度必须是 (1,N)");
+        if (tau.rows() != M || tau.cols() != 1) EX_FAIL("matmul_q_i8: τ 必须是 (M,1)");
         if (nn::trit_pack::words_per_row(K) != packed_w.cols())
-            NN_FAIL("matmul_q_i8: 权重容器列数与 K 不匹配");
+            EX_FAIL("matmul_q_i8: 权重容器列数与 K 不匹配");
         if (nn::i8_pack::words_per_row(N) != packed_x.cols())
-            NN_FAIL("matmul_q_i8: 激活容器列数与 N 不匹配");
+            EX_FAIL("matmul_q_i8: 激活容器列数与 N 不匹配");
 
         Tensor out = Tensor::cpu_uninitialized(M, N);
         const Matrix& pm = packed_w.cpu_matrix();
@@ -991,7 +991,7 @@ public:
     // 语义与数值口径：compute_engine.hpp 公共入口说明（领域原语）+ int8_pack.hpp。
     // CPU 参考实现：逐行解码 → 更新 → 编码 → 参数更新的标量路径（正确性优先；
     // 与 GPU shader 同运算序，逐位对拍由 adam_int8_test 锁定）。
-    [[nodiscard]] Result<void> quantized_adamw_step_impl(
+    [[nodiscard]] exstl::Result<void> quantized_adamw_step_impl(
         Tensor& param, const Tensor& grad, Tensor& m_packed, Tensor& v_packed,
         const Tensor& m_scale_old, const Tensor& m_scale_new, const Tensor& v_scale_old,
         const Tensor& v_scale_new, Scalar lr, Scalar beta1, Scalar beta2, Scalar eps, Scalar wd,
@@ -1000,23 +1000,23 @@ public:
         if (!param.is_cpu() || !grad.is_cpu() || !m_packed.is_cpu() || !v_packed.is_cpu() ||
             !m_scale_old.is_cpu() || !m_scale_new.is_cpu() || !v_scale_old.is_cpu() ||
             !v_scale_new.is_cpu())
-            NN_FAIL("quantized_adamw_step: tensors are not CPU");
+            EX_FAIL("quantized_adamw_step: tensors are not CPU");
         if (param.precision() != Precision::F32 || grad.precision() != Precision::F32 ||
             m_packed.precision() != Precision::F32 || v_packed.precision() != Precision::F32 ||
             m_scale_old.precision() != Precision::F32 || m_scale_new.precision() != Precision::F32 ||
             v_scale_old.precision() != Precision::F32 || v_scale_new.precision() != Precision::F32)
-            NN_FAIL("quantized_adamw_step: 参数/梯度/尺度/容器必须 f32");
+            EX_FAIL("quantized_adamw_step: 参数/梯度/尺度/容器必须 f32");
         const std::size_t rows = param.rows(), cols = param.cols();
         if (grad.rows() != rows || grad.cols() != cols)
-            NN_FAIL("quantized_adamw_step: 梯度形状不匹配");
+            EX_FAIL("quantized_adamw_step: 梯度形状不匹配");
         const std::size_t wpr = nn::i8_pack::words_per_row(cols);
         if (m_packed.rows() != rows || m_packed.cols() != wpr || v_packed.rows() != rows ||
             v_packed.cols() != wpr)
-            NN_FAIL("quantized_adamw_step: 状态容器形状必须 (rows, ceil(cols/4))");
+            EX_FAIL("quantized_adamw_step: 状态容器形状必须 (rows, ceil(cols/4))");
         if (m_scale_old.rows() != rows || m_scale_old.cols() != 1 || m_scale_new.rows() != rows ||
             m_scale_new.cols() != 1 || v_scale_old.rows() != rows || v_scale_old.cols() != 1 ||
             v_scale_new.rows() != rows || v_scale_new.cols() != 1)
-            NN_FAIL("quantized_adamw_step: 尺度必须 (rows,1)");
+            EX_FAIL("quantized_adamw_step: 尺度必须 (rows,1)");
 
         Matrix& p_mat = param.cpu_matrix();
         const Matrix& g_mat = grad.cpu_matrix();
@@ -1090,10 +1090,10 @@ public:
         return {};
     }
 
-    [[nodiscard]] Result<Tensor> matmul_impl(const Tensor& A, const Tensor& B, bool transA,
+    [[nodiscard]] exstl::Result<Tensor> matmul_impl(const Tensor& A, const Tensor& B, bool transA,
                                              bool transB, Precision P = Precision::F32) override
     {
-        if (A.is_gpu() || B.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (A.is_gpu() || B.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
         // ── 精度与存储不匹配时不可直读（cpu_matrix<P> 对错位存储返回空 → UB；
         //    实测 CPU f16 训练 step0 即 NaN）→ 先统一到 f32 空间计算，输出按 P
         //    舍入（§7.2 f32 参考语义）。两端同 f16 才走下方原生 f16 GEMM。
@@ -1102,12 +1102,12 @@ public:
             const bool b16 = B.precision() == Precision::F16;
             if ((P == Precision::F32 && (a16 || b16)) || (P == Precision::F16 && !(a16 && b16)))
             {
-                auto a32 = a16 ? cast(A, Precision::F32) : Result<Tensor>{A};
-                NN_TRY_CHECK(a32);
-                auto b32 = b16 ? cast(B, Precision::F32) : Result<Tensor>{B};
-                NN_TRY_CHECK(b32);
+                auto a32 = a16 ? cast(A, Precision::F32) : exstl::Result<Tensor>{A};
+                EX_TRY_CHECK(a32);
+                auto b32 = b16 ? cast(B, Precision::F32) : exstl::Result<Tensor>{B};
+                EX_TRY_CHECK(b32);
                 auto r = matmul(*a32, *b32, transA, transB, Precision::F32);
-                NN_TRY_CHECK(r);
+                EX_TRY_CHECK(r);
                 if (P == Precision::F32) return r;
                 return cast(*r, Precision::F16);
             }
@@ -1124,7 +1124,7 @@ public:
             const std::size_t K2 = transB ? b.cols() : b.rows();
             const std::size_t N = transB ? b.rows() : b.cols();
             if (K != K2)
-                NN_FAIL("matmul: dimension mismatch A=" + std::to_string(a.rows()) + "x" +
+                EX_FAIL("matmul: dimension mismatch A=" + std::to_string(a.rows()) + "x" +
                         std::to_string(a.cols()) + " transA=" + (transA ? "1" : "0") +
                         " B=" + std::to_string(b.rows()) + "x" + std::to_string(b.cols()) +
                         " transB=" + (transB ? "1" : "0") + " K=" + std::to_string(K) +
@@ -1153,7 +1153,7 @@ public:
             const std::size_t K = transA ? a.rows() : a.cols();
             const std::size_t K2 = transB ? b.cols() : b.rows();
             const std::size_t N = transB ? b.rows() : b.cols();
-            if (K != K2) NN_FAIL("matmul(f16): dimension mismatch");
+            if (K != K2) EX_FAIL("matmul(f16): dimension mismatch");
             MatrixT<Precision::F16> result(M, N);
             // f16 无原生 x86 SIMD → 向量化失败是预期行为（§7.2 兼容路径）
             if (!transA && !transB) { a.multiply_to(result, b); }
@@ -1167,19 +1167,19 @@ public:
             return Tensor::from_matrix(std::move(result));
         }
 
-        NN_FAIL("matmul: unsupported precision");
+        EX_FAIL("matmul: unsupported precision");
     }
 
     // ── matmul + 行广播 bias：经 DSL 融合（单一事实源）──────────────
     // 覆盖基类默认的"matmul + host 端 to_matrix 往返加 bias"：CPU 走模板求值，
     // GPU 走 AOT 融合 shader；scan_exprs dry-run 经本路径收集该结构 → gen_fused
     // 生成融合 kernel（结构没被收集 = GPU 注册表里没有对应 key，运行期走 JIT 兜底）。
-    [[nodiscard]] Result<Tensor> matmul_with_bias_impl(const Tensor& A, const Tensor& B,
+    [[nodiscard]] exstl::Result<Tensor> matmul_with_bias_impl(const Tensor& A, const Tensor& B,
                                                        const Tensor& bias, bool transA = false,
                                                        bool transB = false,
                                                        Precision P = Precision::F32) override
     {
-        if (A.is_gpu() || B.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (A.is_gpu() || B.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
         const std::size_t rows = transA ? A.cols() : A.rows();
         const std::size_t cols = transB ? B.rows() : B.cols();
         // P 必须下传（不可丢弃）：scan 的 f16 dry-run 靠 dsl::compute 的
@@ -1194,25 +1194,25 @@ public:
     // ── 批量矩阵乘法：按 batch 切分行块，逐 batch 矩阵乘 ──
     // C_b = alpha * op(A_b, B_b)（alpha 为 cuBLAS sgemm 语义的输出缩放系数）
     // P: 计算精度（§8.1，同 matmul）
-    [[nodiscard]] Result<Tensor> batched_matmul_impl(const Tensor& A, const Tensor& B,
+    [[nodiscard]] exstl::Result<Tensor> batched_matmul_impl(const Tensor& A, const Tensor& B,
                                                      std::size_t batch, bool transA, bool transB,
                                                      Scalar alpha,
                                                      Precision P = Precision::F32) override
     {
-        if (A.is_gpu() || B.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (batch == 0) NN_FAIL("batched_matmul: batch must be > 0");
+        if (A.is_gpu() || B.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (batch == 0) EX_FAIL("batched_matmul: batch must be > 0");
         // ── 精度与存储不匹配：统一到 f32 空间计算 + 按 P 舍入（同 matmul）──
         {
             const bool a16 = A.precision() == Precision::F16;
             const bool b16 = B.precision() == Precision::F16;
             if ((P == Precision::F32 && (a16 || b16)) || (P == Precision::F16 && !(a16 && b16)))
             {
-                auto a32 = a16 ? cast(A, Precision::F32) : Result<Tensor>{A};
-                NN_TRY_CHECK(a32);
-                auto b32 = b16 ? cast(B, Precision::F32) : Result<Tensor>{B};
-                NN_TRY_CHECK(b32);
+                auto a32 = a16 ? cast(A, Precision::F32) : exstl::Result<Tensor>{A};
+                EX_TRY_CHECK(a32);
+                auto b32 = b16 ? cast(B, Precision::F32) : exstl::Result<Tensor>{B};
+                EX_TRY_CHECK(b32);
                 auto r = batched_matmul(*a32, *b32, batch, transA, transB, alpha, Precision::F32);
-                NN_TRY_CHECK(r);
+                EX_TRY_CHECK(r);
                 if (P == Precision::F32) return r;
                 return cast(*r, Precision::F16);
             }
@@ -1272,7 +1272,7 @@ public:
 
         // 每个 batch 的行数
         if (a.rows() % batch != 0 || b.rows() % batch != 0)
-            NN_FAIL("batched_matmul: rows not divisible by batch");
+            EX_FAIL("batched_matmul: rows not divisible by batch");
         const std::size_t a_rows_per = a.rows() / batch;
         const std::size_t b_rows_per = b.rows() / batch;
 
@@ -1285,7 +1285,7 @@ public:
         const std::size_t K = transA ? a_rows_per : a.cols();
         const std::size_t K2 = transB ? b.cols() : b_rows_per;
         const std::size_t N = transB ? b_rows_per : b.cols();
-        if (K != K2) NN_FAIL("batched_matmul: K dimension mismatch");
+        if (K != K2) EX_FAIL("batched_matmul: K dimension mismatch");
         Matrix result(batch * M, N);
         auto result_span = result.span();
         const auto a_span = a.span();
@@ -1343,29 +1343,29 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<void> add_inplace_impl(Tensor& A, const Tensor& B) override
+    [[nodiscard]] exstl::Result<void> add_inplace_impl(Tensor& A, const Tensor& B) override
     {
         if (A.precision() != Precision::F32 || B.precision() != Precision::F32)
-            return inplace2_(A, B, [this](Tensor& a, const Tensor& b) -> Result<void>
+            return inplace2_(A, B, [this](Tensor& a, const Tensor& b) -> exstl::Result<void>
                              { return add_inplace_impl(a, b); });
-        if (A.rows() != B.rows() || A.cols() != B.cols()) NN_FAIL("add_inplace: shape mismatch");
+        if (A.rows() != B.rows() || A.cols() != B.cols()) EX_FAIL("add_inplace: shape mismatch");
         A.cpu_matrix().add_inplace(B.cpu_matrix());
         return {};
     }
 
-    [[nodiscard]] Result<void> scale_inplace_impl(Tensor& A, Scalar s) override
+    [[nodiscard]] exstl::Result<void> scale_inplace_impl(Tensor& A, Scalar s) override
     {
         if (A.precision() != Precision::F32)
-            return inplace1_(A, [this, s](Tensor& a) -> Result<void>
+            return inplace1_(A, [this, s](Tensor& a) -> exstl::Result<void>
                              { return scale_inplace_impl(a, s); });
         A.cpu_matrix().scale_inplace(s);
         return {};
     }
 
-    [[nodiscard]] Result<void> zero_impl(Tensor& A) override
+    [[nodiscard]] exstl::Result<void> zero_impl(Tensor& A) override
     {
         if (A.precision() != Precision::F32)
-            return inplace1_(A, [this](Tensor& a) -> Result<void> { return zero_impl(a); });
+            return inplace1_(A, [this](Tensor& a) -> exstl::Result<void> { return zero_impl(a); });
         A.cpu_matrix().zero();
         return {};
     }
@@ -1379,7 +1379,7 @@ public:
     // ══════════════════════════════════════════════════════════════════════
 
     // ── 前缀扫描（forward / backward pass 1 / forward_step）──────────────
-    [[nodiscard]] Result<Tensor>
+    [[nodiscard]] exstl::Result<Tensor>
     scan_prefix_outer_impl(const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
                            const Tensor& A0, const Tensor& B0, bool has_state, std::size_t dk,
                            std::size_t heads, bool causal, const Tensor& boundary, bool has_bnd,
@@ -1391,40 +1391,40 @@ public:
                                           boundary, has_bnd);
         // 边界 cast：全部操作数抬 f32 → 算 → 输出按 prec 落回
         auto c = to_f32_all(ts);
-        NN_TRY_CHECK(c);
+        EX_TRY_CHECK(c);
         auto r = scan_prefix_outer_f32_((*c)[0], (*c)[1], (*c)[2], (*c)[3], (*c)[4], (*c)[5],
                                         has_state, dk, heads, causal, (*c)[6], has_bnd);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return to_prec(std::move(*r), prec);
     }
 
 private:
-    [[nodiscard]] Result<Tensor>
+    [[nodiscard]] exstl::Result<Tensor>
     scan_prefix_outer_f32_(const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
                            const Tensor& A0, const Tensor& B0, bool has_state, std::size_t dk,
                            std::size_t heads, bool causal, const Tensor& boundary, bool has_bnd)
     {
         for (const auto& t : {K, V, P, R, A0, B0, boundary})
-            if (t.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (dk == 0 || heads == 0) NN_FAIL("scan_prefix_outer: dk/heads must be > 0");
+            if (t.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (dk == 0 || heads == 0) EX_FAIL("scan_prefix_outer: dk/heads must be > 0");
         const Matrix& Km = K.cpu_matrix();
         const std::size_t rows = Km.rows();
         const std::size_t seq = Km.cols();
-        if (rows % (dk * heads) != 0) NN_FAIL("scan_prefix_outer: K rows not divisible by H*dk");
+        if (rows % (dk * heads) != 0) EX_FAIL("scan_prefix_outer: K rows not divisible by H*dk");
         for (const auto* m : {&V.cpu_matrix(), &P.cpu_matrix(), &R.cpu_matrix()})
             if (m->rows() != rows || m->cols() != seq)
-                NN_FAIL("scan_prefix_outer: K/V/P/R shape mismatch");
+                EX_FAIL("scan_prefix_outer: K/V/P/R shape mismatch");
         if (has_state)
         {
             if (A0.cpu_matrix().rows() != heads * dk || A0.cpu_matrix().cols() != dk ||
                 B0.cpu_matrix().rows() != heads * dk || B0.cpu_matrix().cols() != dk)
-                NN_FAIL("scan_prefix_outer: A0/B0 must be (H*dk, dk)");
+                EX_FAIL("scan_prefix_outer: A0/B0 must be (H*dk, dk)");
         }
         if (has_bnd)
         {
             const Matrix& bd = boundary.cpu_matrix();
             if (bd.rows() != 1 || bd.cols() != (rows / (dk * heads)) * seq)
-                NN_FAIL("scan_prefix_outer: boundary must be (1, B*seq)");
+                EX_FAIL("scan_prefix_outer: boundary must be (1, B*seq)");
         }
 
         const std::size_t BH = rows / dk;
@@ -1542,7 +1542,7 @@ private:
 
 public:
     // ── 后缀扫描（backward pass 2：gK/gV）────────────────────────────────
-    [[nodiscard]] Result<Tensor> scan_suffix_outer_impl(const Tensor& D, const Tensor& X,
+    [[nodiscard]] exstl::Result<Tensor> scan_suffix_outer_impl(const Tensor& D, const Tensor& X,
                                                         const Tensor& Y, std::size_t dk,
                                                         std::size_t heads, bool causal,
                                                         const Tensor& boundary, bool has_bnd,
@@ -1552,36 +1552,36 @@ public:
         if (prec == Precision::F32 && all_f32(ts))
             return scan_suffix_outer_f32_(D, X, Y, dk, heads, causal, boundary, has_bnd);
         auto c = to_f32_all(ts);
-        NN_TRY_CHECK(c);
+        EX_TRY_CHECK(c);
         auto r =
             scan_suffix_outer_f32_((*c)[0], (*c)[1], (*c)[2], dk, heads, causal, (*c)[3], has_bnd);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return to_prec(std::move(*r), prec);
     }
 
 private:
-    [[nodiscard]] Result<Tensor> scan_suffix_outer_f32_(const Tensor& D, const Tensor& X,
+    [[nodiscard]] exstl::Result<Tensor> scan_suffix_outer_f32_(const Tensor& D, const Tensor& X,
                                                         const Tensor& Y, std::size_t dk,
                                                         std::size_t heads, bool causal,
                                                         const Tensor& boundary, bool has_bnd)
     {
         for (const auto& t : {D, X, Y, boundary})
-            if (t.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (dk == 0 || heads == 0) NN_FAIL("scan_suffix_outer: dk/heads must be > 0");
+            if (t.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (dk == 0 || heads == 0) EX_FAIL("scan_suffix_outer: dk/heads must be > 0");
         const Matrix& Xm = X.cpu_matrix();
         const std::size_t rows = Xm.rows();
         const std::size_t seq = Xm.cols();
-        if (rows % (dk * heads) != 0) NN_FAIL("scan_suffix_outer: X rows not divisible by H*dk");
+        if (rows % (dk * heads) != 0) EX_FAIL("scan_suffix_outer: X rows not divisible by H*dk");
         const Matrix& Dm = D.cpu_matrix();
         if (Dm.rows() != rows * dk || Dm.cols() != seq)
-            NN_FAIL("scan_suffix_outer: D must be (B*H*dk*dk, seq)");
+            EX_FAIL("scan_suffix_outer: D must be (B*H*dk*dk, seq)");
         if (Y.cpu_matrix().rows() != rows || Y.cpu_matrix().cols() != seq)
-            NN_FAIL("scan_suffix_outer: X/Y shape mismatch");
+            EX_FAIL("scan_suffix_outer: X/Y shape mismatch");
         if (has_bnd)
         {
             const Matrix& bd = boundary.cpu_matrix();
             if (bd.rows() != 1 || bd.cols() != (rows / (dk * heads)) * seq)
-                NN_FAIL("scan_suffix_outer: boundary must be (1, B*seq)");
+                EX_FAIL("scan_suffix_outer: boundary must be (1, B*seq)");
         }
 
         const std::size_t BH = rows / dk;
@@ -1648,34 +1648,34 @@ private:
 
 public:
     // ── 逐列外积（backward 的 dL/dA、dL/dB 物化）─────────────────────────
-    [[nodiscard]] Result<Tensor> outer_col_impl(const Tensor& P, const Tensor& R, const Tensor& S,
+    [[nodiscard]] exstl::Result<Tensor> outer_col_impl(const Tensor& P, const Tensor& R, const Tensor& S,
                                                 std::size_t dk, bool has_scale,
                                                 Precision prec = Precision::F32) override
     {
         const std::vector<Tensor> ts{P, R, S};
         if (prec == Precision::F32 && all_f32(ts)) return outer_col_f32_(P, R, S, dk, has_scale);
         auto c = to_f32_all(ts);
-        NN_TRY_CHECK(c);
+        EX_TRY_CHECK(c);
         auto r = outer_col_f32_((*c)[0], (*c)[1], (*c)[2], dk, has_scale);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return to_prec(std::move(*r), prec);
     }
 
 private:
-    [[nodiscard]] Result<Tensor> outer_col_f32_(const Tensor& P, const Tensor& R, const Tensor& S,
+    [[nodiscard]] exstl::Result<Tensor> outer_col_f32_(const Tensor& P, const Tensor& R, const Tensor& S,
                                                 std::size_t dk, bool has_scale)
     {
         for (const auto& t : {P, R, S})
-            if (t.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (dk == 0) NN_FAIL("outer_col: dk must be > 0");
+            if (t.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (dk == 0) EX_FAIL("outer_col: dk must be > 0");
         const Matrix& Pm = P.cpu_matrix();
         const std::size_t rows = Pm.rows();
         const std::size_t seq = Pm.cols();
-        if (rows % dk != 0) NN_FAIL("outer_col: rows not divisible by dk");
+        if (rows % dk != 0) EX_FAIL("outer_col: rows not divisible by dk");
         if (R.cpu_matrix().rows() != rows || R.cpu_matrix().cols() != seq)
-            NN_FAIL("outer_col: P/R shape mismatch");
+            EX_FAIL("outer_col: P/R shape mismatch");
         if (has_scale && (S.cpu_matrix().rows() != rows || S.cpu_matrix().cols() != seq))
-            NN_FAIL("outer_col: S must be (B*H*dk, seq)");
+            EX_FAIL("outer_col: S must be (B*H*dk, seq)");
         const Matrix& Rm = R.cpu_matrix();
         const Matrix& Sm = S.cpu_matrix();
 
@@ -1707,12 +1707,12 @@ public:
     // 归约原语
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A,
+    [[nodiscard]] exstl::Result<Tensor> row_reduce_sum_impl(const Tensor& A,
                                                      Precision P = Precision::F32) override
     {
         // 非 f32 输入 / 非 f32 输出精度 → 通用边界 cast（归约恒 f32 累加）
         if (A.precision() != Precision::F32 || P != Precision::F32)
-            return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
+            return unary_(A, P, [this](const Tensor& a) -> exstl::Result<Tensor>
                           { return row_reduce_sum_impl(a, Precision::F32); });
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.row_reduce(
@@ -1721,11 +1721,11 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A,
+    [[nodiscard]] exstl::Result<Tensor> col_reduce_sum_impl(const Tensor& A,
                                                      Precision P = Precision::F32) override
     {
         if (A.precision() != Precision::F32 || P != Precision::F32)
-            return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
+            return unary_(A, P, [this](const Tensor& a) -> exstl::Result<Tensor>
                           { return col_reduce_sum_impl(a, Precision::F32); });
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.col_reduce(
@@ -1734,11 +1734,11 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A,
+    [[nodiscard]] exstl::Result<Tensor> col_reduce_max_impl(const Tensor& A,
                                                      Precision P = Precision::F32) override
     {
         if (A.precision() != Precision::F32 || P != Precision::F32)
-            return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
+            return unary_(A, P, [this](const Tensor& a) -> exstl::Result<Tensor>
                           { return col_reduce_max_impl(a, Precision::F32); });
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.col_reduce(
@@ -1750,13 +1750,13 @@ public:
     // ── 分组归约（契约见 compute_engine.hpp）───────────────────────────
     // 按组并行（组间无竞争），组内沿 R 行累加、内层对列连续（可向量化）。
     template <bool IsMax>
-    [[nodiscard]] Result<Tensor> grouped_reduce_cpu_(const Tensor& x, std::size_t G, std::size_t R)
+    [[nodiscard]] exstl::Result<Tensor> grouped_reduce_cpu_(const Tensor& x, std::size_t G, std::size_t R)
     {
-        if (x.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (G == 0 || R == 0) NN_FAIL("grouped_reduce: G/R must be > 0");
-        if (x.rows() != G * R) NN_FAIL("grouped_reduce: x must be (G*R, N)");
+        if (x.is_gpu()) EX_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (G == 0 || R == 0) EX_FAIL("grouped_reduce: G/R must be > 0");
+        if (x.rows() != G * R) EX_FAIL("grouped_reduce: x must be (G*R, N)");
         const std::size_t N = x.cols();
-        if (N == 0) NN_FAIL("grouped_reduce: N must be > 0");
+        if (N == 0) EX_FAIL("grouped_reduce: N must be > 0");
         Matrix out(G, N);
         const auto src = x.cpu_matrix().span();
         const auto dst = out.span();
@@ -1783,10 +1783,10 @@ public:
             }
         };
 
-        if (G * R * N >= PARALLEL_THRESHOLD && G > 1)
+        if (G * R * N >= exstl::PARALLEL_THRESHOLD && G > 1)
         {
             auto idx = std::views::iota(std::size_t{0}, G);
-            nn::parallel_for_blocks(idx.begin(), idx.end(), group_kernel);
+            exstl::parallel_for_blocks(idx.begin(), idx.end(), group_kernel);
         }
         else
         {
@@ -1796,22 +1796,22 @@ public:
         return Tensor::from_matrix(std::move(out));
     }
 
-    [[nodiscard]] Result<Tensor> grouped_reduce_sum_impl(const Tensor& x, std::size_t G,
+    [[nodiscard]] exstl::Result<Tensor> grouped_reduce_sum_impl(const Tensor& x, std::size_t G,
                                                          std::size_t R,
                                                          Precision P = Precision::F32) override
     {
         if (x.precision() != Precision::F32 || P != Precision::F32)
-            return unary_(x, P, [this, G, R](const Tensor& t) -> Result<Tensor>
+            return unary_(x, P, [this, G, R](const Tensor& t) -> exstl::Result<Tensor>
                           { return grouped_reduce_sum_impl(t, G, R, Precision::F32); });
         return grouped_reduce_cpu_<false>(x, G, R);
     }
 
-    [[nodiscard]] Result<Tensor> grouped_reduce_max_impl(const Tensor& x, std::size_t G,
+    [[nodiscard]] exstl::Result<Tensor> grouped_reduce_max_impl(const Tensor& x, std::size_t G,
                                                          std::size_t R,
                                                          Precision P = Precision::F32) override
     {
         if (x.precision() != Precision::F32 || P != Precision::F32)
-            return unary_(x, P, [this, G, R](const Tensor& t) -> Result<Tensor>
+            return unary_(x, P, [this, G, R](const Tensor& t) -> exstl::Result<Tensor>
                           { return grouped_reduce_max_impl(t, G, R, Precision::F32); });
         return grouped_reduce_cpu_<true>(x, G, R);
     }
@@ -1824,7 +1824,7 @@ public:
     // 纯索引映射，无物化。性能与等价手写循环一致。
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> eval_expr_impl(const ExprSpec& spec,
+    [[nodiscard]] exstl::Result<Tensor> eval_expr_impl(const ExprSpec& spec,
                                                 std::span<const Tensor> inputs, std::size_t rows,
                                                 std::size_t cols,
                                                 Precision P = Precision::F32) override
@@ -1843,16 +1843,16 @@ public:
         {
             if (prec_trace_enabled_()) trace_miss_(spec, inputs, P);
             auto in32 = to_f32_all(inputs);
-            NN_TRY_CHECK(in32);
+            EX_TRY_CHECK(in32);
             auto r = eval_expr_impl(spec, *in32, rows, cols, Precision::F32);
-            NN_TRY_CHECK(r);
+            EX_TRY_CHECK(r);
             return to_prec(std::move(*r), P);
         }
         // 输出会被下面的输出循环完整覆盖（每个下标恰好写一次）→ 未初始化构造，
         // 省掉一遍全尺寸零写（见 Tensor::cpu_uninitialized）
         Tensor out = Tensor::cpu_uninitialized(rows, cols);
         auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, out);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return out;
     }
 
@@ -1861,7 +1861,7 @@ public:
     //   行归约轴 → (rows,1)，列归约轴 → (1,cols)（而非广播到 (rows,cols)）。
     // 要求：表达式归约轴为 0/1；末指令为归约时直接取归约向量，否则按代表
     //   元素求值（所有 Input 须经归约/广播视图访问，保证沿归约轴恒定）。
-    [[nodiscard]] Result<Tensor> eval_expr_reduce_impl(const ExprSpec& spec,
+    [[nodiscard]] exstl::Result<Tensor> eval_expr_reduce_impl(const ExprSpec& spec,
                                                        std::span<const Tensor> inputs,
                                                        std::size_t rows, std::size_t cols,
                                                        Precision P = Precision::F32) override
@@ -1877,9 +1877,9 @@ public:
         {
             if (prec_trace_enabled_()) trace_miss_(spec, inputs, P);
             auto in32 = to_f32_all(inputs);
-            NN_TRY_CHECK(in32);
+            EX_TRY_CHECK(in32);
             auto r = eval_expr_reduce_impl(spec, *in32, rows, cols, Precision::F32);
-            NN_TRY_CHECK(r);
+            EX_TRY_CHECK(r);
             return to_prec(std::move(*r), P);
         }
         const bool vec_is_row = (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) == 0);
@@ -1887,30 +1887,30 @@ public:
         Tensor out =
             vec_is_row ? Tensor::cpu_uninitialized(rows, 1) : Tensor::cpu_uninitialized(1, cols);
         auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true, out);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return out;
     }
 
     // 归约向量的目标传递版（T1_58 显存修复 #L2）：写进 dst 既有存储，不分配。
     // 输出精度 = dst 存储精度（in-place，§8.3）；非 f32 dst 抬 f32 求值后
     // cast_into 写回（§7.3）。
-    [[nodiscard]] Result<void> eval_expr_reduce_into_impl(const ExprSpec& spec,
+    [[nodiscard]] exstl::Result<void> eval_expr_reduce_into_impl(const ExprSpec& spec,
                                                           std::span<const Tensor> inputs,
                                                           std::size_t rows, std::size_t cols,
                                                           Tensor& dst) override
     {
         // 「录制段内不支持」守卫（方案 A：归属引擎 TU；文案与原 NVI 逐字一致）。
         if (fused::is_recording())
-            NN_FAIL("eval_expr_reduce_into: 不支持在 begin_expr/end_expr 录制段内使用");
+            EX_FAIL("eval_expr_reduce_into: 不支持在 begin_expr/end_expr 录制段内使用");
         scan_record_variant_(spec, inputs, dst.precision());
         if (dst.precision() != Precision::F32 || !all_f32(inputs))
         {
             trace_variant_(spec, inputs, dst.precision());
             if (prec_trace_enabled_()) trace_miss_(spec, inputs, dst.precision());
             auto in32 = to_f32_all(inputs);
-            NN_TRY_CHECK(in32);
+            EX_TRY_CHECK(in32);
             auto tmp = eval_expr_reduce_impl(spec, *in32, rows, cols, Precision::F32);
-            NN_TRY_CHECK(tmp);
+            EX_TRY_CHECK(tmp);
             return cast_into(*tmp, dst);
         }
         trace_variant_(spec, inputs, Precision::F32);
@@ -1918,7 +1918,7 @@ public:
         const std::size_t orows = vec_is_row ? rows : 1;
         const std::size_t ocols = vec_is_row ? 1 : cols;
         if (dst.rows() != orows || dst.cols() != ocols)
-            NN_FAIL("eval_expr_reduce_into: dst shape mismatch");
+            EX_FAIL("eval_expr_reduce_into: dst shape mismatch");
         return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true, dst);
     }
 
@@ -1931,7 +1931,7 @@ public:
     // （就地安全前提：每个元素先读完全部输入再写 out[i]；GPU 同一 buffer 绑定为
     // readonly 输入 + writeonly 输出的逐元素同索引读写亦无跨调用危害）。
     // 仅支持逐元素表达式（无归约）；归约向量输出用 eval_expr_reduce。
-    [[nodiscard]] Result<void> eval_expr_into_impl(const ExprSpec& spec,
+    [[nodiscard]] exstl::Result<void> eval_expr_into_impl(const ExprSpec& spec,
                                                    std::span<const Tensor> inputs, std::size_t rows,
                                                    std::size_t cols, Tensor& dst) override
     {
@@ -1947,16 +1947,16 @@ public:
             trace_variant_(spec, inputs, dst.precision());
             if (prec_trace_enabled_()) trace_miss_(spec, inputs, dst.precision());
             auto in32 = to_f32_all(inputs);
-            NN_TRY_CHECK(in32);
+            EX_TRY_CHECK(in32);
             auto tmp = create_tensor(rows, cols, Precision::F32);
             auto r = eval_expr_into_impl(spec, *in32, rows, cols, tmp);
-            NN_TRY_CHECK(r);
+            EX_TRY_CHECK(r);
             return cast_into(tmp, dst);
         }
         trace_variant_(spec, inputs, Precision::F32);
-        if (dst.rows() != rows || dst.cols() != cols) NN_FAIL("eval_expr_into: dst shape mismatch");
+        if (dst.rows() != rows || dst.cols() != cols) EX_FAIL("eval_expr_into: dst shape mismatch");
         if (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) != -1)
-            NN_FAIL("eval_expr_into: 仅支持逐元素表达式（无归约）");
+            EX_FAIL("eval_expr_into: 仅支持逐元素表达式（无归约）");
         return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, dst);
     }
 
@@ -1965,7 +1965,7 @@ public:
     // 把目标寄存器提升为主输出（解释器单输出写回；Neg∘Neg 逐位恒等——含 -0
     // 与 NaN；末指令是输出 ⇒ simplify 的输出指令豁免不折叠该链）。CPU 无
     // 运行时图录制，本路径仅测试/工具使用，重复求值可接受。
-    [[nodiscard]] Result<void> eval_expr_multi_into_impl(const ExprSpec& raw_spec,
+    [[nodiscard]] exstl::Result<void> eval_expr_multi_into_impl(const ExprSpec& raw_spec,
                                                          std::span<const Tensor> inputs,
                                                          std::size_t rows, std::size_t cols,
                                                          std::span<Tensor> outs) override
@@ -1973,17 +1973,17 @@ public:
         // 「录制段内不支持」守卫（方案 A：归属引擎 TU；文案与原 NVI 逐字一致，
         // 在空指令表守卫之前 = 原 NVI 的相对次序）。epoch 守卫在 NVI。
         if (fused::is_recording())
-            NN_FAIL("eval_expr_multi_into: 不支持在 begin_expr/end_expr 录制段内使用");
-        if (raw_spec.instrs.empty()) NN_FAIL("eval_expr_multi_into: 空指令表");
+            EX_FAIL("eval_expr_multi_into: 不支持在 begin_expr/end_expr 录制段内使用");
+        if (raw_spec.instrs.empty()) EX_FAIL("eval_expr_multi_into: 空指令表");
         auto r0 = eval_expr_impl(raw_spec, inputs, rows, cols,
                                  /*vector_out=*/false, outs[0]);
-        NN_TRY_CHECK(r0);
+        EX_TRY_CHECK(r0);
         for (std::size_t k = 0; k < raw_spec.extras.size(); ++k)
         {
             if (raw_spec.extras[k] >= raw_spec.num_regs)
-                NN_FAIL("eval_expr_multi_into: extras 寄存器越界");
+                EX_FAIL("eval_expr_multi_into: extras 寄存器越界");
             if (raw_spec.num_regs + 2 > EXPR_MAX_REGS)
-                NN_FAIL("eval_expr_multi_into: extras 复制链超出寄存器上限");
+                EX_FAIL("eval_expr_multi_into: extras 复制链超出寄存器上限");
             ExprSpec s = raw_spec;
             ExprInstr n1;
             n1.op = static_cast<std::uint8_t>(ExprOp::Neg);
@@ -1998,7 +1998,7 @@ public:
             s.num_regs += 2;
             auto r = eval_expr_impl(s, inputs, rows, cols,
                                     /*vector_out=*/false, outs[k + 1]);
-            NN_TRY_CHECK(r);
+            EX_TRY_CHECK(r);
         }
         return {};
     }
@@ -2013,16 +2013,16 @@ public:
     //   - 键域每块：[mm 段预计算 tile] → body 指令 →（块尾）vecacc 更新行向量态
     //   - 块内有效列 valid = min(BLOCK, K-k0) 天然 gate 尾块越界
     //   - 向量域：finalize 逐 (row, d∈[0,out_cols)) 求值 → 输出
-    [[nodiscard]] Result<void> eval_fold_impl(const ExprSpec& spec, std::span<const Tensor> inputs,
+    [[nodiscard]] exstl::Result<void> eval_fold_impl(const ExprSpec& spec, std::span<const Tensor> inputs,
                                               std::size_t rows, std::size_t cols, bool vector_out,
                                               Tensor& output)
     {
-        if (vector_out) NN_FAIL("eval_fold: vector_out not expected (fold outputs via eval_expr)");
+        if (vector_out) EX_FAIL("eval_fold: vector_out not expected (fold outputs via eval_expr)");
         const FoldSpec& f = *spec.fold;
         const std::size_t K = f.k;
         const std::size_t out_cols = (f.vec_state_len > 0) ? f.vec_state_len : 1;
         if (cols != out_cols)
-            NN_FAIL("eval_fold: cols must equal fold output width (vec_state_len or 1)");
+            EX_FAIL("eval_fold: cols must equal fold output width (vec_state_len or 1)");
         // ── P10-③ 域簿记：body 域槽（body Input / f.matmul A·B / vecacc.b）与
         //   尾链域槽（顶层 instrs 的 Input）——尾链独占槽按输出网格校验、
         //   body 槽（或无人引用的旧槽）按既有 (rows, K) 规则校验、两域皆用则
@@ -2058,7 +2058,7 @@ public:
         for (std::size_t k = 0; k < inputs.size(); ++k)
         {
             const Tensor& t = inputs[k];
-            if (!t.is_cpu()) NN_FAIL("eval_fold: input not CPU");
+            if (!t.is_cpu()) EX_FAIL("eval_fold: input not CPU");
             const ExprViewKind vk = static_cast<ExprViewKind>(spec.views[k].kind);
             // vecacc.b（(K, vec) 独立校验于下方）与掩码小表（BatchMod/BatchCol
             //   为 (1, *) 标签/斜率向量，行主序平坦读、不占 (rows,K) 网格）
@@ -2077,29 +2077,29 @@ public:
                 if (vk == ExprViewKind::Linear || vk == ExprViewKind::HeadGroup)
                 {
                     if (t.rows() != rows || t.cols() != out_cols)
-                        NN_FAIL("eval_fold: tail input shape mismatch (expect (rows, out_cols))");
+                        EX_FAIL("eval_fold: tail input shape mismatch (expect (rows, out_cols))");
                 }
                 else if (vk == ExprViewKind::RowBroadcast)
                 {
                     if (!(t.rows() == rows && t.cols() == 1))
-                        NN_FAIL("eval_fold: tail RowBroadcast input must be (rows, 1)");
+                        EX_FAIL("eval_fold: tail RowBroadcast input must be (rows, 1)");
                 }
                 else if (vk == ExprViewKind::ColBroadcast)
                 {
                     if (!(t.rows() == 1 && t.cols() == out_cols))
-                        NN_FAIL("eval_fold: tail ColBroadcast input must be (1, out_cols)");
+                        EX_FAIL("eval_fold: tail ColBroadcast input must be (1, out_cols)");
                 }
                 else if (vk == ExprViewKind::Transpose)
                 {
                     const std::size_t stride = spec.views[k].param;
                     if (stride == 0 || (out_cols - 1) * stride + rows > t.size())
-                        NN_FAIL("eval_fold: tail Transpose input addressing out of range");
+                        EX_FAIL("eval_fold: tail Transpose input addressing out of range");
                 }
                 else if (vk == ExprViewKind::BatchMod)
                 {
                     const std::uint32_t vparam = spec.views[k].param;
                     if (t.rows() != 1 || vparam == 0)
-                        NN_FAIL("eval_fold: tail BatchMod input must be (1, n), param > 0");
+                        EX_FAIL("eval_fold: tail BatchMod input must be (1, n), param > 0");
                 }
                 else if (vk == ExprViewKind::BatchCol)
                 {
@@ -2107,10 +2107,10 @@ public:
                     const std::size_t batch_n = f.matmul ? f.matmul->batch : 1;
                     if (t.rows() != 1 || vparam == 0 ||
                         t.cols() != batch_n * static_cast<std::size_t>(vparam))
-                        NN_FAIL("eval_fold: tail BatchCol input must be (1, batch*param)");
+                        EX_FAIL("eval_fold: tail BatchCol input must be (1, batch*param)");
                 }
                 else
-                    NN_FAIL("eval_fold: tail view outside supported scope");
+                    EX_FAIL("eval_fold: tail view outside supported scope");
                 // 尾链独占槽：跳过 body 侧的 (rows, K)/白名单校验（域不同）
                 if (!used_body[k])
                 {
@@ -2137,7 +2137,7 @@ public:
                     is_a ? (tr ? nb_a * mm_k : rows) : (tr ? nb_b * K : nb_b * mm_k);
                 const std::size_t ec = is_a ? (tr ? m_per : mm_k) : (tr ? mm_k : K);
                 if (t.rows() != er || t.cols() != ec)
-                    NN_FAIL("eval_fold: fold matmul input shape mismatch");
+                    EX_FAIL("eval_fold: fold matmul input shape mismatch");
                 spans.push_back(t.cpu_matrix().span());
                 continue;
             }
@@ -2147,21 +2147,21 @@ public:
                 vk != ExprViewKind::RowMod && vk != ExprViewKind::RowBroadcast &&
                 vk != ExprViewKind::Transpose &&
                 !((vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol) && f.matmul))
-                NN_FAIL("eval_fold: view outside supported scope");
+                EX_FAIL("eval_fold: view outside supported scope");
             const bool is_trans = (vk == ExprViewKind::Transpose);
             if (!is_vecb && !is_tag_table && !is_rowvec && !is_trans &&
                 (t.rows() != rows || t.cols() != K))
-                NN_FAIL("eval_fold: input shape mismatch (expect (rows, fold.k))");
+                EX_FAIL("eval_fold: input shape mismatch (expect (rows, fold.k))");
             if (is_trans)
             {
                 // 转置读：(rows, K) 网格读 (K, rows) 存储——与 matmul 输入同
                 //   精神的"定向放宽"（形状元数据不设假设，只做寻址越界守卫）
                 const std::size_t stride = spec.views[k].param;
                 if (stride == 0 || (K - 1) * stride + rows > t.size())
-                    NN_FAIL("eval_fold: Transpose input addressing out of range");
+                    EX_FAIL("eval_fold: Transpose input addressing out of range");
             }
             if (is_tag_table && t.rows() != 1)
-                NN_FAIL("eval_fold: tag table (BatchMod/BatchCol) must be (1, n)");
+                EX_FAIL("eval_fold: tag table (BatchMod/BatchCol) must be (1, n)");
             // 标签表列数守卫（必须连 cols 一起查，否则形状违约静默越界读）：
             //   BatchMod 读 [batch_idx % param] → cols ≥ param（param==0 无
             //   定义直接拒）；BatchCol 读 [batch_idx*param + gk] →
@@ -2169,16 +2169,16 @@ public:
             if (is_tag_table)
             {
                 const std::uint32_t vparam = spec.views[k].param;
-                if (vparam == 0) NN_FAIL("eval_fold: BatchMod/BatchCol param must be > 0");
+                if (vparam == 0) EX_FAIL("eval_fold: BatchMod/BatchCol param must be > 0");
                 const std::size_t batch_n = f.matmul ? f.matmul->batch : 1;
                 const std::size_t need = vk == ExprViewKind::BatchMod
                                              ? static_cast<std::size_t>(vparam)
                                              : (batch_n - 1) * static_cast<std::size_t>(vparam) + K;
                 if (t.cols() < need)
-                    NN_FAIL("eval_fold: tag table cols out of range (BatchMod/BatchCol)");
+                    EX_FAIL("eval_fold: tag table cols out of range (BatchMod/BatchCol)");
             }
             if (is_rowvec && !(t.rows() == rows && t.cols() == 1))
-                NN_FAIL("eval_fold: RowBroadcast input must be (rows, 1)");
+                EX_FAIL("eval_fold: RowBroadcast input must be (rows, 1)");
             spans.push_back(t.cpu_matrix().span());
         }
         // vecacc.b：(batch·K, vec_state_len) 行主序（行 = batch 全局键
@@ -2191,12 +2191,12 @@ public:
                 (f.matmul ? f.matmul->batch : 1) / gqa_ratio_of(spec, f.vecacc->b_input);
             const std::size_t want_rows = (vb ? vb : 1) * K;
             if (tb.rows() != want_rows || tb.cols() != f.vec_state_len)
-                NN_FAIL(
+                EX_FAIL(
                     "eval_fold: vecacc b_input shape mismatch (expect (batch*k, vec_state_len))");
         }
 
         auto cls_r = expr_fold_classify(f, spec.num_regs);
-        NN_TRY_CHECK(cls_r);
+        EX_TRY_CHECK(cls_r);
         const std::vector<uint8_t>& is_elem = *cls_r;
 
         // fold matmul 上下文（掩码网格索引与 mm 段求值共用）
@@ -2318,7 +2318,7 @@ public:
                 }
                 else
                 {
-                    nn::parallel_for_blocks(tasks.begin(), tasks.end(), run_task);
+                    exstl::parallel_for_blocks(tasks.begin(), tasks.end(), run_task);
                 }
             }
             mmc = mm_span;
@@ -2377,7 +2377,7 @@ public:
         std::size_t n_chunks = 1;
         if (rows >= 2 && K > 0 && rows * K >= kFoldParallelMinWork)
         {
-            n_chunks = std::min(nn::global_thread_pool().size(), rows / kFoldRowsPerChunk);
+            n_chunks = std::min(exstl::global_thread_pool().size(), rows / kFoldRowsPerChunk);
             if (n_chunks < 1) n_chunks = 1;
         }
         const auto run_rows = [&](std::size_t r_begin, std::size_t r_end)
@@ -2610,7 +2610,7 @@ public:
                 ranges.emplace_back(off, off + len);
                 off += len;
             }
-            nn::parallel_for_blocks(ranges.begin(), ranges.end(),
+            exstl::parallel_for_blocks(ranges.begin(), ranges.end(),
                                     [&](const RowRange& rg) { run_rows(rg.first, rg.second); });
         }
         return {};
@@ -2619,24 +2619,24 @@ public:
     // ── eval_expr / eval_expr_reduce / eval_expr_into 共用实现 ────────────
     // output：调用方预分配的输出张量，形状须与输出一致
     //   （vector_out=false → (rows,cols)；true → (rows,1)/(1,cols)）。
-    [[nodiscard]] Result<void> eval_expr_impl(const ExprSpec& raw_spec,
+    [[nodiscard]] exstl::Result<void> eval_expr_impl(const ExprSpec& raw_spec,
                                               std::span<const Tensor> inputs, std::size_t rows,
                                               std::size_t cols, bool vector_out, Tensor& output)
     {
         // canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），Layer 无感知；
         // 结构统一在 canonical 形态上，与 scan/gen_fused 两端一致。
-        NN_TRY(v, validate_expr_spec(raw_spec, inputs.size()));
+        EX_TRY(v, validate_expr_spec(raw_spec, inputs.size()));
         // fold 段：独立执行路径——跳过 canonicalize（IR-A/B 不作用于
         //   body/finalize 序列）与空指令表检查（fold 的 finalize 即尾链）
         if (raw_spec.fold) return eval_fold_impl(raw_spec, inputs, rows, cols, vector_out, output);
         const ExprSpec spec = canonicalize_expr_spec(raw_spec);
-        NN_TRY(v2, validate_expr_spec(spec, inputs.size()));
+        EX_TRY(v2, validate_expr_spec(spec, inputs.size()));
         // 空指令表仅允许"纯 matmul"（输出 = matmul 结果本身）
-        if (spec.instrs.empty() && !spec.matmul) NN_FAIL("eval_expr: empty instruction list");
+        if (spec.instrs.empty() && !spec.matmul) EX_FAIL("eval_expr: empty instruction list");
         // vector_out：要求表达式为纯行/列归约（归约轴 0/1），输出取向量形状
         const int raxis = vector_out ? expr_spec_reduce_axis(spec) : -1;
         if (vector_out && raxis != 0 && raxis != 1)
-            NN_FAIL("eval_expr_reduce: 表达式需为行/列归约（归约轴 0/1）");
+            EX_FAIL("eval_expr_reduce: 表达式需为行/列归约（归约轴 0/1）");
         const bool vec_is_row = (raxis == 0);
 
         std::vector<ConstSpan> spans;
@@ -2654,11 +2654,11 @@ public:
         for (std::size_t k = 0; k < inputs.size(); ++k)
         {
             const Tensor& t = inputs[k];
-            if (!t.is_cpu()) NN_FAIL("eval_expr: input not CPU");
+            if (!t.is_cpu()) EX_FAIL("eval_expr: input not CPU");
             // CPU 解释器按 f32 存储读取 span：f16 输入直读 = 空指针 UB →
             // 响亮报错，让误用立刻暴露。
             if (t.precision() != Precision::F32)
-                NN_FAIL("eval_expr: CPU 解释器仅支持 f32 输入（f16 须由基类 NVI 入口先抬到 "
+                EX_FAIL("eval_expr: CPU 解释器仅支持 f32 输入（f16 须由基类 NVI 入口先抬到 "
                         "f32（直调 eval_expr_impl 才会到这里））");
             const ExprView& v = spec.views[k];
             if (mm && (k == static_cast<std::size_t>(mm->a_input) ||
@@ -2675,7 +2675,7 @@ public:
                 const std::size_t ec = is_a ? (tr ? m_per : mm_k) // A 存储列数期望
                                             : (tr ? mm_k : cols);
                 if (t.rows() != er || t.cols() != ec)
-                    NN_FAIL("eval_expr: matmul input shape mismatch");
+                    EX_FAIL("eval_expr: matmul input shape mismatch");
                 spans.push_back(t.cpu_matrix().span());
                 continue;
             }
@@ -2691,53 +2691,53 @@ public:
             case static_cast<uint8_t>(ExprViewKind::RowReduceMax):
             case static_cast<uint8_t>(ExprViewKind::RowGather):
                 // 按标签行收集：主输入行数任意（读取经 label 索引），列数须一致
-                if (t.cols() != cols) NN_FAIL("eval_expr: RowGather input cols mismatch");
+                if (t.cols() != cols) EX_FAIL("eval_expr: RowGather input cols mismatch");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RotateHalf):
                 if (t.rows() != rows || t.cols() != cols || v.param == 0 || rows % v.param != 0 ||
                     v.param % 2 != 0)
-                    NN_FAIL("eval_expr: RotateHalf shape/param invalid");
+                    EX_FAIL("eval_expr: RotateHalf shape/param invalid");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RowMod):
                 if (t.rows() != v.param || t.cols() != cols || v.param == 0 || rows % v.param != 0)
-                    NN_FAIL("eval_expr: RowMod shape/param invalid");
+                    EX_FAIL("eval_expr: RowMod shape/param invalid");
                 break;
             case static_cast<uint8_t>(ExprViewKind::Transpose):
                 // 转置读：(rows, cols) 网格读 (cols, rows) 存储（行距 = param）——
                 // 形状元数据不设假设，只做寻址越界守卫（与 fold 侧同精神）
                 if (v.param == 0 ||
                     (cols - 1) * static_cast<std::size_t>(v.param) + rows > t.size())
-                    NN_FAIL("eval_expr: Transpose input addressing out of range");
+                    EX_FAIL("eval_expr: Transpose input addressing out of range");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RowAccess):
                 // 读取行 [offset, offset+mod)，须在输入行数内；offset 为运行时形状
                 if (t.cols() != cols || v.param == 0 || v.param2 + v.param > t.rows())
-                    NN_FAIL("eval_expr: RowAccess shape/param invalid");
+                    EX_FAIL("eval_expr: RowAccess shape/param invalid");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RowBroadcast):
                 // 输入 (rows,1)：每行一个值，按行广播
                 if (t.rows() != rows || t.cols() != 1)
-                    NN_FAIL("eval_expr: RowBroadcast input must be (rows,1)");
+                    EX_FAIL("eval_expr: RowBroadcast input must be (rows,1)");
                 break;
             case static_cast<uint8_t>(ExprViewKind::ColBroadcast):
                 // 输入 (1,cols)：每列一个值，按列广播
                 if (t.rows() != 1 || t.cols() != cols)
-                    NN_FAIL("eval_expr: ColBroadcast input must be (1,cols)");
+                    EX_FAIL("eval_expr: ColBroadcast input must be (1,cols)");
                 break;
             case static_cast<uint8_t>(ExprViewKind::BatchMod):
                 // 输入 (1,modulo 相关)：按批次取模索引的小向量
-                if (t.rows() != 1) NN_FAIL("eval_expr: BatchMod input must be (1,cols)");
+                if (t.rows() != 1) EX_FAIL("eval_expr: BatchMod input must be (1,cols)");
                 break;
             case static_cast<uint8_t>(ExprViewKind::BatchCol):
                 // 输入 (1, batch*param)：按 (batch, col) 切片（doc_ids 等）
                 if (t.rows() != 1 || t.cols() != mm_batch * v.param)
-                    NN_FAIL("eval_expr: BatchCol input must be (1,batch*param)");
+                    EX_FAIL("eval_expr: BatchCol input must be (1,batch*param)");
                 break;
             case static_cast<uint8_t>(ExprViewKind::GroupedReduceSum):
             case static_cast<uint8_t>(ExprViewKind::GroupedReduceMax):
                 // 输入 (rows*R, cols)：输出行 r 读组行 [r*R, (r+1)*R)
                 if (v.param == 0 || t.cols() != cols || t.rows() != rows * v.param)
-                    NN_FAIL("eval_expr: GroupedReduce input shape invalid (expect (rows*R, cols))");
+                    EX_FAIL("eval_expr: GroupedReduce input shape invalid (expect (rows*R, cols))");
                 break;
             }
             spans.push_back(t.cpu_matrix().span());
@@ -2746,7 +2746,7 @@ public:
         // 输出 span 由调用方预分配；n 恒为**网格**元素数（vector_out 时输出
         // span 更小，而下述归约重放循环仍按网格遍历）。
         if (output.precision() != Precision::F32)
-            NN_FAIL("eval_expr: CPU 解释器输出须为 f32 存储（f16 输出须由基类 NVI 入口落回）");
+            EX_FAIL("eval_expr: CPU 解释器输出须为 f32 存储（f16 输出须由基类 NVI 入口落回）");
         Span out = output.cpu_matrix().span();
         const std::size_t n = rows * cols;
         if (n == 0) return {};
@@ -2779,7 +2779,7 @@ public:
                     acc[r] = a;
                 };
                 if (rows * cols >= kExprParallelThreshold && rows > 1)
-                    nn::parallel_for_samples(rows, kernel);
+                    exstl::parallel_for_samples(rows, kernel);
                 else
                     for (std::size_t r = 0; r < rows; ++r)
                         kernel(r);
@@ -2794,7 +2794,7 @@ public:
                     acc[c] = a;
                 };
                 if (rows * cols >= kExprParallelThreshold && cols > 1)
-                    nn::parallel_for_samples(cols, kernel);
+                    exstl::parallel_for_samples(cols, kernel);
                 else
                     for (std::size_t c = 0; c < cols; ++c)
                         kernel(c);
@@ -2866,7 +2866,7 @@ public:
         // ── 纯 matmul（无逐元素链）：输出 = matmul 结果本身 ─────────────
         if (spec.instrs.empty())
         {
-            if (!mm) NN_FAIL("eval_expr: empty instruction list without matmul");
+            if (!mm) EX_FAIL("eval_expr: empty instruction list without matmul");
             const auto ms = matmul_out.span();
             for (std::size_t i = 0; i < n; ++i)
                 out[i] = ms[i];
@@ -3038,7 +3038,7 @@ public:
                     acc[c] = a;
                 };
                 if (n >= kExprParallelThreshold && cols > 1)
-                    nn::parallel_for_samples(cols, col_kernel);
+                    exstl::parallel_for_samples(cols, col_kernel);
                 else
                     for (std::size_t c = 0; c < cols; ++c)
                         col_kernel(c);
@@ -3056,7 +3056,7 @@ public:
                     acc[r] = a;
                 };
                 if (n >= kExprParallelThreshold && rows > 1)
-                    nn::parallel_for_samples(rows, row_kernel);
+                    exstl::parallel_for_samples(rows, row_kernel);
                 else
                     for (std::size_t r = 0; r < rows; ++r)
                         row_kernel(r);
@@ -3159,13 +3159,13 @@ public:
                             const ExprViewKind vk =
                                 static_cast<ExprViewKind>(spec.views[op.idx].kind);
                             if (!expr_view_is_reduce(vk) && !expr_view_is_broadcast(vk))
-                                NN_FAIL("eval_expr_reduce: 输出链经 Linear/视图直接访问输入，"
+                                EX_FAIL("eval_expr_reduce: 输出链经 Linear/视图直接访问输入，"
                                         "输出不沿归约轴恒定");
                         }
                         else if (op.kind == static_cast<uint8_t>(ExprOperandKind::Matmul))
                         {
                             // matmul 输出沿两个轴都变化，不能作为归约向量输出
-                            NN_FAIL("eval_expr_reduce: 输出链经 Matmul 访问，输出不沿归约轴恒定");
+                            EX_FAIL("eval_expr_reduce: 输出链经 Matmul 访问，输出不沿归约轴恒定");
                         }
                         else if (op.kind == static_cast<uint8_t>(ExprOperandKind::Row) ||
                                  op.kind == static_cast<uint8_t>(ExprOperandKind::Col) ||
@@ -3173,7 +3173,7 @@ public:
                         {
                             // 索引操作数沿归约轴的恒定性由生成器/引擎按轴判定；
                             // 这里保守拒绝（实际表达式不触发此路径）
-                            NN_FAIL("eval_expr_reduce: 输出链经 Row/Col/Batch "
+                            EX_FAIL("eval_expr_reduce: 输出链经 Row/Col/Batch "
                                     "索引，输出不沿归约轴恒定");
                         }
                         else if (op.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
@@ -3201,7 +3201,7 @@ public:
                     const std::size_t c = vec_is_row ? 0 : k;
                     o[k] = eval_element(r, c);
                 };
-                nn::parallel_for_samples(len, slot_kernel);
+                exstl::parallel_for_samples(len, slot_kernel);
             }
             else
             {
@@ -3218,7 +3218,7 @@ public:
         // ── 广播输出（常规 eval_expr）：每元素求值，输出 (rows, cols) ──
         // 逐元素无跨元素依赖（归约/matmul 段均已预计算且此处只读）→ 并行与
         // 串行逐字节一致。门控用解释器自己的阈值 kExprParallelThreshold
-        // （远低于 PARALLEL_THRESHOLD）：解释执行 per-element 成本高一个数量级，
+        // （远低于 exstl::PARALLEL_THRESHOLD）：解释执行 per-element 成本高一个数量级，
         // 且典型层形状（如 768×512=393216）低于全局阈值、按其门控不会并行。
         if (n >= kExprParallelThreshold)
         {
@@ -3234,7 +3234,7 @@ public:
                 }
                 out[i] = eval_element(r, c);
             };
-            nn::parallel_for_samples(n, elem_kernel);
+            exstl::parallel_for_samples(n, elem_kernel);
         }
         else
         {

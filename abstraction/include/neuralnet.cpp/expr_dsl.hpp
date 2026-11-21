@@ -33,8 +33,8 @@
 #include <ranges>
 
 #include <neuralnet.cpp/core_config.hpp>   // NN_PROBES_ENABLED（探针编译门）
-#include <neuralnet.cpp/core_parallel.hpp>   // nn::parallel_for_samples
-#include <neuralnet.cpp/core_assert.hpp>    // NN_ASSERT_ALWAYS（DSL 结构不变量）
+#include <exstl/parallel.hpp>   // exstl::parallel_for_samples
+#include <exstl/assert.hpp>    // EX_ASSERT_ALWAYS（DSL 结构不变量）
 #include "core_domain.hpp"
 #include "core_env.hpp"      // RV-09：环境变量读取唯一入口
 
@@ -52,7 +52,7 @@ inline bool env_flag(const char* name)
 
 #include "compute_tensor.hpp"
 #include "compute_engine.hpp"
-#include <neuralnet.cpp/core_assert.hpp>
+#include <exstl/assert.hpp>
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
 #include "algebra_ops.hpp"    // nn::ops（唯一算子来源，含 op_id()）
@@ -71,7 +71,7 @@ namespace nn::dsl
 using TensorAccess = ::nn::detail::TensorAccess;
 
 // ── DSL 逐元素模板路径的并行门控 ────────────────────────────────────────
-// 低于全局 nn::PARALLEL_THRESHOLD(524288)。全局值按"裸逐元素 add 的内存
+// 低于全局 exstl::PARALLEL_THRESHOLD(524288)。全局值按"裸逐元素 add 的内存
 // 带宽回本点"标定；而本路径折叠的是多算子融合表达式（每元素 2~6 次算术，
 // 还可能含 exp/tanh/sqrt），per-element 成本更高，回本点更低。
 // LayerNorm/RMSNorm 的典型形状 768×512 = 393216 低于全局门控 → 若按全局
@@ -216,7 +216,7 @@ template <typename E>
 // 与逐元素原语（algebra_matrix 的 apply/transform/原地运算）**同构**：
 //   - n < kDslParallelThreshold：串行计数循环 + NN_VECTORIZE_PRAGMA
 //   - n ≥ kDslParallelThreshold：自建分块并行，块内同样是**带向量化提示的裸
-//     指针计数循环**（不用 nn::for_each(iota)：其分块内层在池里，无法为该
+//     指针计数循环**（不用 exstl::for_each(iota)：其分块内层在池里，无法为该
 //     循环单独加向量化提示——池被多种读写模式复用，不能全局 assume_safety；
 //     实测大张量下慢 1.3–1.5 倍）
 // NN_VECTORIZE_PRAGMA（clang `loop vectorize(assume_safety)` / GCC ivdep）是
@@ -226,7 +226,7 @@ template <typename E>
 // 先读完再写回。无论目标是否与某输入同 buffer，向量化后的"载入同下标向量
 // →计算→存回"与串行逐一读改写逐字节一致（无跨下标依赖）。
 //
-// 门控说明：这里用 kDslParallelThreshold（131072）而非全局 PARALLEL_THRESHOLD
+// 门控说明：这里用 kDslParallelThreshold（131072）而非全局 exstl::PARALLEL_THRESHOLD
 // （524288）。全局值是按"裸 add 的内存带宽回本点"标的；而本路径折叠的是
 // 多算子融合表达式（每元素 2~6 次算术 + 可能的 exp/tanh），per-element 成本
 // 更高，回本点更低。典型 LayerNorm/RMSNorm 形状 768×512=393216 正好低于
@@ -257,7 +257,7 @@ template <typename E> inline void eval_into_span(const E& e, Span d_span, std::s
         std::clamp(n / TARGET_CHUNK, std::size_t{1}, std::max<std::size_t>(hw, 1) * 4);
     const std::size_t base = n / n_chunks;
     const std::size_t rem = n % n_chunks;
-    nn::parallel_for_samples(n_chunks,
+    exstl::parallel_for_samples(n_chunks,
                              [&e, d, cols, base, rem](std::size_t c) noexcept
                              {
                                  const std::size_t off = c * base + std::min(c, rem);
@@ -299,7 +299,7 @@ struct CpuViewCache
         if (!t.is_cpu()) return;
         // 符号张量（默认构造：未绑定、无存储）——AOT 自登记需要"从表达式类型
         // 折叠出结构"，那条路径只看 to_spec 折出的视图/指令，不会 eval；此处
-        // 直接返回，避免在无存储张量上取 CPU 视图（原会 NN_ASSERT 硬失败）。
+        // 直接返回，避免在无存储张量上取 CPU 视图（原会 EX_ASSERT 硬失败）。
         if (!t.valid()) return;
         if (t.precision() == Precision::F16)
         {
@@ -320,7 +320,7 @@ struct CpuViewCache
     [[nodiscard]] Scalar at(std::size_t i) const
     {
         // RV-01：失败后 `data[i]` 是空指针解引用 → 无条件终止
-        NN_ASSERT_ALWAYS(data != nullptr,
+        EX_ASSERT_ALWAYS(data != nullptr,
                          "DSL 叶子 eval 仅适用于 CPU 张量（GPU 路径走 to_spec 折叠）");
         return data[i];
     }
@@ -560,13 +560,13 @@ struct MatmulRef
     mutable Tensor c_cache_{};
     mutable const Scalar* c_data_ = nullptr;
 
-    [[nodiscard]] Result<void> prepare_cpu(ComputeEngine& eng) const
+    [[nodiscard]] exstl::Result<void> prepare_cpu(ComputeEngine& eng) const
     {
         // GQA（ratio>1）：CPU 预绑定路径用通用 batched_matmul，无头映射语义
         // → 直接拒绝，让上层回退到解释器（eval_expr 的 MatmulSpec 分支已支持
         // 头映射）。预绑定只是优化，回退不引入正确性风险。
         if (a_kv_ratio > 1 || b_kv_ratio > 1)
-            NN_FAIL("dsl matmul prepare: kv_ratio > 1 走解释器路径（CPU 预绑定不支持头映射）");
+            EX_FAIL("dsl matmul prepare: kv_ratio > 1 走解释器路径（CPU 预绑定不支持头映射）");
         if (c_data_ != nullptr) return {};  // 幂等：同一棵树重复求值只物化一次
         // ── 精度安全（§7.2 f32 参考）────────────────────────────────────
         // C 固定以 P=F32 物化，而操作数可能带 **f16 存储**（profile_f16 的
@@ -579,24 +579,24 @@ struct MatmulRef
         if (a.precision() != Precision::F32)
         {
             auto r = eng.cast(a, Precision::F32);
-            NN_TRY_CHECK(r);
+            EX_TRY_CHECK(r);
             ca = std::move(*r);
             pa = &ca;
         }
         if (b.precision() != Precision::F32)
         {
             auto r = eng.cast(b, Precision::F32);
-            NN_TRY_CHECK(r);
+            EX_TRY_CHECK(r);
             cb = std::move(*r);
             pb = &cb;
         }
         constexpr Precision P = Precision::F32;
-        Result<Tensor> c = (batch > 1)
+        exstl::Result<Tensor> c = (batch > 1)
                                ? eng.batched_matmul(*pa, *pb, batch, transA, transB, Scalar{1}, P)
                                : eng.matmul(*pa, *pb, transA, transB, P);
-        NN_TRY_CHECK(c);
-        if (!c->is_cpu()) NN_FAIL("dsl matmul prepare: result not on CPU");
-        if (c->precision() != Precision::F32) NN_FAIL("dsl matmul prepare: result not f32");
+        EX_TRY_CHECK(c);
+        if (!c->is_cpu()) EX_FAIL("dsl matmul prepare: result not on CPU");
+        if (c->precision() != Precision::F32) EX_FAIL("dsl matmul prepare: result not f32");
         if (env_flag("NN_F16_DEBUG"))
         {
             const auto sp = TensorAccess::cpu_matrix(*c).span();
@@ -642,7 +642,7 @@ struct MatmulRef
         // 单 matmul 段约束：spec.matmul 是单个 optional，第二个 MatmulRef
         // 会静默覆盖前一个 → 错值。结构不变量在此 fail-fast（编程错误，
         // 与"一个表达式一个 matmul 段"的 IR 域规则同源）。
-        NN_ASSERT_ALWAYS(!sb.spec.matmul.has_value(),
+        EX_ASSERT_ALWAYS(!sb.spec.matmul.has_value(),
                          "MatmulRef::to_spec: 一个表达式至多一个 matmul 段"
                          "（多 matmul 融合暂不支持，请拆成多个表达式）");
         sb.spec.matmul = MatmulSpec{ai,
@@ -1264,20 +1264,20 @@ inline void grid_contrib(const Select<C, T, Ex>& e, GridInfer& g)
 
 // 推导出口：失败一律给出"可操作"的错误（点名入口 + 提示显式 rows/cols）
 template <typename E>
-[[nodiscard]] inline Result<std::pair<std::size_t, std::size_t>> infer_grid_shape(const E& e,
+[[nodiscard]] inline exstl::Result<std::pair<std::size_t, std::size_t>> infer_grid_shape(const E& e,
                                                                                   const char* entry)
 {
     GridInfer g;
     grid_contrib(e, g);
     const std::string where = std::string(entry) + "(engine, expr[, P])";
     if (g.conflict)
-        NN_FAIL(where + " 无法推导输出形状：操作数形状不满足广播规则"
+        EX_FAIL(where + " 无法推导输出形状：操作数形状不满足广播规则"
                         "（逐维相等或其一为 1）→ 请用显式形式给出 rows/cols");
     if (g.unknown)
-        NN_FAIL(where + " 无法推导输出形状：表达式含形状不可推导的项"
+        EX_FAIL(where + " 无法推导输出形状：表达式含形状不可推导的项"
                         "（如 GQA matmul 行块不整除）→ 请用显式形式给出 rows/cols");
     if (!g.any)
-        NN_FAIL(where + " 无法推导输出形状：表达式不含可确定网格的张量操作数"
+        EX_FAIL(where + " 无法推导输出形状：表达式不含可确定网格的张量操作数"
                         "（如裸广播向量）→ 请用显式形式给出 rows/cols");
     return std::pair<std::size_t, std::size_t>{g.rows, g.cols};
 }
@@ -1356,16 +1356,16 @@ inline constexpr bool cpu_preparable_v<ReduceRef<C, Rop>> = cpu_preparable_v<C>;
 
 // 默认：普通叶子 / 视图 / 索引叶子无需预绑定
 template <typename T>
-[[nodiscard]] inline Result<void> cpu_prepare(const T&, ComputeEngine&, std::size_t, std::size_t)
+[[nodiscard]] inline exstl::Result<void> cpu_prepare(const T&, ComputeEngine&, std::size_t, std::size_t)
 { return {}; }
 
 template <typename Op, nn::Expression C>
-[[nodiscard]] inline Result<void> cpu_prepare(const Unary<Op, C>& u, ComputeEngine& eng,
+[[nodiscard]] inline exstl::Result<void> cpu_prepare(const Unary<Op, C>& u, ComputeEngine& eng,
                                               std::size_t rows, std::size_t cols)
 { return cpu_prepare(u.child, eng, rows, cols); }
 
 template <typename Op, nn::Expression L, nn::Expression R>
-[[nodiscard]] inline Result<void> cpu_prepare(const Binary<Op, L, R>& b, ComputeEngine& eng,
+[[nodiscard]] inline exstl::Result<void> cpu_prepare(const Binary<Op, L, R>& b, ComputeEngine& eng,
                                               std::size_t rows, std::size_t cols)
 {
     if (auto r = cpu_prepare(b.l, eng, rows, cols); !r) return r;
@@ -1373,7 +1373,7 @@ template <typename Op, nn::Expression L, nn::Expression R>
 }
 
 template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
-[[nodiscard]] inline Result<void> cpu_prepare(const Select<C, T, E>& s, ComputeEngine& eng,
+[[nodiscard]] inline exstl::Result<void> cpu_prepare(const Select<C, T, E>& s, ComputeEngine& eng,
                                               std::size_t rows, std::size_t cols)
 {
     if (auto r = cpu_prepare(s.cond, eng, rows, cols); !r) return r;
@@ -1382,19 +1382,19 @@ template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
 }
 
 // matmul：把 C 物化一次（引擎通用 GEMM 原语）并绑定指针
-[[nodiscard]] inline Result<void> cpu_prepare(const MatmulRef& m, ComputeEngine& eng, std::size_t,
+[[nodiscard]] inline exstl::Result<void> cpu_prepare(const MatmulRef& m, ComputeEngine& eng, std::size_t,
                                               std::size_t)
 { return m.prepare_cpu(eng); }
 
 // 归约视图：按输出槽算出行/列归约向量（槽内沿归约轴升序累加）
 template <ExprViewKind K>
-[[nodiscard]] inline Result<void> cpu_prepare(const ReduceViewRef<K>& r, ComputeEngine&,
+[[nodiscard]] inline exstl::Result<void> cpu_prepare(const ReduceViewRef<K>& r, ComputeEngine&,
                                               std::size_t rows, std::size_t cols)
 {
     if (r.v_ != nullptr) return {};
-    if (!r.t.is_cpu()) NN_FAIL("dsl reduce-view prepare: input not on CPU");
+    if (!r.t.is_cpu()) EX_FAIL("dsl reduce-view prepare: input not on CPU");
     if (r.t.rows() != rows || r.t.cols() != cols)
-        NN_FAIL("dsl reduce-view prepare: shape mismatch");
+        EX_FAIL("dsl reduce-view prepare: shape mismatch");
     using R = ReduceViewRef<K>;
     // f16 输入 → 归约在 f32 参考空间做（§7.2）：一次性镜像后读。直接
     // cpu_matrix() 读 f16 存储 = 空指针 UB（MatmulRef::prepare_cpu 同款
@@ -1413,7 +1413,7 @@ template <ExprViewKind K>
     }
     else
     {
-        NN_FAIL("dsl reduce-view prepare: unsupported precision");
+        EX_FAIL("dsl reduce-view prepare: unsupported precision");
     }
     const Scalar init = R::reduces_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
     const std::size_t len = R::reduces_rows ? rows : cols;
@@ -1431,7 +1431,7 @@ template <ExprViewKind K>
         r.vec_[slot] = a;
     };
     // 槽间独立（累加方向固定）→ 并行与串行逐字节一致，无需归并
-    if (rows * cols >= kDslParallelThreshold && len > 1) nn::parallel_for_samples(len, slot_kernel);
+    if (rows * cols >= kDslParallelThreshold && len > 1) exstl::parallel_for_samples(len, slot_kernel);
     else
         for (std::size_t k = 0; k < len; ++k)
             slot_kernel(k);
@@ -1443,7 +1443,7 @@ template <ExprViewKind K>
 // 归约指令：先递归备好子表达式，再按输出槽对子表达式求值并归约。
 // 槽内沿归约轴升序累加 → 与解释器 replay_prefix 逐字节一致。
 template <typename C, ExprOp Rop>
-[[nodiscard]] inline Result<void> cpu_prepare(const ReduceRef<C, Rop>& r, ComputeEngine& eng,
+[[nodiscard]] inline exstl::Result<void> cpu_prepare(const ReduceRef<C, Rop>& r, ComputeEngine& eng,
                                               std::size_t rows, std::size_t cols)
 {
     if (r.v_ != nullptr) return {};
@@ -1471,7 +1471,7 @@ template <typename C, ExprOp Rop>
             }
         r.vec_[slot] = a;
     };
-    if (rows * cols >= kDslParallelThreshold && len > 1) nn::parallel_for_samples(len, slot_kernel);
+    if (rows * cols >= kDslParallelThreshold && len > 1) exstl::parallel_for_samples(len, slot_kernel);
     else
         for (std::size_t k = 0; k < len; ++k)
             slot_kernel(k);
@@ -1586,7 +1586,7 @@ template <typename E>
 //   · **不做 Auto 推导**：P 是唯一可见实参，来源可追溯（§8.5 G4）。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
-[[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e, std::size_t rows,
+[[nodiscard]] exstl::Result<Tensor> compute(ComputeEngine& eng, const E& e, std::size_t rows,
                                      std::size_t cols,
                                      Precision P)   // 默认实参在 compute_engine.hpp 前置声明处
 {
@@ -1617,14 +1617,14 @@ template <typename E>
             // 归约"，折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义处理归约
             // 视图/指令）
             auto [spec, inputs] = to_expr_spec(e);
-            NN_TRY(v, validate_expr_spec(spec, inputs.size()));
+            EX_TRY(v, validate_expr_spec(spec, inputs.size()));
             return eng.eval_expr(spec, inputs, rows, cols, P);
         }
         return (eval_cpu(e, rows, cols, P));
     }
 
     auto [spec, inputs] = to_expr_spec(e);
-    NN_TRY(v, validate_expr_spec(spec, inputs.size()));
+    EX_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr(spec, inputs, rows, cols, P);  // AOT 注册表：GPU 未命中走 JIT 兜底
 }
 
@@ -1632,13 +1632,13 @@ template <typename E>
 // 输出网格由表达式推导（口径见上方"输出网格形状推导"）；推导失败 = 明确报错，
 // 绝不猜形状。需要非常规网格（如裸行广播向量）时继续用 4/5 参显式形式。
 template <typename E>
-[[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e, Precision P)
+[[nodiscard]] exstl::Result<Tensor> compute(ComputeEngine& eng, const E& e, Precision P)
 {
-    NN_TRY(rc, infer_grid_shape(e, "dsl::compute"));
+    EX_TRY(rc, infer_grid_shape(e, "dsl::compute"));
     return compute(eng, e, rc->first, rc->second, P);
 }
 
-template <typename E> [[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e)
+template <typename E> [[nodiscard]] exstl::Result<Tensor> compute(ComputeEngine& eng, const E& e)
 { return compute(eng, e, Precision::F32); }
 
 // ── CPU 侧"写进目标张量"（f16 目标 → f32 参考求值 + 舍入写回，§7.2）────────
@@ -1700,12 +1700,12 @@ template <typename E> inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
 // 仅支持逐元素表达式（无归约）；归约向量输出用 compute_reduce。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
-[[nodiscard]] Result<void> compute_into(ComputeEngine& eng, const E& e, Tensor& dst)
+[[nodiscard]] exstl::Result<void> compute_into(ComputeEngine& eng, const E& e, Tensor& dst)
 {
     NN_PROF_OP("dsl::compute_into");   // CPU 模板路径不经引擎入口，须在此计时（剖析器）
     if (eng.device() == Device::CPU)
     {
-        if (!dst.is_cpu()) NN_FAIL("dsl::compute_into: dst not on CPU");
+        if (!dst.is_cpu()) EX_FAIL("dsl::compute_into: dst not on CPU");
         if constexpr (nn::dsl::has_reduction_v<E>)
         {
             // 注意：只在"不含真归约"时才走预绑定路径。含真归约的表达式必须落到
@@ -1731,7 +1731,7 @@ template <typename E>
             }
             // 含归约：折叠成 ExprSpec 走引擎（与 compute() 的 CPU 分支一致）
             auto [spec, inputs] = to_expr_spec(e);
-            NN_TRY(v, validate_expr_spec(spec, inputs.size()));
+            EX_TRY(v, validate_expr_spec(spec, inputs.size()));
             return eng.eval_expr_into(spec, inputs, dst.rows(), dst.cols(), dst);
         }
         // 纯逐元素：编译期模板直接写进 dst 的 span（零解释器开销、零分配），
@@ -1741,7 +1741,7 @@ template <typename E>
     }
 
     auto [spec, inputs] = to_expr_spec(e);
-    NN_TRY(v, validate_expr_spec(spec, inputs.size()));
+    EX_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr_into(spec, inputs, dst.rows(), dst.cols(), dst);
 }
 
@@ -1755,12 +1755,12 @@ template <typename E>
 // P：输出向量精度（§8.1；归约恒 f32 累加 + 输出舍入到 P，§7.3）。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
-[[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e, std::size_t rows,
+[[nodiscard]] exstl::Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e, std::size_t rows,
                                             std::size_t cols,
                                             Precision P) // 默认实参在 compute_engine.hpp 前置声明处
 {
     NN_PROF_OP("dsl::compute_reduce"); // CPU 模板路径不经引擎入口，须在此计时（剖析器）
-    NN_TRY(pc, check_precision_supported(P)); // 同 compute()：拒绝非存储精度
+    EX_TRY(pc, check_precision_supported(P)); // 同 compute()：拒绝非存储精度
     if (eng.device() == Device::CPU)
     {
         // 必须用 if constexpr：非归约根节点的 E 不能实例化 reduce_vector_tensor
@@ -1778,7 +1778,7 @@ template <typename E>
         }
     }
     auto [spec, inputs] = to_expr_spec(e);
-    NN_TRY(v, validate_expr_spec(spec, inputs.size()));
+    EX_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr_reduce(spec, inputs, rows, cols, P);
 }
 
@@ -1786,13 +1786,13 @@ template <typename E>
 // 归约向量形状 (rows,1)/(1,cols) 由引擎按归约轴决定，调用方给出的只是**输入
 // 网格**；故这里的推导与 compute 同一口径（见"输出网格形状推导"）。
 template <typename E>
-[[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e, Precision P)
+[[nodiscard]] exstl::Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e, Precision P)
 {
-    NN_TRY(rc, infer_grid_shape(e, "dsl::compute_reduce"));
+    EX_TRY(rc, infer_grid_shape(e, "dsl::compute_reduce"));
     return compute_reduce(eng, e, rc->first, rc->second, P);
 }
 
-template <typename E> [[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e)
+template <typename E> [[nodiscard]] exstl::Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e)
 { return compute_reduce(eng, e, Precision::F32); }
 
 // ── 目标传递版：compute_reduce_into ────────────────────────────────────────
@@ -1802,7 +1802,7 @@ template <typename E> [[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine&
 // dst 存储精度不可变（in-place，§8.3）；非 f32 / 非 CPU 目标走引擎参考
 // 求值 + cast_into 写回。
 template <typename E>
-[[nodiscard]] Result<void> compute_reduce_into(ComputeEngine& eng, const E& e, std::size_t rows,
+[[nodiscard]] exstl::Result<void> compute_reduce_into(ComputeEngine& eng, const E& e, std::size_t rows,
                                                std::size_t cols, Tensor& dst)
 {
     NN_PROF_OP("dsl::compute_reduce_into");
@@ -1817,7 +1817,7 @@ template <typename E>
                 {
                     if (!nn::dsl::reduce_vector_into(e, rows, cols,
                                                      TensorAccess::cpu_matrix(dst)))
-                        NN_FAIL("dsl::compute_reduce_into: dst 形状与归约向量不匹配");
+                        EX_FAIL("dsl::compute_reduce_into: dst 形状与归约向量不匹配");
                     TensorAccess::mark_written(dst);
                     return {};
                 }
@@ -1825,7 +1825,7 @@ template <typename E>
         }
     }
     auto [spec, inputs] = to_expr_spec(e);
-    NN_TRY(v, validate_expr_spec(spec, inputs.size()));
+    EX_TRY(v, validate_expr_spec(spec, inputs.size()));
     return eng.eval_expr_reduce_into(spec, inputs, rows, cols, dst);
 }
 
@@ -1856,9 +1856,9 @@ template <typename E>
     return {std::move(keepalive), rows, cols, e};
 }
 
-template <typename E> [[nodiscard]] Result<Tensor> end_expr(const ExprBlock<E>& b)
+template <typename E> [[nodiscard]] exstl::Result<Tensor> end_expr(const ExprBlock<E>& b)
 {
-    if (!b.eng) NN_FAIL("dsl::end_expr: ExprBlock 未绑定引擎");
+    if (!b.eng) EX_FAIL("dsl::end_expr: ExprBlock 未绑定引擎");
     return compute(*b.eng, b.expr, b.rows, b.cols);
 }
 

@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <memory>
 
-#include <neuralnet.cpp/core_errors.hpp>
+#include <exstl/errors.hpp>
 #include <neuralnet.cpp/core_domain.hpp>
 #include <neuralnet.cpp/precision.hpp>
 
@@ -76,10 +76,10 @@ public:
 
     // 创建 Device Local / Host Visible 缓冲区（引擎侧实现，Vulkan 操作；
     // usage 恒补 SHADER_DEVICE_ADDRESS（P3 实例表按设备地址引用张量缓冲））
-    [[nodiscard]] static Result<GpuBuffer>
+    [[nodiscard]] static exstl::Result<GpuBuffer>
     create_device_local(std::uint64_t device, MemoryPool& pool, std::size_t byte_count,
                         std::uint32_t usage, std::shared_ptr<GpuBackend> backend_keepalive);
-    [[nodiscard]] static Result<GpuBuffer>
+    [[nodiscard]] static exstl::Result<GpuBuffer>
     create_host_visible(std::uint64_t device, MemoryPool& pool, std::size_t byte_count,
                         std::uint32_t usage, std::shared_ptr<GpuBackend> backend_keepalive);
 
@@ -113,13 +113,13 @@ public:
     {
     }
 
-    [[nodiscard]] static Result<GpuTensorT<P>> from_matrix(const MatrixT<P>& cpu_mat,
+    [[nodiscard]] static exstl::Result<GpuTensorT<P>> from_matrix(const MatrixT<P>& cpu_mat,
                                                            GpuBackend& backend);
-    [[nodiscard]] static Result<GpuTensorT<P>> create_empty(std::size_t rows, std::size_t cols,
+    [[nodiscard]] static exstl::Result<GpuTensorT<P>> create_empty(std::size_t rows, std::size_t cols,
                                                             GpuBackend& backend);
-    [[nodiscard]] static Result<GpuTensorT<P>>
+    [[nodiscard]] static exstl::Result<GpuTensorT<P>>
     create_host_visible_empty(std::size_t rows, std::size_t cols, GpuBackend& backend);
-    [[nodiscard]] Result<MatrixT<P>> to_matrix(GpuBackend& backend) const;
+    [[nodiscard]] exstl::Result<MatrixT<P>> to_matrix(GpuBackend& backend) const;
 
     [[nodiscard]] std::size_t rows() const noexcept { return rows_; }
     [[nodiscard]] std::size_t cols() const noexcept { return cols_; }

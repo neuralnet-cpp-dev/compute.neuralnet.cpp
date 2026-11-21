@@ -118,18 +118,18 @@ void run_prefix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t
     const nn::Matrix B0m = make_matrix(rng, H * dk, dk);
     const nn::Matrix bnd = make_boundary(rng, B * seq);
 
-    auto run = [&](nn::ComputeEngine& e) -> nn::Result<nn::Matrix>
+    auto run = [&](nn::ComputeEngine& e) -> exstl::Result<nn::Matrix>
     {
-        NN_TRY(k, e.from_matrix(Km, prec));
-        NN_TRY(v, e.from_matrix(Vm, prec));
-        NN_TRY(p, e.from_matrix(Pm, prec));
-        NN_TRY(r, e.from_matrix(Rm, prec));
-        NN_TRY(a0, e.from_matrix(A0m, prec));
-        NN_TRY(b0, e.from_matrix(B0m, prec));
-        NN_TRY(bd, e.from_matrix(bnd, prec));
+        EX_TRY(k, e.from_matrix(Km, prec));
+        EX_TRY(v, e.from_matrix(Vm, prec));
+        EX_TRY(p, e.from_matrix(Pm, prec));
+        EX_TRY(r, e.from_matrix(Rm, prec));
+        EX_TRY(a0, e.from_matrix(A0m, prec));
+        EX_TRY(b0, e.from_matrix(B0m, prec));
+        EX_TRY(bd, e.from_matrix(bnd, prec));
         auto out = e.scan_prefix_outer(*k, *v, *p, *r, *a0, *b0, has_state, dk, H, causal, *bd,
                                        has_bnd, prec);
-        NN_TRY_CHECK(out);
+        EX_TRY_CHECK(out);
         return e.to_matrix(*out);
     };
 
@@ -175,14 +175,14 @@ void run_suffix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t
     const nn::Matrix Ym = make_matrix(rng, rows, seq);
     const nn::Matrix bnd = make_boundary(rng, B * seq);
 
-    auto run = [&](nn::ComputeEngine& e) -> nn::Result<nn::Matrix>
+    auto run = [&](nn::ComputeEngine& e) -> exstl::Result<nn::Matrix>
     {
-        NN_TRY(d, e.from_matrix(Dm, prec));
-        NN_TRY(x, e.from_matrix(Xm, prec));
-        NN_TRY(y, e.from_matrix(Ym, prec));
-        NN_TRY(bd, e.from_matrix(bnd, prec));
+        EX_TRY(d, e.from_matrix(Dm, prec));
+        EX_TRY(x, e.from_matrix(Xm, prec));
+        EX_TRY(y, e.from_matrix(Ym, prec));
+        EX_TRY(bd, e.from_matrix(bnd, prec));
         auto out = e.scan_suffix_outer(*d, *x, *y, dk, H, causal, *bd, has_bnd, prec);
-        NN_TRY_CHECK(out);
+        EX_TRY_CHECK(out);
         return e.to_matrix(*out);
     };
 

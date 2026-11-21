@@ -19,7 +19,7 @@
 // ── 延迟销毁入口（GpuBuffer 析构时调用）──────────────────────────
 // 打上帧标签：batch 录制中 → 当前帧；非 batch → 最近活跃帧。
 void defer_buffer_destroy(VkDevice device, VkBuffer buffer, const MemoryPool::Allocation& alloc,
-                          observer_ptr<MemoryPool> pool)
+                          exstl::observer_ptr<MemoryPool> pool)
 {
     const std::size_t frame = batch_mode_ ? batch_frame_ : last_active_frame_;
     std::lock_guard lock(pending_mutex_);
@@ -63,7 +63,7 @@ void retire_reduce_partial_()
     if (needs_deferred_destroy())
     {
         defer_buffer_destroy(device_.device(), reduce_partial_.buffer, reduce_partial_.alloc,
-                             observer_ptr<MemoryPool>(reduce_partial_.pool));
+                             exstl::observer_ptr<MemoryPool>(reduce_partial_.pool));
     }
     else
     {
@@ -74,7 +74,7 @@ void retire_reduce_partial_()
     reduce_partial_ = {};
 }
 
-[[nodiscard]] Result<void> ensure_reduce_partial_(std::uint32_t rows, std::uint32_t cols)
+[[nodiscard]] exstl::Result<void> ensure_reduce_partial_(std::uint32_t rows, std::uint32_t cols)
 {
     if (reduce_partial_.buffer != VK_NULL_HANDLE && reduce_partial_.rows == rows &&
         reduce_partial_.cols == cols)
@@ -94,7 +94,7 @@ void retire_reduce_partial_()
     VkBuffer buffer = VK_NULL_HANDLE;
     const VkResult cr = vkCreateBuffer(device_.device(), &info, nullptr, &buffer);
     if (cr != VK_SUCCESS)
-        NN_FAIL("reduce scratch vkCreateBuffer failed: " + std::to_string(static_cast<int>(cr)));
+        EX_FAIL("reduce scratch vkCreateBuffer failed: " + std::to_string(static_cast<int>(cr)));
 
     VkMemoryRequirements req{};
     vkGetBufferMemoryRequirements(device_.device(), buffer, &req);
@@ -102,7 +102,7 @@ void retire_reduce_partial_()
     if (!alloc_r)
     {
         vkDestroyBuffer(device_.device(), buffer, nullptr);
-        NN_TRY_CHECK(alloc_r);
+        EX_TRY_CHECK(alloc_r);
     }
     const VkResult br =
         vkBindBufferMemory(device_.device(), buffer, alloc_r->memory, alloc_r->offset);
@@ -110,7 +110,7 @@ void retire_reduce_partial_()
     {
         pool.free(*alloc_r);
         vkDestroyBuffer(device_.device(), buffer, nullptr);
-        NN_FAIL("reduce scratch vkBindBufferMemory failed: " +
+        EX_FAIL("reduce scratch vkBindBufferMemory failed: " +
                 std::to_string(static_cast<int>(br)));
     }
 
@@ -123,7 +123,7 @@ void retire_reduce_partial_()
 // vkWaitForFences 确认 VK_SUCCESS）→ 销毁该帧的延迟 buffer 并归还
 // 内存 → 释放该帧描述符集（帧提交期间被已录制命令引用，fence 信号
 // 前不得释放）→ in_flight=false
-[[nodiscard]] Result<void> reap_frame(std::size_t i, bool wait)
+[[nodiscard]] exstl::Result<void> reap_frame(std::size_t i, bool wait)
 {
     auto& f = frames_[i];
     if (f.in_flight && wait)
@@ -135,13 +135,13 @@ void retire_reduce_partial_()
         {
             // 设备丢失（TDR 触发）：GPU 已死亡，无法恢复
             device_lost_ = true;
-            NN_FAIL("GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
+            EX_FAIL("GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
                     "\n模型已自动保存，请使用 --resume <save-path> 重启训练。"
                     "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
                     " (注册表 TdrDelay)");
         }
         if (wr != VK_SUCCESS)
-            NN_FAIL(std::string("GPU 帧等待失败: Vulkan error ") +
+            EX_FAIL(std::string("GPU 帧等待失败: Vulkan error ") +
                     std::to_string(static_cast<int>(wr)) +
                     "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
                     " (注册表 TdrDelay)");
@@ -178,14 +178,14 @@ void retire_reduce_partial_()
 // 初始化
 // device_selector：手动指定计算设备（索引 "2" 或名称子串 "40HX"/"NVIDIA"）。
 // 空 = 自动选择（设备类型 + apiVersion 打分，见 VulkanDevice::initialize）。
-[[nodiscard]] Result<void> initialize(std::string device_selector = {})
+[[nodiscard]] exstl::Result<void> initialize(std::string device_selector = {})
 {
     std::lock_guard lock(init_mutex_);
     if (initialized_) return {};
 
     // 1. 检查 SPIR-V 是否可用
     const auto& spirv = get_matmul_spirv();
-    if (spirv.empty()) NN_FAIL("matmul SPIR-V bytecode not embedded");
+    if (spirv.empty()) EX_FAIL("matmul SPIR-V bytecode not embedded");
     // 2. 初始化 Vulkan 设备（先登记设备选择器）
     if (!device_selector.empty()) device_.set_device_selector(std::move(device_selector));
     auto dev_r = device_.initialize();
@@ -199,7 +199,7 @@ void retire_reduce_partial_()
     //    缺失（SPIR-V 未嵌入 / 设备能力不足 / 创建失败）= 空句柄，
     //    由上层按 has_*() 回退；唯一硬要求是 matmul 本身。
     pipelines_.create_all(device_.device(), device_, pipeline_specs());
-    if (!pipelines_.has(PipelineId::matmul)) NN_FAIL("matmul pipeline 创建失败");
+    if (!pipelines_.has(PipelineId::matmul)) EX_FAIL("matmul pipeline 创建失败");
 
     // 4. 创建 memory pool（持久 + 瞬态）
     //    底材粒度可用 NN_POOL_BLOCK_MB 覆盖（显存峰值调参/探针用）：
@@ -534,7 +534,7 @@ void retire_reduce_partial_()
 // "已完成但未被收割"的帧上、内存不还池 → backward 只能继续申请新底材
 // （实测 bench 配置 transient live 3837MB 里 pending（已析构未还池）
 //  高达 3000MB，步内峰值 ≈ 稳态 2.8×）。
-[[nodiscard]] Result<void> reap_completed_frames()
+[[nodiscard]] exstl::Result<void> reap_completed_frames()
 {
     if (!initialized_) return {};
     for (std::size_t i = 0; i < frames_.size(); ++i)
@@ -548,18 +548,18 @@ void retire_reduce_partial_()
         {
             // 设备丢失（TDR 触发）：GPU 已死亡，无法恢复
             device_lost_ = true;
-            NN_FAIL("GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
+            EX_FAIL("GPU 设备丢失 (VK_ERROR_DEVICE_LOST): Windows TDR 已重置 GPU 驱动。"
                     "\n模型已自动保存，请使用 --resume <save-path> 重启训练。"
                     "\n建议：减小 --batch-size 或 --seq-len，或增大 Windows TDR 超时"
                     " (注册表 TdrDelay)");
         }
         if (rs != VK_TIMEOUT && rs != VK_SUCCESS)
-            NN_FAIL(std::string("GPU fence 非阻塞查询失败: Vulkan error ") +
+            EX_FAIL(std::string("GPU fence 非阻塞查询失败: Vulkan error ") +
                     std::to_string(static_cast<int>(rs)));
         if (rs == VK_SUCCESS)
         {
             auto rr = reap_frame(i, /*wait=*/false);
-            NN_TRY_CHECK(rr);
+            EX_TRY_CHECK(rr);
         }
     }
     return {};
@@ -574,7 +574,7 @@ void retire_reduce_partial_()
 // 完全空闲块在空闲容量仍 ≥ 阈值时留在池内（下步 first-fit 复用），只在
 // 工作负载真正收缩时把超出阈值的块归还；步内峰值不变（工作块两种情形都
 // 在用），步间基线抬高 ≤ 保留阈值。进程内读一次并缓存（行为开关口径）。
-[[nodiscard]] Result<void> release_idle_pool_blocks()
+[[nodiscard]] exstl::Result<void> release_idle_pool_blocks()
 {
     if (!pool_retain_env_applied_)
     {

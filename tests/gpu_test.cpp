@@ -60,22 +60,22 @@ Scalar max_abs_diff(const Matrix& a, const Matrix& b)
 }
 
 // ── 辅助：通过 engine 执行 matmul 并下载结果 ───────────────────────────────
-nn::Result<Matrix> engine_matmul(ComputeEngine& engine, const Matrix& A, const Matrix& B,
+exstl::Result<Matrix> engine_matmul(ComputeEngine& engine, const Matrix& A, const Matrix& B,
                                  bool transA = false, bool transB = false)
 {
     auto a_t = engine.from_matrix(A);
-    NN_TRY_CHECK(a_t);
+    EX_TRY_CHECK(a_t);
     auto b_t = engine.from_matrix(B);
-    NN_TRY_CHECK(b_t);
+    EX_TRY_CHECK(b_t);
     auto c_t = engine.matmul(*a_t, *b_t, transA, transB);
-    NN_TRY_CHECK(c_t);
+    EX_TRY_CHECK(c_t);
     return engine.to_matrix(*c_t);
 }
 
 // 数字解析辅助：解析失败时打印错误并退出（替代会抛异常的 std::stoi/stod）
 template <typename T> T parse_num_or_die(const char* s, const char* opt)
 {
-    auto v = nn::parse_number<T>(s);
+    auto v = exstl::parse_number<T>(s);
     if (!v)
     {
         std::cerr << "无效的 " << opt << " 值: " << v.error().message << "\n";
@@ -181,9 +181,9 @@ int main(int argc, char* argv[])
     std::cout << "[3/6] matmul 正确性验证 (CPU vs GPU)..." << std::flush;
 
     auto cpu_c_r = engine_matmul(*cpu_engine, A, B);
-    NN_EXIT(cpu_c_r, 1, "\n  ❌ CpuEngine matmul 失败: ");
+    EX_EXIT(cpu_c_r, 1, "\n  ❌ CpuEngine matmul 失败: ");
     auto gpu_c_r = engine_matmul(*gpu_engine, A, B);
-    NN_EXIT(gpu_c_r, 1, "\n  ❌ GpuEngine matmul 失败: ");
+    EX_EXIT(gpu_c_r, 1, "\n  ❌ GpuEngine matmul 失败: ");
 
     Scalar matmul_err = max_abs_diff(*cpu_c_r, *gpu_c_r);
 
@@ -209,7 +209,7 @@ int main(int argc, char* argv[])
     const bool matmul_ok = (matmul_err < 1e-2f) && (nrmse < 1e-3f);
     std::cout << "  结果: " << (matmul_ok ? "✅ 通过" : "❌ 失败") << "\n\n";
 
-    NN_EXIT(matmul_ok, 1, "matmul 正确性验证失败，跳过后续测试。\n");
+    EX_EXIT(matmul_ok, 1, "matmul 正确性验证失败，跳过后续测试。\n");
 
     // ── 3b. 转置 matmul 测试 ──────────────────────────────────────
     std::cout << "[3b] 转置 matmul 测试..." << std::flush;
@@ -327,9 +327,9 @@ int main(int argc, char* argv[])
 
             auto a_t = gpu_engine->from_matrix(a);
             auto r_t = a_t ? gpu_engine->transpose(*a_t)
-                           : nn::Result<Tensor>{std::unexpected(a_t.error())};
+                           : exstl::Result<Tensor>{std::unexpected(a_t.error())};
             auto out_r = r_t ? gpu_engine->to_matrix(*r_t)
-                             : nn::Result<Matrix>{std::unexpected(r_t.error())};
+                             : exstl::Result<Matrix>{std::unexpected(r_t.error())};
             if (!out_r)
             {
                 std::cout << "  " << c.R << "x" << c.C << " 执行失败: " << out_r.error().message
@@ -462,7 +462,7 @@ int main(int argc, char* argv[])
     for (int i = 0; i < iters; ++i)
     {
         auto r = engine_matmul(*cpu_engine, A, B);
-        NN_EXIT(r, 1, "CPU matmul 性能测试失败\n");
+        EX_EXIT(r, 1, "CPU matmul 性能测试失败\n");
     }
     auto t_cpu_end = std::chrono::high_resolution_clock::now();
     double cpu_ms =
@@ -473,7 +473,7 @@ int main(int argc, char* argv[])
     for (int i = 0; i < iters; ++i)
     {
         auto r = engine_matmul(*gpu_engine, A, B);
-        NN_EXIT(r, 1, "GPU matmul 性能测试失败\n");
+        EX_EXIT(r, 1, "GPU matmul 性能测试失败\n");
     }
     auto t_gpu_end = std::chrono::high_resolution_clock::now();
     double gpu_ms =
@@ -554,8 +554,8 @@ int main(int argc, char* argv[])
             auto a_cpu = cpu_engine->from_matrix(A);
             auto b_cpu = cpu_engine->from_matrix(B);
             auto c_cpu = cpu_engine->matmul(*a_cpu, *b_cpu, false, false);
-            auto sum_cpu = c_cpu ? cpu_engine->col_reduce_sum(*c_cpu) : nn::Result<Tensor>{};
-            auto res_cpu = sum_cpu ? cpu_engine->to_matrix(*sum_cpu) : nn::Result<Matrix>{};
+            auto sum_cpu = c_cpu ? cpu_engine->col_reduce_sum(*c_cpu) : exstl::Result<Tensor>{};
+            auto res_cpu = sum_cpu ? cpu_engine->to_matrix(*sum_cpu) : exstl::Result<Matrix>{};
 
             // ── Step 1: matmul(A, B) on GPU ──
             auto c_t = gpu_engine->matmul(*a_t, *b_t, false, false);
@@ -763,12 +763,12 @@ int main(int argc, char* argv[])
         (void)bnd;
 
         auto run_prefix = [&](ComputeEngine& e, const Matrix& Ki, const Matrix& Vi,
-                              const Matrix& Pi, const Matrix& Ri) -> nn::Result<Matrix>
+                              const Matrix& Pi, const Matrix& Ri) -> exstl::Result<Matrix>
         {
-            NN_TRY(k, e.from_matrix(Ki));
-            NN_TRY(v, e.from_matrix(Vi));
-            NN_TRY(p, e.from_matrix(Pi));
-            NN_TRY(r, e.from_matrix(Ri));
+            EX_TRY(k, e.from_matrix(Ki));
+            EX_TRY(v, e.from_matrix(Vi));
+            EX_TRY(p, e.from_matrix(Pi));
+            EX_TRY(r, e.from_matrix(Ri));
             auto a0 = e.from_matrix(A0v);
             const auto& a0r = *a0;
             auto b0 = e.from_matrix(B0v);
@@ -777,19 +777,19 @@ int main(int argc, char* argv[])
             const auto& bdr = *bd;
             auto out = e.scan_prefix_outer(*k, *v, *p, *r, a0r, b0r, false, dk, H, /*causal=*/true,
                                            bdr, false);
-            NN_TRY_CHECK(out);
+            EX_TRY_CHECK(out);
             return e.to_matrix(*out);
         };
         auto run_suffix = [&](ComputeEngine& e, const Matrix& Di, const Matrix& Xi,
-                              const Matrix& Yi) -> nn::Result<Matrix>
+                              const Matrix& Yi) -> exstl::Result<Matrix>
         {
-            NN_TRY(d, e.from_matrix(Di));
-            NN_TRY(x, e.from_matrix(Xi));
-            NN_TRY(y, e.from_matrix(Yi));
+            EX_TRY(d, e.from_matrix(Di));
+            EX_TRY(x, e.from_matrix(Xi));
+            EX_TRY(y, e.from_matrix(Yi));
             auto bd = e.from_matrix(bnd);
             const auto& bdr = *bd;
             auto out = e.scan_suffix_outer(*d, *x, *y, dk, H, /*causal=*/true, bdr, false);
-            NN_TRY_CHECK(out);
+            EX_TRY_CHECK(out);
             return e.to_matrix(*out);
         };
 

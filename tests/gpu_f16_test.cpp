@@ -35,20 +35,20 @@ int main()
 
     // Upload as f32
     auto t32 = engine.from_matrix(m);
-    NN_EXIT(t32, 1, "from_matrix failed: %s\n");
+    EX_EXIT(t32, 1, "from_matrix failed: %s\n");
     printf("f32 uploaded: %s\n", t32->shape_str().c_str());
 
     // Cast to f16
     auto t16 = engine.cast(*t32, nn::Precision::F16);
-    NN_EXIT(t16, 1, "cast to f16 failed: %s\n");
+    EX_EXIT(t16, 1, "cast to f16 failed: %s\n");
     printf("f16 tensor: prec=%d %s\n", (int)t16->precision(), t16->shape_str().c_str());
 
     // Cast back to f32
     auto t32_back = engine.cast(*t16, nn::Precision::F32);
-    NN_EXIT(t32_back, 1, "cast back failed: %s\n");
+    EX_EXIT(t32_back, 1, "cast back failed: %s\n");
 
     auto result = engine.to_matrix(*t32_back);
-    NN_EXIT(result, 1, "to_matrix failed: %s\n");
+    EX_EXIT(result, 1, "to_matrix failed: %s\n");
 
     printf("Original:  [%.1f %.1f; %.1f %.1f]\n", m.at(0, 0), m.at(0, 1), m.at(1, 0), m.at(1, 1));
     printf("GPU f16:   [%.1f %.1f; %.1f %.1f]\n", result->at(0, 0), result->at(0, 1),
@@ -66,7 +66,7 @@ int main()
     auto t16_b = engine.cast(engine.from_matrix(m2).value(), nn::Precision::F16);
 
     auto t16_c = engine.matmul(*t16_a, *t16_b, false, false, nn::Precision::F16);
-    NN_EXIT(t16_c, 1, "f16 matmul failed: %s\n");
+    EX_EXIT(t16_c, 1, "f16 matmul failed: %s\n");
 
     auto c32 = engine.cast(*t16_c, nn::Precision::F32);
     auto c_mat = engine.to_matrix(*c32);

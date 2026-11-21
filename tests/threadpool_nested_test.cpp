@@ -11,7 +11,7 @@
 // 判定方式：分片回调里对 worker_index() 做 per-slot 并发计数，进入时若该槽已被
 // 其它线程占用即记为一次冲突。探针不依赖修复后的具体 slot 编号。
 
-#include <neuralnet.cpp/core_threadpool.hpp>
+#include <exstl/threadpool.hpp>
 
 #include <atomic>
 #include <barrier>
@@ -86,7 +86,7 @@ struct SlotProbe
 void test_nested_parallel_caller_slot()
 {
     std::printf("嵌套并行：内外层调用者 slot 隔离\n");
-    nn::ThreadPool pool(4);
+    exstl::ThreadPool pool(4);
     const std::size_t caller_slot = pool.size();  // 外层调用者分片的 slot（约定）
 
     constexpr std::size_t kOuter = 3 * 1024;  // chunk_count = min(4, 3) = 3
@@ -154,7 +154,7 @@ void test_nested_parallel_caller_slot()
 void test_concurrent_external_callers()
 {
     std::printf("并发外部调用者：两个并行区调用者 slot 隔离\n");
-    nn::ThreadPool pool(4);
+    exstl::ThreadPool pool(4);
 
     constexpr std::size_t kN = 3 * 1024;  // chunk_count = min(4, 3) = 3
     std::vector<int> a(kN, 0);

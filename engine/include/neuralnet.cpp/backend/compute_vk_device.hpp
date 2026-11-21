@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-#include <neuralnet.cpp/core_errors.hpp>
+#include <exstl/errors.hpp>
 #include <neuralnet.cpp/core_config.hpp>
 #include <neuralnet.cpp/core_env.hpp>   // RV-09：环境变量读取唯一入口
 
@@ -29,11 +29,11 @@ namespace detail
 {
 
 // ── Vulkan 错误检查 ──────────────────────────────────────────────────────
-[[nodiscard]] inline Result<void> vk_check(VkResult res, const char* file, int line)
+[[nodiscard]] inline exstl::Result<void> vk_check(VkResult res, const char* file, int line)
 {
     if (res != VK_SUCCESS)
     {
-        NN_FAIL("Vulkan error " + std::to_string(static_cast<int>(res)) + " at " +
+        EX_FAIL("Vulkan error " + std::to_string(static_cast<int>(res)) + " at " +
                 std::string(file) + ":" + std::to_string(line));
     }
     return {};
@@ -127,7 +127,7 @@ public:
 
     // 读取环境变量（RV-09：实现收敛到 core_env.hpp；本包装保留供后端调用）
     [[nodiscard]] static std::string get_env(const char* name)
-    { return ::nn::detail::env_string_raw(name); }
+    { return ::exstl::env::str(name); }
 
     // ── 手动指定计算设备（必须在 initialize() 之前调用）────────────────────
     // selector = 枚举索引（"2"）或设备名子串（"40HX" / "NVIDIA"）；
@@ -136,7 +136,7 @@ public:
     // 列出全部候选设备的错误。
     void set_device_selector(std::string selector) { device_selector_ = std::move(selector); }
 
-    [[nodiscard]] Result<void> initialize()
+    [[nodiscard]] exstl::Result<void> initialize()
     {
         if (initialized_) return {};
 
@@ -165,11 +165,11 @@ public:
         instance_info.pApplicationInfo = &app_info;
 
         VkResult res = vkCreateInstance(&instance_info, nullptr, &instance_);
-        if (res != VK_SUCCESS) NN_FAIL("vkCreateInstance failed: " + std::to_string(res));
+        if (res != VK_SUCCESS) EX_FAIL("vkCreateInstance failed: " + std::to_string(res));
         // 2. 选择物理设备
         uint32_t device_count = 0;
         vkEnumeratePhysicalDevices(instance_, &device_count, nullptr);
-        if (device_count == 0) NN_FAIL("No Vulkan devices found");
+        if (device_count == 0) EX_FAIL("No Vulkan devices found");
         std::vector<VkPhysicalDevice> devices(device_count);
         vkEnumeratePhysicalDevices(instance_, &device_count, devices.data());
 
@@ -221,7 +221,7 @@ public:
                     vkGetPhysicalDeviceProperties(devices[i], &props);
                     avail += "\n  [" + std::to_string(i) + "] " + props.deviceName;
                 }
-                NN_FAIL("未找到匹配的计算设备 \"" + selector + "\"，可用设备:" + avail);
+                EX_FAIL("未找到匹配的计算设备 \"" + selector + "\"，可用设备:" + avail);
             }
         }
 
@@ -280,7 +280,7 @@ public:
                 break;
             }
         }
-        if (!found_queue) NN_FAIL("No compute queue family found");
+        if (!found_queue) EX_FAIL("No compute queue family found");
         // 4. 创建逻辑设备
         // 先探测时间线信号量能力（Vulkan 1.2 核心特性）：跨 submit 数据依赖
         // 需要"同一信号量可被多个 submit 等待"的语义，二进制信号量做不到
@@ -433,7 +433,7 @@ public:
         device_info.pQueueCreateInfos = &queue_info;
 
         res = vkCreateDevice(physical_device_, &device_info, nullptr, &device_);
-        if (res != VK_SUCCESS) NN_FAIL("vkCreateDevice failed: " + std::to_string(res));
+        if (res != VK_SUCCESS) EX_FAIL("vkCreateDevice failed: " + std::to_string(res));
         // 5. 获取计算队列
         vkGetDeviceQueue(device_, queue_family_index_, 0, &compute_queue_);
 
@@ -528,7 +528,7 @@ public:
     VulkanPipeline& operator=(const VulkanPipeline&) = delete;
 
     // 创建 matmul pipeline
-    [[nodiscard]] static Result<VulkanPipeline> create_matmul(VkDevice device,
+    [[nodiscard]] static exstl::Result<VulkanPipeline> create_matmul(VkDevice device,
                                                               std::span<const uint32_t> spirv_code)
     {
         VulkanPipeline pl;
@@ -543,7 +543,7 @@ public:
         auto r = detail::vk_check(
             vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_), __FILE__,
             __LINE__);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         // 创建 descriptor set layout（3 个 storage buffer）
         VkDescriptorSetLayoutBinding bindings[3]{};
         for (int i = 0; i < 3; ++i)
@@ -562,7 +562,7 @@ public:
         r = detail::vk_check(
             vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_),
             __FILE__, __LINE__);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         // 创建 pipeline layout（push constants: M, N, K, transA, transB）
         VkPushConstantRange push_range{};
         push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -579,7 +579,7 @@ public:
         r = detail::vk_check(
             vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_),
             __FILE__, __LINE__);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         // 创建 compute pipeline
         VkComputePipelineCreateInfo pipeline_info{};
         pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -592,7 +592,7 @@ public:
         r = detail::vk_check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
                                                       nullptr, &pl.pipeline_),
                              __FILE__, __LINE__);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return pl;
     }
 
@@ -600,7 +600,7 @@ public:
     // 用于 elementwise_v2 / reduce / broadcast 等纯原语着色器。
     // spec_entries/data/data_size 可选：VkSpecializationInfo（特化常量）；
     // 传空 = 用 shader 默认值（SC_* 全 0）。
-    [[nodiscard]] static Result<VulkanPipeline>
+    [[nodiscard]] static exstl::Result<VulkanPipeline>
     create_generic(VkDevice device, std::span<const uint32_t> spirv_code,
                    uint32_t num_bindings, uint32_t push_constant_size,
                    const VkSpecializationMapEntry* spec_entries = nullptr,
@@ -619,7 +619,7 @@ public:
         auto r = detail::vk_check(
             vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_), __FILE__,
             __LINE__);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         // 创建 descriptor set layout（num_bindings 个 storage buffer）
         std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
         for (uint32_t i = 0; i < num_bindings; ++i)
@@ -638,7 +638,7 @@ public:
         r = detail::vk_check(
             vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &pl.descriptor_layout_),
             __FILE__, __LINE__);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         // 创建 pipeline layout（push constants）
         VkPushConstantRange push_range{};
         push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -655,7 +655,7 @@ public:
         r = detail::vk_check(
             vkCreatePipelineLayout(device, &pl_layout_info, nullptr, &pl.pipeline_layout_),
             __FILE__, __LINE__);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         // 创建 compute pipeline（可选特化常量）
         VkSpecializationInfo spec_info{};
         VkSpecializationInfo* spec_ptr = nullptr;
@@ -680,7 +680,7 @@ public:
         r = detail::vk_check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
                                                       nullptr, &pl.pipeline_),
                              __FILE__, __LINE__);
-        NN_TRY_CHECK(r);
+        EX_TRY_CHECK(r);
         return pl;
     }
 
